@@ -853,7 +853,7 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────
 static unsigned long _lastSync2 = 0;
 static bool _syncing = false;
-#define SYNC_INTERVAL_MS 13000UL  // 13 giây (lệch với Node-2: 17s)
+#define SYNC_INTERVAL_MS 10000UL  // 60 giây (giảm drop AP cho laptop kết nối)
 
 void loop() {
   // Luôn kiểm tra nút BOOT để toggle bật/tắt
@@ -875,7 +875,7 @@ void loop() {
     // Có client vừa kết nối → reset timer để không sync ngay sau đó
     _lastSync2 = millis();
   }
-  // Periodic sync từ Node-2 mỗi 10s
+  // Periodic sync từ Node-2 mỗi 60s
   if (!_syncing && (millis() - _lastSync2 >= SYNC_INTERVAL_MS)) {
     _syncing = true;
     _lastSync2 = millis();

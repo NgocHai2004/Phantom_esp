@@ -10,6 +10,10 @@ import tkinter as tk
 import tkinter.ttk as ttk
 import socket, threading, os, time, subprocess, json
 import urllib.request, urllib.error
+from pathlib import Path
+
+# ── Thư mục dongbo/ (cùng cấp với audio_gui.py) ──────────────────────────────
+DONGBO_DIR = Path(__file__).parent / "dongbo"
 
 # ── Network config ─────────────────────────────────────────────────────────────
 SERVER_IP    = "192.168.4.1"
@@ -161,14 +165,15 @@ class App(ctk.CTk):
         self._build_ui()
         self.after(600, self._auto_refresh)
         threading.Thread(target=self._poll_detect, daemon=True).start()
+        # Refresh tab dongbo khi focus vào
+        self.bind("<FocusIn>", lambda e: None)
 
     # ─────────────────────────────────────────────────────────────────────────
     # BUILD UI
     # ─────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         # ── Outer container (rounded window feel) ────────────────────────────
-        outer = ctk.CTkFrame(self, fg_color=BG_CARD,
-                             corner_radius=16)
+        outer = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=16)
         outer.pack(fill="both", expand=True, padx=12, pady=10)
 
         # ── Header bar ───────────────────────────────────────────────────────
@@ -176,7 +181,6 @@ class App(ctk.CTk):
         hdr.pack(fill="x", padx=20, pady=(14, 0))
         hdr.pack_propagate(False)
 
-        # App icon (rounded square) + title
         icon_box = ctk.CTkFrame(hdr, fg_color=ACCENT,
                                 width=28, height=28, corner_radius=7)
         icon_box.pack(side="left", pady=12)
@@ -186,49 +190,67 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(hdr, text="  Audio Transfer",
                      font=ctk.CTkFont("Segoe UI", 16, "bold"),
-                     text_color=TEXT
-                     ).pack(side="left", pady=12)
+                     text_color=TEXT).pack(side="left", pady=12)
 
-        # Right side: status + menu
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
         right_hdr.pack(side="right", pady=8)
 
         self._conn_spinner = ctk.CTkLabel(
             right_hdr, text="◌",
-            font=ctk.CTkFont("Segoe UI", 14),
-            text_color=MUTED)
+            font=ctk.CTkFont("Segoe UI", 14), text_color=MUTED)
         self._conn_spinner.pack(side="left", padx=(0, 4))
 
         self._conn_lbl = ctk.CTkLabel(
             right_hdr, text="Đang tìm thiết bị…",
-            font=ctk.CTkFont("Segoe UI", 11),
-            text_color=MUTED)
+            font=ctk.CTkFont("Segoe UI", 11), text_color=MUTED)
         self._conn_lbl.pack(side="left", padx=(0, 10))
 
         ctk.CTkLabel(right_hdr, text="···",
                      font=ctk.CTkFont("Segoe UI", 16, "bold"),
-                     text_color=MUTED
-                     ).pack(side="left")
+                     text_color=MUTED).pack(side="left")
 
         # ── Thin separator ───────────────────────────────────────────────────
         ctk.CTkFrame(outer, fg_color=BORDER, height=1, corner_radius=0
                      ).pack(fill="x", padx=0, pady=(12, 0))
 
-        # ── Body ─────────────────────────────────────────────────────────────
-        body = ctk.CTkFrame(outer, fg_color="transparent")
+        # ── Tab view ─────────────────────────────────────────────────────────
+        self._tabs = ctk.CTkTabview(
+            outer,
+            fg_color=BG_CARD,
+            segmented_button_fg_color=BG_SURFACE,
+            segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_GLOW,
+            segmented_button_unselected_color=BG_SURFACE,
+            segmented_button_unselected_hover_color=BORDER,
+            text_color=TEXT,
+            corner_radius=12,
+        )
+        self._tabs.pack(fill="both", expand=True, padx=8, pady=(6, 8))
+
+        self._tabs.add("📡  ESP32")
+        self._tabs.add("📁  Thư mục dongbo")
+
+        # Tab 1: ESP32 — layout sidebar + main
+        tab_esp = self._tabs.tab("📡  ESP32")
+        body = ctk.CTkFrame(tab_esp, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=0, pady=0)
 
-        # LEFT SIDEBAR (fixed 280px)
         sidebar = ctk.CTkFrame(body, fg_color="transparent", width=280)
-        sidebar.pack(side="left", fill="y", padx=(16, 8), pady=14)
+        sidebar.pack(side="left", fill="y", padx=(4, 8), pady=6)
         sidebar.pack_propagate(False)
 
-        # RIGHT MAIN
         main = ctk.CTkFrame(body, fg_color="transparent")
-        main.pack(side="left", fill="both", expand=True, padx=(0, 16), pady=14)
+        main.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=6)
 
         self._build_sidebar(sidebar)
         self._build_main(main)
+
+        # Tab 2: Thư mục dongbo
+        tab_local = self._tabs.tab("📁  Thư mục dongbo")
+        self._build_local_tab(tab_local)
+
+        # Khi chuyển sang tab dongbo → tự refresh
+        self._tabs.configure(command=self._on_tab_change)
 
         # Start spinner animation
         self._start_spinner()
@@ -975,6 +997,264 @@ class App(ctk.CTk):
                 text="Không nhận được — thử lại sau", text_color=RED),
             self._dl_pb.stop(), self._dl_pb.pack_forget()
         ))
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB CALLBACK
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_tab_change(self):
+        name = self._tabs.get()
+        if "dongbo" in name:
+            threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB 2 — THƯ MỤC DONGBO
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_local_tab(self, parent):
+        # ── Header ──────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(parent, fg_color="transparent")
+        hdr.pack(fill="x", pady=(6, 8), padx=4)
+
+        ctk.CTkLabel(hdr, text="File WAV trong  dongbo/",
+                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                     text_color=TEXT, anchor="w"
+                     ).pack(side="left")
+
+        # Nút hành động
+        for icon, tip, cmd in [
+            ("↻", "Làm mới",        lambda: threading.Thread(target=self._refresh_local_tab, daemon=True).start()),
+            ("🗁", "Mở thư mục",    self._open_dongbo_folder),
+            ("🗑", "Xóa đã chọn",   self._delete_local_selected),
+        ]:
+            ctk.CTkButton(hdr, text=icon, width=32, height=28,
+                          font=ctk.CTkFont("Segoe UI", 12),
+                          fg_color="transparent", hover_color=BG_SURFACE,
+                          text_color=MUTED, corner_radius=6,
+                          command=cmd
+                          ).pack(side="right", padx=2)
+
+        # ── Stat bar ────────────────────────────────────────────────────────
+        self._local_stat_lbl = ctk.CTkLabel(
+            parent, text="",
+            font=ctk.CTkFont("Segoe UI", 9),
+            text_color=MUTED, anchor="w")
+        self._local_stat_lbl.pack(fill="x", padx=8, pady=(0, 6))
+
+        # ── Table header ────────────────────────────────────────────────────
+        table_card = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
+        table_card.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+
+        col_hdr = tk.Frame(table_card, bg=BG_CARD)
+        col_hdr.pack(fill="x", padx=2, pady=(2, 0))
+        for txt, w, anchor in [
+            ("Tên file",    0,   "w"),
+            ("Kích thước",  90,  "center"),
+            ("Ngày sửa",    130, "center"),
+            ("",            80,  "center"),
+        ]:
+            tk.Label(col_hdr, text=txt,
+                     bg=BG_CARD, fg=MUTED,
+                     font=("Segoe UI", 9),
+                     padx=10 if anchor == "w" else 0,
+                     anchor=anchor, width=0
+                     ).pack(side="left",
+                            fill="x", expand=(txt == "Tên file"),
+                            ipadx=6, ipady=6)
+
+        # ── Scrollable rows ─────────────────────────────────────────────────
+        scroll_outer = tk.Frame(table_card, bg=BG_SURFACE)
+        scroll_outer.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+
+        vsb = tk.Scrollbar(scroll_outer, orient="vertical",
+                           bg=BG_SURFACE, troughcolor=BG_SURFACE,
+                           bd=0, highlightthickness=0, width=6)
+        vsb.pack(side="right", fill="y", padx=(0, 2), pady=4)
+
+        self._local_canvas = tk.Canvas(
+            scroll_outer, bg=BG_SURFACE,
+            highlightthickness=0, bd=0,
+            yscrollcommand=vsb.set)
+        self._local_canvas.pack(side="left", fill="both", expand=True)
+        vsb.configure(command=self._local_canvas.yview)
+
+        self._local_rows = tk.Frame(self._local_canvas, bg=BG_SURFACE)
+        self._local_rows_id = self._local_canvas.create_window(
+            (0, 0), window=self._local_rows, anchor="nw")
+
+        self._local_rows.bind("<Configure>",
+            lambda e: self._local_canvas.configure(
+                scrollregion=self._local_canvas.bbox("all")))
+        self._local_canvas.bind("<Configure>",
+            lambda e: self._local_canvas.itemconfig(
+                self._local_rows_id, width=e.width))
+        # Scroll chuột
+        self._local_canvas.bind_all("<MouseWheel>",
+            lambda e: self._local_canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        # Placeholder
+        self._local_empty_lbl = tk.Label(
+            self._local_rows, text="Thư mục dongbo/ chưa có file WAV",
+            bg=BG_SURFACE, fg=MUTED,
+            font=("Segoe UI", 10), pady=28)
+        self._local_empty_lbl.pack()
+
+        self._local_selected = set()  # tên file đang chọn
+
+        # Load lần đầu
+        threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _refresh_local_tab(self):
+        """Quét dongbo/ và cập nhật UI."""
+        DONGBO_DIR.mkdir(parents=True, exist_ok=True)
+        wavs = sorted(DONGBO_DIR.glob("*.wav"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        self.after(0, self._update_local_rows, wavs)
+
+    def _update_local_rows(self, wavs):
+        for w in self._local_rows.winfo_children():
+            w.destroy()
+        self._local_selected.clear()
+
+        if not wavs:
+            tk.Label(self._local_rows,
+                     text="Thư mục dongbo/ chưa có file WAV",
+                     bg=BG_SURFACE, fg=MUTED,
+                     font=("Segoe UI", 10), pady=28).pack()
+            self._local_stat_lbl.configure(text="Không có file")
+            return
+
+        total_kb = sum(p.stat().st_size for p in wavs) // 1024
+        self._local_stat_lbl.configure(
+            text=f"{len(wavs)} file  •  {total_kb} KB  •  {DONGBO_DIR}")
+
+        icons = ["♪", "♫", "♩", "♬"]
+        for i, p in enumerate(wavs):
+            sz    = p.stat().st_size
+            mtime = time.strftime("%d/%m  %H:%M", time.localtime(p.stat().st_mtime))
+            sz_str = f"{sz/1024:.1f} KB" if sz < 1024*1024 else f"{sz/1024/1024:.2f} MB"
+            row_bg = BG_ROW if i % 2 == 0 else BG_ROW_ALT
+
+            row = tk.Frame(self._local_rows, bg=row_bg, cursor="hand2")
+            row.pack(fill="x")
+            tk.Frame(row, bg=BORDER, height=1).pack(fill="x")
+
+            inner = tk.Frame(row, bg=row_bg)
+            inner.pack(fill="x", padx=4, pady=2)
+
+            # Checkbox (dùng Label làm toggle)
+            chk_var = tk.BooleanVar(value=False)
+            chk_lbl = tk.Label(inner, text="☐",
+                                bg=row_bg, fg=MUTED,
+                                font=("Segoe UI", 13),
+                                width=2, cursor="hand2")
+            chk_lbl.pack(side="left", padx=(6, 0), pady=4)
+
+            # Icon nhạc
+            tk.Label(inner, text=icons[i % len(icons)],
+                     bg=BG_SURFACE, fg=ACCENT_ICON,
+                     font=("Segoe UI", 14),
+                     width=3, pady=10
+                     ).pack(side="left", padx=(4, 8), pady=6)
+
+            # Tên file
+            name_lbl = tk.Label(inner, text=p.name,
+                                 bg=row_bg, fg=TEXT,
+                                 font=("Segoe UI", 10),
+                                 anchor="w")
+            name_lbl.pack(side="left", fill="x", expand=True)
+
+            # Kích thước
+            tk.Label(inner, text=sz_str,
+                     bg=row_bg, fg=SUBTLE,
+                     font=("Segoe UI", 10),
+                     width=9, anchor="center"
+                     ).pack(side="left", padx=4)
+
+            # Ngày sửa
+            tk.Label(inner, text=mtime,
+                     bg=row_bg, fg=MUTED,
+                     font=("Segoe UI", 9),
+                     width=12, anchor="center"
+                     ).pack(side="left", padx=4)
+
+            # Action buttons
+            btn_frame = tk.Frame(inner, bg=row_bg)
+            btn_frame.pack(side="right", padx=(0, 8))
+
+            path_cap = p  # capture
+
+            # Nút mở (play / reveal in explorer)
+            open_btn = tk.Label(btn_frame, text="⬡",
+                                 bg=BG_SURFACE, fg=SUBTLE,
+                                 font=("Segoe UI", 12),
+                                 width=3, pady=4,
+                                 relief="flat", cursor="hand2")
+            open_btn.pack(side="left", padx=2)
+            open_btn.bind("<Button-1>",
+                lambda e, pp=path_cap: subprocess.Popen(
+                    f'explorer /select,"{pp}"'))
+            open_btn.bind("<Enter>", lambda e, b=open_btn: b.configure(bg=TEAL))
+            open_btn.bind("<Leave>", lambda e, b=open_btn: b.configure(bg=BG_SURFACE))
+
+            # Nút xóa
+            del_btn = tk.Label(btn_frame, text="🗑",
+                                bg=BG_SURFACE, fg=SUBTLE,
+                                font=("Segoe UI", 10),
+                                width=3, pady=4,
+                                relief="flat", cursor="hand2")
+            del_btn.pack(side="left", padx=2)
+            del_btn.bind("<Button-1>",
+                lambda e, pp=path_cap: threading.Thread(
+                    target=self._delete_local_file, args=(pp,), daemon=True).start())
+            del_btn.bind("<Enter>", lambda e, b=del_btn: b.configure(bg=RED))
+            del_btn.bind("<Leave>", lambda e, b=del_btn: b.configure(bg=BG_SURFACE))
+
+            # Toggle checkbox
+            def _toggle(e, pp=path_cap, cl=chk_lbl):
+                if pp.name in self._local_selected:
+                    self._local_selected.discard(pp.name)
+                    cl.configure(text="☐", fg=MUTED)
+                else:
+                    self._local_selected.add(pp.name)
+                    cl.configure(text="☑", fg=ACCENT)
+
+            chk_lbl.bind("<Button-1>", _toggle)
+            name_lbl.bind("<Button-1>", _toggle)
+            row.bind("<Button-1>", _toggle)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _open_dongbo_folder(self):
+        DONGBO_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.Popen(f'explorer "{DONGBO_DIR}"')
+        except Exception as ex:
+            self._log(f"Không mở được thư mục: {ex}", "err")
+
+    def _delete_local_file(self, path: Path):
+        try:
+            path.unlink()
+            self._log(f"✓  Đã xóa local: {path.name}", "ok")
+            self._show_toast(f"✓  Đã xóa: {path.name}")
+        except Exception as ex:
+            self._log(f"Xóa thất bại: {ex}", "err")
+        threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+
+    def _delete_local_selected(self):
+        if not self._local_selected:
+            self._log("Chưa chọn file nào (click tên hoặc ô vuông)", "warn")
+            return
+        names = list(self._local_selected)
+        for name in names:
+            p = DONGBO_DIR / name
+            if p.exists():
+                try:
+                    p.unlink()
+                    self._log(f"✓  Đã xóa: {name}", "ok")
+                except Exception as ex:
+                    self._log(f"Lỗi xóa {name}: {ex}", "err")
+        threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+        self._show_toast(f"✓  Đã xóa {len(names)} file")
 
 
 if __name__ == "__main__":

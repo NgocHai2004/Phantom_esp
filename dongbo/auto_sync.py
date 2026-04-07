@@ -47,7 +47,7 @@ CFG = {
     "probe_timeout"  : 2,              # timeout kiem tra node (giay)
     "dl_timeout"     : 30,             # timeout download file (giay)
     "check_interval" : 3,              # giay giua cac lan kiem tra WiFi
-    "cooldown"       : 30,             # giay doi sau khi sync xong
+    "cooldown"       : 5,              # giay doi sau khi sync xong
 }
 
 SYNC_DIR = Path(__file__).parent.resolve()
@@ -106,16 +106,24 @@ def probe_node(ip: str):
     except Exception:
         return None
 
-def get_file_list(ip: str):
-    try:
-        url = f"http://{ip}/file/list"
-        req = urllib.request.Request(url, headers={"Connection": "close"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            return [f for f in data.get("files", []) if f.get("size", 0) > 0]
-    except Exception as e:
-        log_err(f"file/list({ip}): {e}")
-        return []
+def get_file_list(ip: str, retries: int = 4, retry_delay: float = 3.0):
+    """
+    Lay danh sach file tu ESP32. Retry neu bi timeout (Node dang ban sync noi bo).
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            url = f"http://{ip}/file/list"
+            req = urllib.request.Request(url, headers={"Connection": "close"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+                return [f for f in data.get("files", []) if f.get("size", 0) > 0]
+        except Exception as e:
+            if attempt < retries:
+                log_info(f"  file/list({ip}) lan {attempt} that bai -- thu lai sau {retry_delay}s ({e})")
+                time.sleep(retry_delay)
+            else:
+                log_err(f"file/list({ip}): {e}")
+    return []
 
 def download_file(ip: str, remote_name: str, local_path: Path) -> bool:
     try:
