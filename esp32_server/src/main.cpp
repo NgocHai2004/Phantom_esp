@@ -45,7 +45,7 @@
 #define AP_SSID        "ESP32-Node-1"
 #define AP_PASSWORD    "12345678"
 #define AP_CHANNEL     1
-#define AP_HIDDEN      true           // Ẩn SSID cho demo
+#define AP_HIDDEN      false          // Hiện SSID để dễ kết nối
 #define AP_MAX_CON     4
 #define AP_IP_1        192
 #define AP_IP_2        168
@@ -53,6 +53,7 @@
 #define AP_IP_4        1
 
 #define LED_PIN        2
+#define BOOT_PIN       0              // Nút BOOT tích hợp (GPIO 0, active LOW)
 #define HTTP_PORT      80
 #define AUDIO_PORT     8080
 #define SPIFFS_FILE    "/audio.wav"
@@ -66,11 +67,69 @@ uint8_t* ramBuf  = nullptr;
 size_t   ramSize = 0;
 bool     ramReady = false;
 
+// ── BOOT button toggle state ──────────────────────────────────
+// nodeEnabled = true  → AP bật, server chạy bình thường
+// nodeEnabled = false → AP tắt, server tạm dừng (tiết kiệm điện)
+bool     nodeEnabled      = true;
+bool     lastRawBoot      = HIGH;   // lần đọc raw trước (chống rung)
+bool     stableBoot       = HIGH;   // trạng thái đã ổn định sau debounce
+unsigned long lastDebounceMs = 0;
+#define  DEBOUNCE_MS      50        // 50ms chống rung
+
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100) {
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, LOW);  delay(ms);
     digitalWrite(LED_PIN, HIGH); delay(ms);
+  }
+}
+
+// ── Bật / Tắt node ────────────────────────────────────────────
+void enableNode() {
+  nodeEnabled = true;
+  // Khởi động lại AP
+  WiFi.mode(WIFI_AP_STA);
+  IPAddress apIP(AP_IP_1,AP_IP_2,AP_IP_3,AP_IP_4);
+  IPAddress gw(AP_IP_1,AP_IP_2,AP_IP_3,AP_IP_4);
+  IPAddress sn(255,255,255,0);
+  WiFi.softAPConfig(apIP,gw,sn);
+  WiFi.softAP(AP_SSID,AP_PASSWORD,AP_CHANNEL,AP_HIDDEN,AP_MAX_CON);
+  server.begin();
+  audioServer.begin();
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println("[BOOT] Node-1 ENABLED — AP ON");
+  blinkLED(3, 80);
+}
+
+void disableNode() {
+  nodeEnabled = false;
+  WiFi.softAPdisconnect(true);   // Tắt AP, ngắt tất cả client
+  WiFi.disconnect(true);         // Tắt STA
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("[BOOT] Node-1 DISABLED — AP OFF (low power)");
+  blinkLED(2, 300);
+  digitalWrite(LED_PIN, LOW);   // Đảm bảo LED tắt hẳn
+}
+
+// ── Đọc nút BOOT với debounce chuẩn ────────────────────────
+void checkBootButton() {
+  bool raw = digitalRead(BOOT_PIN);
+  // Nếu tín hiệu thay đổi → reset timer chống rung
+  if (raw != lastRawBoot) {
+    lastDebounceMs = millis();
+    lastRawBoot = raw;
+  }
+  // Sau khi ổn định đủ DEBOUNCE_MS → cập nhật trạng thái ổn định
+  if ((millis() - lastDebounceMs) >= DEBOUNCE_MS) {
+    if (raw != stableBoot) {
+      // Phát hiện cạnh xuống (HIGH→LOW) = nhấn nút
+      if (stableBoot == HIGH && raw == LOW) {
+        if (nodeEnabled) disableNode();
+        else             enableNode();
+      }
+      stableBoot = raw;
+    }
   }
 }
 
@@ -101,26 +160,44 @@ bool spiffsSave(const uint8_t* buf, size_t size) {
   return ok;
 }
 
-// Lưu vào SPIFFS với path tùy ý
+// Lưu vào SPIFFS với path tùy ý (tự động format + retry nếu SPIFFS fragmented)
 bool spiffsSaveAs(const uint8_t* buf, size_t size, const String& path) {
-  // Kiểm tra dung lượng SPIFFS trước khi ghi
-  size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
-  if (size > freeBytes) {
-    Serial.printf("[SPIFFS] Not enough space: need %d, free %d bytes\n", size, freeBytes);
+  if (size > SPIFFS.totalBytes()) {
+    Serial.printf("[SPIFFS] File too large: need %d, total %d bytes\n", size, SPIFFS.totalBytes());
     return false;
   }
-  File f = SPIFFS.open(path, "w");
-  if (!f) { Serial.printf("[SPIFFS] Open '%s' FAILED\n", path.c_str()); return false; }
-  size_t wr = f.write(buf, size); f.close();
-  bool ok = (wr == size);
-  if (!ok) {
-    // Ghi thất bại → xóa file rỗng để tránh 0-byte entry trong danh sách
-    SPIFFS.remove(path);
-    Serial.printf("[SPIFFS] SaveAs '%s' FAILED (%d/%d) — removed empty entry\n", path.c_str(), wr, size);
-  } else {
-    Serial.printf("[SPIFFS] SaveAs '%s' %d/%d → OK\n", path.c_str(), wr, size);
+  // Thử ghi lần 1
+  {
+    File f = SPIFFS.open(path, "w");
+    if (f) {
+      size_t wr = f.write(buf, size); f.close();
+      if (wr == size) {
+        Serial.printf("[SPIFFS] SaveAs '%s' %d/%d → OK\n", path.c_str(), wr, size);
+        return true;
+      }
+      SPIFFS.remove(path);
+      Serial.printf("[SPIFFS] SaveAs '%s' FAILED (%d/%d) — fragmented, auto-format...\n", path.c_str(), wr, size);
+    } else {
+      Serial.printf("[SPIFFS] Open '%s' FAILED — try format...\n", path.c_str());
+    }
   }
-  return ok;
+  // Format để xóa fragmentation, rồi retry
+  Serial.println("[SPIFFS] Formatting...");
+  SPIFFS.format();
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Re-mount FAILED"); return false;
+  }
+  Serial.printf("[SPIFFS] After format: free=%d bytes\n", SPIFFS.totalBytes() - SPIFFS.usedBytes());
+  // Ghi lần 2
+  {
+    File f2 = SPIFFS.open(path, "w");
+    if (!f2) { Serial.printf("[SPIFFS] Open '%s' after format FAILED\n", path.c_str()); return false; }
+    size_t wr2 = f2.write(buf, size); f2.close();
+    bool ok2 = (wr2 == size);
+    if (!ok2) SPIFFS.remove(path);
+    Serial.printf("[SPIFFS] SaveAs '%s' retry: %d/%d → %s\n", path.c_str(), wr2, size, ok2?"OK":"FAIL");
+    return ok2;
+  }
 }
 
 bool spiffsLoad() {
@@ -388,10 +465,11 @@ void handleFileList() {
     if (sz == 0 && ramReady && ramSize > 0 && path == String(SPIFFS_FILE)) {
       sz = ramSize;
     }
-    // Fallback thứ hai: nếu vẫn 0 thì thử đọc trực tiếp qua SPIFFS info
+    // Bỏ qua file rỗng/corrupt (size=0 sau fallback)
     if (sz == 0) {
-      File f3 = SPIFFS.open(path, "r");
-      if (f3) { sz = f3.size(); f3.close(); }
+      if (f2) f2.close();
+      Serial.printf("[FileList] Skip empty '%s'\n", displayName.c_str());
+      continue;
     }
     float dur = 0.0f;
     if (sz >= 44) {
@@ -680,8 +758,11 @@ void syncFromNode2() {
     delay(100);
   }
 
-  // Node-1 là master — KHÔNG xóa file theo Node-2
-  // Chỉ download file mới từ Node-2, không để Node-2 quyết định file nào bị xóa
+  // Nháy LED 3 cái khi có file mới được đồng bộ
+  if (downloaded > 0) blinkLED(3, 100);
+
+  // Chính sách đồng bộ: chỉ bổ sung file còn thiếu — KHÔNG xóa file local
+  // (xóa file phải thực hiện thủ công trên từng node riêng biệt)
 
   WiFi.disconnect(false); delay(200);
   // Không gọi WiFi.mode() — giữ nguyên WIFI_AP_STA để AP không restart
@@ -692,6 +773,7 @@ void syncFromNode2() {
 void setup() {
   Serial.begin(115200); delay(500);
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
+  pinMode(BOOT_PIN, INPUT_PULLUP);  // Nút BOOT GPIO 0, active LOW
 
   Serial.println("\n══════════════════════════════");
   Serial.println(" ESP32 NODE-1  (AP + SPIFFS)");
@@ -771,9 +853,18 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────
 static unsigned long _lastSync2 = 0;
 static bool _syncing = false;
-#define SYNC_INTERVAL_MS 10000UL  // 10 giây
+#define SYNC_INTERVAL_MS 13000UL  // 13 giây (lệch với Node-2: 17s)
 
 void loop() {
+  // Luôn kiểm tra nút BOOT để toggle bật/tắt
+  checkBootButton();
+
+  // Nếu node đang bị tắt → không xử lý server / sync
+  if (!nodeEnabled) {
+    delay(10);
+    return;
+  }
+
   server.handleClient();
   WiFiClient c = audioServer.accept();
   if (c) {

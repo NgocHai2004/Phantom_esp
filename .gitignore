@@ -21,6 +21,16 @@ downloaded_from_client.wav
 dl_server.wav
 dl_client.wav
 
+# ── File WAV tải về / demo (không commit dữ liệu âm thanh) ───
+dongbo/*.wav
+*.wav
+!esp32_client/src/test.wav
+!esp32_server/src/test.wav
+
+# ── dongbo: chỉ commit script + hướng dẫn, không commit file tải về
+dongbo/downloaded/
+dongbo/__pycache__/
+
 # ── Credentials / môi trường ─────────────────────────────────
 .env
 *.env

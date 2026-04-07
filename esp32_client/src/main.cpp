@@ -39,7 +39,7 @@
 #define MY_AP_SSID         "ESP32-Node-2"
 #define MY_AP_PASSWORD     "12345678"
 #define MY_AP_CHANNEL      6          // Kênh khác Node-1 (channel 1)
-#define MY_AP_HIDDEN       true           // Ẩn SSID cho demo
+#define MY_AP_HIDDEN       false          // Hiện SSID để dễ kết nối
 #define MY_AP_MAX_CON      4
 
 // Node-1 cần kết nối để lấy file
@@ -50,6 +50,7 @@
 #define NODE1_HTTP_PORT    80
 
 #define LED_PIN            2
+#define BOOT_PIN           0              // Nút BOOT tích hợp (GPIO 0, active LOW)
 #define HTTP_PORT          80
 #define AUDIO_PORT         8080
 #define SPIFFS_FILE        "/audio.wav"
@@ -71,11 +72,68 @@ bool syncDone   = false;
 bool syncFailed = false;
 String syncMsg  = "not started";
 
+// ── BOOT button toggle state ──────────────────────────────────
+// nodeEnabled = true  → AP bật, server chạy bình thường
+// nodeEnabled = false → AP tắt, server tạm dừng (tiết kiệm điện)
+bool     nodeEnabled      = true;
+bool     lastRawBoot      = HIGH;   // lần đọc raw trước (chống rung)
+bool     stableBoot       = HIGH;   // trạng thái đã ổn định sau debounce
+unsigned long lastDebounceMs = 0;
+#define  DEBOUNCE_MS      50        // 50ms chống rung
+
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100) {
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, LOW);  delay(ms);
     digitalWrite(LED_PIN, HIGH); delay(ms);
+  }
+}
+
+// ── Bật / Tắt node ────────────────────────────────────────────
+void enableNode() {
+  nodeEnabled = true;
+  WiFi.mode(WIFI_AP_STA);
+  IPAddress apIP(192,168,5,1);
+  IPAddress gw(192,168,5,1);
+  IPAddress sn(255,255,255,0);
+  WiFi.softAPConfig(apIP,gw,sn);
+  WiFi.softAP(MY_AP_SSID,MY_AP_PASSWORD,MY_AP_CHANNEL,MY_AP_HIDDEN,MY_AP_MAX_CON);
+  server.begin();
+  audioServer.begin();
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println("[BOOT] Node-2 ENABLED — AP ON");
+  blinkLED(3, 80);
+}
+
+void disableNode() {
+  nodeEnabled = false;
+  WiFi.softAPdisconnect(true);   // Tắt AP, ngắt tất cả client
+  WiFi.disconnect(true);         // Tắt STA
+  WiFi.mode(WIFI_OFF);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("[BOOT] Node-2 DISABLED — AP OFF (low power)");
+  blinkLED(2, 300);
+  digitalWrite(LED_PIN, LOW);   // Đảm bảo LED tắt hẳn
+}
+
+// ── Đọc nút BOOT với debounce chuẩn ────────────────────────
+void checkBootButton() {
+  bool raw = digitalRead(BOOT_PIN);
+  // Nếu tín hiệu thay đổi → reset timer chống rung
+  if (raw != lastRawBoot) {
+    lastDebounceMs = millis();
+    lastRawBoot = raw;
+  }
+  // Sau khi ổn định đủ DEBOUNCE_MS → cập nhật trạng thái ổn định
+  if ((millis() - lastDebounceMs) >= DEBOUNCE_MS) {
+    if (raw != stableBoot) {
+      // Phát hiện cạnh xuống (HIGH→LOW) = nhấn nút
+      if (stableBoot == HIGH && raw == LOW) {
+        if (nodeEnabled) disableNode();
+        else             enableNode();
+      }
+      stableBoot = raw;
+    }
   }
 }
 
@@ -109,24 +167,44 @@ bool spiffsSave(const uint8_t* buf, size_t size) {
   return ok;
 }
 
-// Lưu vào SPIFFS với path tùy ý
+// Lưu vào SPIFFS với path tùy ý (tự động format + retry nếu SPIFFS fragmented)
 bool spiffsSaveAs(const uint8_t* buf, size_t size, const String& path) {
-  size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
-  if (size > freeBytes) {
-    Serial.printf("[SPIFFS] Not enough space: need %d, free %d bytes\n", size, freeBytes);
+  if (size > SPIFFS.totalBytes()) {
+    Serial.printf("[SPIFFS] File too large: need %d, total %d bytes\n", size, SPIFFS.totalBytes());
     return false;
   }
-  File f = SPIFFS.open(path, "w");
-  if (!f) { Serial.printf("[SPIFFS] Open '%s' FAILED\n", path.c_str()); return false; }
-  size_t wr = f.write(buf, size); f.close();
-  bool ok = (wr == size);
-  if (!ok) {
-    SPIFFS.remove(path);
-    Serial.printf("[SPIFFS] SaveAs '%s' FAILED (%d/%d) — removed empty entry\n", path.c_str(), wr, size);
-  } else {
-    Serial.printf("[SPIFFS] SaveAs '%s' %d/%d → OK\n", path.c_str(), wr, size);
+  // Thử ghi lần 1
+  {
+    File f = SPIFFS.open(path, "w");
+    if (f) {
+      size_t wr = f.write(buf, size); f.close();
+      if (wr == size) {
+        Serial.printf("[SPIFFS] SaveAs '%s' %d/%d → OK\n", path.c_str(), wr, size);
+        return true;
+      }
+      SPIFFS.remove(path);
+      Serial.printf("[SPIFFS] SaveAs '%s' FAILED (%d/%d) — fragmented, auto-format...\n", path.c_str(), wr, size);
+    } else {
+      Serial.printf("[SPIFFS] Open '%s' FAILED — try format...\n", path.c_str());
+    }
   }
-  return ok;
+  // Format để xóa fragmentation, rồi retry
+  Serial.println("[SPIFFS] Formatting...");
+  SPIFFS.format();
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Re-mount FAILED"); return false;
+  }
+  Serial.printf("[SPIFFS] After format: free=%d bytes\n", SPIFFS.totalBytes() - SPIFFS.usedBytes());
+  // Ghi lần 2
+  {
+    File f2 = SPIFFS.open(path, "w");
+    if (!f2) { Serial.printf("[SPIFFS] Open '%s' after format FAILED\n", path.c_str()); return false; }
+    size_t wr2 = f2.write(buf, size); f2.close();
+    bool ok2 = (wr2 == size);
+    if (!ok2) SPIFFS.remove(path);
+    Serial.printf("[SPIFFS] SaveAs '%s' retry: %d/%d → %s\n", path.c_str(), wr2, size, ok2?"OK":"FAIL");
+    return ok2;
+  }
 }
 
 // Sanitize tên file: chỉ giữ ký tự an toàn
@@ -192,23 +270,28 @@ String wavInfoJson(const uint8_t* buf, size_t size) {
 }
 
 // ── Helper: HTTP GET text từ Node-1 ──────────────────────────
-String httpGetFromNode1(const char* path, int timeoutMs = 5000) {
-  WiFiClient c;
-  if (!c.connect(NODE1_IP, NODE1_HTTP_PORT)) return "";
-  c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, NODE1_IP);
-  String body = "";
-  bool inBody = false;
-  unsigned long t = millis();
-  while (c.connected() && (millis()-t) < (unsigned long)timeoutMs) {
-    if (c.available()) {
-      String line = c.readStringUntil('\n'); line.trim();
-      if (inBody) { body += line; }
-      else if (line.length() == 0) { inBody = true; }
-      t = millis();
-    } else delay(1);
+String httpGetFromNode1(const char* path, int timeoutMs = 8000) {
+  // Thử tối đa 3 lần nếu body rỗng (do Node-1 đang bận sync)
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(1500); // Đợi Node-1 rảnh trước khi retry
+    WiFiClient c;
+    if (!c.connect(NODE1_IP, NODE1_HTTP_PORT)) continue;
+    c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, NODE1_IP);
+    String body = "";
+    bool inBody = false;
+    unsigned long t = millis();
+    while (c.connected() && (millis()-t) < (unsigned long)timeoutMs) {
+      if (c.available()) {
+        String line = c.readStringUntil('\n'); line.trim();
+        if (inBody) { body += line; }
+        else if (line.length() == 0) { inBody = true; }
+        t = millis();
+      } else delay(1);
+    }
+    c.stop();
+    if (body.length() > 0) return body; // Có data → trả về ngay
   }
-  c.stop();
-  return body;
+  return ""; // Tất cả lần thử đều rỗng
 }
 
 // ── Helper: HTTP GET file binary từ Node-1 → lưu SPIFFS ──────
@@ -306,79 +389,42 @@ bool syncFromNode1() {
   Serial.printf("[Sync] Node-1 has %d file(s)\n", remoteFiles.size());
 
   if (remoteFiles.empty()) {
-    // Fallback: nếu /file/list rỗng → thử lấy audio.wav qua TCP (backward compat)
-    WiFiClient tcp;
-    if (tcp.connect(NODE1_IP, NODE1_TCP_PORT)) {
-      tcp.printf("GET /audio.wav HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
-                 NODE1_IP, NODE1_TCP_PORT);
-      int clen = 0; unsigned long t = millis();
-      while (tcp.connected() && (millis()-t) < 5000) {
-        String line = tcp.readStringUntil('\n'); line.trim();
-        if (line.length()==0) break;
-        String lo=line; lo.toLowerCase();
-        if (lo.startsWith("content-length:")) clen=line.substring(line.indexOf(':')+1).toInt();
-        t=millis();
-      }
-      if (clen > 0 && clen <= (int)MAX_FILE_SIZE) {
-        if (ramBuf){free(ramBuf);ramBuf=nullptr;ramSize=0;}
-        ramBuf=(uint8_t*)malloc(clen);
-        if (ramBuf) {
-          size_t rx=0; t=millis();
-          while(rx<(size_t)clen&&tcp.connected()&&(millis()-t)<20000){
-            size_t av=tcp.available();
-            if(av>0){size_t ch=min(av,(size_t)(clen-rx));tcp.readBytes(ramBuf+rx,ch);rx+=ch;t=millis();}else delay(1);
-          }
-          ramSize=rx; ramReady=(rx>=44);
-          if (ramReady) spiffsSave(ramBuf, ramSize);
-        }
-      }
-      tcp.stop();
-    }
-    WiFi.disconnect(false); delay(500);
-    syncMsg = ramReady ? "ok: fallback audio.wav" : "failed: no files";
-    return ramReady;
+    // /file/list rỗng → Node-1 chưa có file hoặc bận (STA sync đang chạy)
+    // KHÔNG fallback TCP để tránh ghi đè audio.wav hiện có
+    WiFi.disconnect(false); delay(300);
+    Serial.println("[Sync] Node-1 has no files — skip");
+    syncMsg = "skipped: Node-1 empty";
+    return false;
   }
 
-  // Download từng file chưa có trong SPIFFS
+  // Download từng file chưa có trong SPIFFS (hoặc file corrupt size=0)
   int downloaded = 0;
   for (auto& fname : remoteFiles) {
     String path = "/" + fname;
     if (SPIFFS.exists(path)) {
-      Serial.printf("[Sync] Skip '%s' — already exists\n", fname.c_str());
-      continue;
+      // Kiểm tra file có bị corrupt (size=0) không
+      File fc = SPIFFS.open(path, "r");
+      size_t fsz = fc ? fc.size() : 0;
+      if (fc) fc.close();
+      if (fsz == 0) {
+        // File rỗng/corrupt → xóa và download lại
+        SPIFFS.remove(path);
+        Serial.printf("[Sync] Removed corrupt '%s' (size=0) — re-download\n", fname.c_str());
+      } else {
+        Serial.printf("[Sync] Skip '%s' — already exists (%d bytes)\n", fname.c_str(), fsz);
+        continue;
+      }
     }
     bool ok = httpDownloadFileFromNode1(fname);
     if (ok) downloaded++;
     delay(100);
   }
 
-  // Xóa file local không còn tồn tại ở Node-1
-  int deleted = 0;
-  {
-    std::vector<String> localFiles;
-    File root = SPIFFS.open("/");
-    File fi = root.openNextFile();
-    while (fi) {
-      if (!fi.isDirectory()) localFiles.push_back(String(fi.name()));
-      fi.close();
-      fi = root.openNextFile();
-    }
-    root.close();
-    for (auto& lname : localFiles) {
-      String displayName = lname.startsWith("/") ? lname.substring(1) : lname;
-      bool foundInRemote = false;
-      for (auto& rname : remoteFiles) {
-        if (rname == displayName) { foundInRemote = true; break; }
-      }
-      if (!foundInRemote) {
-        String lpath = lname.startsWith("/") ? lname : ("/" + lname);
-        SPIFFS.remove(lpath);
-        Serial.printf("[Sync] Deleted local '%s' — not in Node-1\n", displayName.c_str());
-        deleted++;
-      }
-    }
-  }
-  Serial.printf("[Sync] +%d downloaded, -%d deleted\n", downloaded, deleted);
+  // Nháy LED 3 cái khi có file mới được đồng bộ
+  if (downloaded > 0) blinkLED(3, 100);
+
+  // Chỉ bổ sung file thiếu — KHÔNG xóa file local dù Node-1 không còn file đó
+  Serial.printf("[Sync] +%d downloaded (no delete policy)\n", downloaded);
 
   // Không gọi /shutdown — Node-1 luôn chạy để phục vụ laptop + sync
   WiFi.disconnect(false); delay(300);
@@ -488,7 +534,7 @@ void handleFileList() {
     }
     root.close();
   }
-  // Bước 2: build JSON
+  // Bước 2: build JSON — bỏ qua file size=0 (corrupt/empty)
   String j = "{\"files\":[";
   int count = 0;
   for (auto& fname : names) {
@@ -498,6 +544,8 @@ void handleFileList() {
     size_t sz = f2 ? f2.size() : 0;
     // Fallback: file vừa upload còn trong RAM
     if (sz == 0 && ramReady && ramSize > 0 && path == String(SPIFFS_FILE)) sz = ramSize;
+    // Bỏ qua file rỗng/corrupt
+    if (sz == 0) { if (f2) f2.close(); Serial.printf("[FileList] Skip empty '%s'\n", displayName.c_str()); continue; }
     float dur = 0.0f;
     if (sz >= 44) {
       if (ramReady && ramBuf && ramSize >= 44 && path == String(SPIFFS_FILE)) {
@@ -650,6 +698,7 @@ void handleRawTCP(WiFiClient& client) {
 void setup() {
   Serial.begin(115200); delay(500);
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
+  pinMode(BOOT_PIN, INPUT_PULLUP);  // Nút BOOT GPIO 0, active LOW
 
   Serial.println("\n══════════════════════════════");
   Serial.println(" ESP32 NODE-2  (APSTA + SPIFFS)");
@@ -728,11 +777,20 @@ void setup() {
 }
 
 // ── Loop ──────────────────────────────────────────────────────
-static unsigned long _lastSync1 = 0;
+static unsigned long _lastSync1 = 3000UL; // Offset 3s so Node-1 không sync cùng lúc
 static bool _syncing = false;
-#define SYNC_INTERVAL_MS 10000UL  // 10 giây
+#define SYNC_INTERVAL_MS 17000UL  // 17 giây (lệch với Node-1: 13s)
 
 void loop() {
+  // Luôn kiểm tra nút BOOT để toggle bật/tắt
+  checkBootButton();
+
+  // Nếu node đang bị tắt → không xử lý server / sync
+  if (!nodeEnabled) {
+    delay(10);
+    return;
+  }
+
   server.handleClient();
   WiFiClient c=audioServer.accept();
   if(c){

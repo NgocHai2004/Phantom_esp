@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+c#!/usr/bin/env python3
 """
 ram_viewer.py — Xem RAM buffer của ESP32 Server và Client từ PC
 ═══════════════════════════════════════════════════════════════
