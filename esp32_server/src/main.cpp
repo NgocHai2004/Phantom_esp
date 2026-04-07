@@ -57,6 +57,7 @@
 #define BOOT_PIN           0
 #define HTTP_PORT          80
 #define AUDIO_PORT         8080
+#define UPLOAD_PORT        8081      // Raw TCP upload — bypass WebServer body issue
 #define SPIFFS_FILE        "/audio.wav"
 #define MAX_FILE_SIZE      1800000   // 1.8 MB
 
@@ -67,6 +68,7 @@
 
 WebServer  server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);
+WiFiServer uploadServer(UPLOAD_PORT); // Raw TCP upload server
 
 // ── RAM buffer (giữ audio.wav trong RAM để phục vụ nhanh) ─────
 uint8_t* ramBuf   = nullptr;
@@ -99,6 +101,7 @@ void enableNode() {
   WiFi.softAP(MY_AP_SSID,MY_AP_PASSWORD,MY_AP_CHANNEL,MY_AP_HIDDEN,MY_AP_MAX_CON);
   server.begin();
   audioServer.begin();
+  uploadServer.begin();
   digitalWrite(LED_PIN, HIGH);
   Serial.println("[BOOT] Node-1 ENABLED — AP_STA ON");
   blinkLED(3, 80);
@@ -163,7 +166,7 @@ String sanitizeFilename(const String& nameIn) {
   name.trim();
   if (name.length() == 0) return "";
 
-  // Tách base và extension
+  // Tách base và extension (dùng dấu chấm cuối cùng)
   int dotIdx = name.lastIndexOf('.');
   String base = (dotIdx > 0) ? name.substring(0, dotIdx) : name;
   String ext  = (dotIdx > 0) ? name.substring(dotIdx)    : "";
@@ -171,12 +174,27 @@ String sanitizeFilename(const String& nameIn) {
   // lowercase extension để so sánh MIME
   String extLow = ext; extLow.toLowerCase();
 
-  // Sanitize base: chỉ giữ alphanumeric, '-', '_'
+  // Sanitize base: giữ alphanumeric, '-', '_', khoảng trắng→'_'
+  // Tối đa 32 ký tự để SPIFFS không bị giới hạn path
   String outBase = "";
-  for (int i = 0; i < (int)base.length() && (int)outBase.length() < 24; i++) {
+  bool lastUnderscore = false;
+  for (int i = 0; i < (int)base.length() && (int)outBase.length() < 32; i++) {
     char c = base[i];
-    if (isAlphaNumeric(c) || c == '-' || c == '_') outBase += c;
+    if (isAlphaNumeric(c) || c == '-') {
+      outBase += c;
+      lastUnderscore = false;
+    } else if (c == '_' || c == ' ' || c == '.' || c == '(' || c == ')') {
+      // Thay khoảng trắng và ký tự phổ biến bằng '_', không lặp
+      if (!lastUnderscore && outBase.length() > 0) {
+        outBase += '_';
+        lastUnderscore = true;
+      }
+    }
+    // Bỏ qua ký tự khác
   }
+  // Xóa '_' cuối
+  while (outBase.length() > 0 && outBase[outBase.length()-1] == '_')
+    outBase.remove(outBase.length()-1);
   if (outBase.length() == 0) return "";
 
   // Sanitize extension: chỉ giữ alphanumeric (tối đa 8 ký tự sau dấu chấm)
@@ -187,9 +205,9 @@ String sanitizeFilename(const String& nameIn) {
       char c = extLow[i];
       if (isAlphaNumeric(c)) outExt += c;
     }
-    if (outExt.length() <= 1) outExt = ""; // không có ký tự sau dấu chấm
+    if (outExt.length() <= 1) outExt = "";
   }
-  if (outExt.length() == 0) outExt = ".bin"; // fallback nếu không có extension
+  if (outExt.length() == 0) outExt = ".bin";
 
   return outBase + outExt;
 }
@@ -498,10 +516,31 @@ void handleFileUpload() {
   }
 
   // Đọc từ raw TCP client → ghi thẳng vào SPIFFS theo từng chunk
+  // Lưu ý: WebServer có thể đã đọc một phần body vào internal buffer.
+  // Dùng server.arg("plain") để lấy phần đã buffer, sau đó đọc thêm từ client.
   WiFiClient cli = server.client();
+
+  // Đợi tối đa 2s để TCP buffer fill (WiFi có thể chậm hơn handler)
+  unsigned long tWait = millis();
+  while (cli.available() == 0 && cli.connected() && (millis()-tWait) < 2000) {
+    delay(5);
+  }
+
   size_t rx = 0;
   uint8_t chunk[512];
   unsigned long t = millis();
+
+  // Kiểm tra nếu WebServer đã buffer body qua server.arg("plain")
+  String plainBody = server.arg("plain");
+  if (plainBody.length() > 0 && (int)plainBody.length() <= clen) {
+    size_t pbLen = plainBody.length();
+    spiffsFile.write((const uint8_t*)plainBody.c_str(), pbLen);
+    rx = pbLen;
+    Serial.printf("[Upload] plain body: %d bytes pre-buffered\n", pbLen);
+    t = millis();
+  }
+
+  // Đọc phần còn lại từ TCP
   while (rx < (size_t)clen && cli.connected() && (millis()-t) < 30000) {
     size_t av = cli.available();
     if (av > 0) {
@@ -513,7 +552,7 @@ void handleFileUpload() {
         t = millis();
       }
     } else {
-      delay(1);
+      delay(2);
     }
   }
   spiffsFile.close();
@@ -648,6 +687,90 @@ void handleSyncStatus() {
   Serial.printf("[Sync/Status] Thiết bị B hỏi — Danh sách: %d file\n", count);
 }
 
+// ── Raw TCP Upload Server (port 8081) ─────────────────────────
+// Bypass WebServer library hoàn toàn — đọc HTTP request + body trực tiếp
+void handleRawUpload(WiFiClient& cli) {
+  // Đọc request line
+  String reqLine = cli.readStringUntil('\n'); reqLine.trim();
+  Serial.printf("[Upload8081] %s\n", reqLine.substring(0,60).c_str());
+
+  // Đọc headers
+  String xFilename = "";
+  int    clen      = 0;
+  unsigned long th = millis();
+  while (cli.connected() && (millis()-th) < 5000) {
+    if (!cli.available()) { delay(2); continue; }
+    String line = cli.readStringUntil('\n'); line.trim();
+    if (line.length() == 0) break;  // blank line = end of headers
+    String lo = line; lo.toLowerCase();
+    if (lo.startsWith("content-length:")) {
+      String val = line.substring(line.indexOf(':')+1); val.trim();
+      clen = val.toInt();
+    }
+    if (lo.startsWith("x-filename:")) {
+      xFilename = line.substring(line.indexOf(':')+1); xFilename.trim();
+    }
+    th = millis();
+  }
+  Serial.printf("[Upload8081] fname='%s' CL=%d\n", xFilename.c_str(), clen);
+
+  if (clen <= 0 || clen > (int)MAX_FILE_SIZE) {
+    cli.print("HTTP/1.0 400 Bad Request\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"bad clen\"}");
+    cli.flush(); return;
+  }
+
+  String saveAs = sanitizeFilename(xFilename);
+  if (saveAs.length() == 0) saveAs = genAutoFilename();
+  String path = "/" + saveAs;
+
+  if (SPIFFS.exists(path)) SPIFFS.remove(path);
+  File spiffsFile = SPIFFS.open(path, "w");
+  if (!spiffsFile) {
+    cli.print("HTTP/1.0 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"error\":\"spiffs open failed\"}");
+    cli.flush(); return;
+  }
+
+  // Đọc body trực tiếp từ TCP — không qua WebServer
+  size_t rx = 0;
+  uint8_t chunk[512];
+  unsigned long t = millis();
+  while (rx < (size_t)clen && cli.connected() && (millis()-t) < 30000) {
+    size_t av = cli.available();
+    if (av > 0) {
+      size_t want = min(av, min((size_t)512, (size_t)(clen-rx)));
+      size_t rd   = cli.readBytes(chunk, want);
+      if (rd > 0) { spiffsFile.write(chunk, rd); rx += rd; t = millis(); }
+    } else { delay(2); }
+  }
+  spiffsFile.close();
+  Serial.printf("[Upload8081] '%s' rx=%d/%d\n", saveAs.c_str(), rx, clen);
+
+  bool saved = (rx > 0 && SPIFFS.exists(path));
+  if (saved) { File chk=SPIFFS.open(path,"r"); if(chk){saved=(chk.size()==rx);chk.close();} }
+  if (!saved) SPIFFS.remove(path);
+
+  // Nếu là audio.wav → load vào RAM
+  if (saved && saveAs == "audio.wav") {
+    if (ramBuf) { free(ramBuf); ramBuf=nullptr; ramSize=0; ramReady=false; }
+    File f = SPIFFS.open(path,"r");
+    if (f) { size_t sz=f.size(); ramBuf=(uint8_t*)malloc(sz);
+      if (ramBuf){size_t rd=f.read(ramBuf,sz);f.close();ramSize=rd;ramReady=(rd>=44);}
+      else f.close(); }
+  }
+
+  blinkLED(saved?5:2, 80);
+  Serial.printf("[Upload8081] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved?"OK":"FAIL");
+
+  String resp = "{\"status\":\"" + String(saved?"ok":"fail") + "\""
+    ",\"filename\":\"" + saveAs + "\""
+    ",\"size\":"       + String(rx) +
+    ",\"spiffs_saved\":" + String(saved?"true":"false") + "}";
+  cli.printf("HTTP/1.0 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+             saved?"200 OK":"500 Internal Server Error",
+             (int)resp.length(), resp.c_str());
+  cli.flush();
+}
+
 void handleNotFound() {
   server.send(404,"application/json","{\"error\":\"not found\"}");
 }
@@ -769,6 +892,7 @@ void setup() {
   server.onNotFound(handleNotFound);
   server.begin();
   audioServer.begin();
+  uploadServer.begin();
 
   // Nếu SPIFFS đã có file → load WAV vào RAM
   if (spiffsHasFile()) {
@@ -1011,8 +1135,8 @@ bool syncFromNode2() {
 }
 
 // ── Loop ──────────────────────────────────────────────────────
-static unsigned long _lastSync2  = 0;
-static bool          _syncing2   = false;
+static unsigned long _lastSync2     = 0;
+static bool          _syncing2      = false;
 
 void loop() {
   checkBootButton();
@@ -1026,17 +1150,37 @@ void loop() {
     while (!c.available() && c.connected() && (millis()-t) < 3000) delay(1);
     if (c.available()) handleRawTCP(c);
     c.stop();
+    _lastSync2 = millis();
   }
 
-  // Periodic sync từ Node-2 mỗi 10s
+  // Raw TCP Upload Server port 8081 — bypass WebServer body issue
+  WiFiClient uc = uploadServer.accept();
+  if (uc) {
+    unsigned long t = millis();
+    while (!uc.available() && uc.connected() && (millis()-t) < 5000) delay(2);
+    if (uc.available()) handleRawUpload(uc);
+    uc.stop();
+    _lastSync2 = millis();  // hoãn sync sau upload
+  }
+
+  // Periodic sync từ Node-2 mỗi SYNC_INTERVAL_MS:
+  // - Không sync nếu đang có AP station kết nối (laptop đang dùng)
+  // - Reset timer sau mỗi sync để tránh loop
   if (!_syncing2 && (millis() - _lastSync2 >= SYNC_INTERVAL_MS)) {
-    _syncing2   = true;
-    _lastSync2  = millis();
-    int before  = countSpiffsFiles();
-    Serial.printf("\n[Sync2] ── Bắt đầu đồng bộ (Thiết bị A có %d file) ──\n", before);
-    syncFromNode2();
-    int after   = countSpiffsFiles();
-    Serial.printf("[Sync2] Danh sách: %d file (Thiết bị A)\n", after);
-    _syncing2   = false;
+    // Kiểm tra có AP client không — nếu có, hoãn sync
+    uint8_t apClients = WiFi.softAPgetStationNum();
+    if (apClients > 0) {
+      Serial.printf("[Sync2] Hoãn sync — có %d client đang kết nối AP\n", apClients);
+      _lastSync2 = millis();  // đặt lại timer, thử sau SYNC_INTERVAL_MS
+    } else {
+      _syncing2  = true;
+      _lastSync2 = millis();
+      int before = countSpiffsFiles();
+      Serial.printf("\n[Sync2] ── Bắt đầu đồng bộ (Thiết bị A có %d file) ──\n", before);
+      syncFromNode2();
+      int after  = countSpiffsFiles();
+      Serial.printf("[Sync2] Danh sách: %d file (Thiết bị A)\n", after);
+      _syncing2  = false;
+    }
   }
 }

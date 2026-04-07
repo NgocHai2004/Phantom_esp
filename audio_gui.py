@@ -17,12 +17,14 @@ from pathlib import Path
 DONGBO_DIR = Path(__file__).parent / "dongbo"
 
 # ── Network config ─────────────────────────────────────────────────────────────
-SERVER_IP    = "192.168.4.1"
-SERVER_HTTP  = 80
-SERVER_AUDIO = 8080
-CLIENT_IP    = "192.168.5.1"
-CLIENT_HTTP  = 80
-CLIENT_AUDIO = 8080
+SERVER_IP     = "192.168.4.1"
+SERVER_HTTP   = 80
+SERVER_AUDIO  = 8080
+SERVER_UPLOAD = 8081   # Raw TCP upload port — bypass WebServer body issue
+CLIENT_IP     = "192.168.5.1"
+CLIENT_HTTP   = 80
+CLIENT_AUDIO  = 8080
+CLIENT_UPLOAD = 8081   # Node-2 cũng dùng port 8081 để upload
 
 # ── Appearance ────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("dark")
@@ -67,6 +69,19 @@ def _mime_for(filename: str) -> str:
     ext = os.path.splitext(filename)[1].lower()
     return _MIME_MAP.get(ext, "application/octet-stream")
 
+def _safe_header_filename(filename: str) -> str:
+    """Thay khoảng trắng và ký tự đặc biệt trong HTTP header bằng '_'.
+    Giữ nguyên extension. Đảm bảo header không bị corrupt."""
+    import re
+    base, ext = os.path.splitext(filename)
+    # Thay khoảng trắng và ký tự ngoài ASCII printable an toàn → _
+    safe_base = re.sub(r'[^\w\-.]', '_', base)
+    # Xóa nhiều _ liên tiếp
+    safe_base = re.sub(r'_+', '_', safe_base).strip('_')
+    if not safe_base:
+        safe_base = "file"
+    return safe_base + ext.lower()
+
 def tcp_upload(host, port, path, data: bytes, timeout=20, filename=""):
     """Upload qua HTTP (port 80) hoặc TCP raw (port 8080).
     Luôn gửi Content-Length để ESP32 đọc đúng binary body."""
@@ -75,9 +90,11 @@ def tcp_upload(host, port, path, data: bytes, timeout=20, filename=""):
     try:
         s.connect((host, port))
         mime = _mime_for(filename) if filename else "application/octet-stream"
+        # Encode filename an toàn cho HTTP header (không có khoảng trắng/ký tự đặc biệt)
+        safe_fname = _safe_header_filename(filename) if filename else ""
         req = (f"POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
                f"Content-Type: {mime}\r\nContent-Length: {len(data)}\r\n"
-               + (f"X-Filename: {filename}\r\n" if filename else "")
+               + (f"X-Filename: {safe_fname}\r\n" if safe_fname else "")
                + "Connection: close\r\n\r\n").encode()
         s.sendall(req)
         sent = 0
@@ -103,10 +120,53 @@ def tcp_upload(host, port, path, data: bytes, timeout=20, filename=""):
 
 def http_upload(host, port, filename: str, data: bytes, timeout=30):
     """Upload file lên /file/upload qua HTTP port 80.
-    Giữ nguyên tên file gốc qua header X-Filename.
+    Dùng raw socket với HTTP/1.0 để tránh chunked Transfer-Encoding.
+    ESP32 WebServer đọc body qua server.client() — cần Content-Length chính xác.
     Trả về (response_str, bytes_sent)."""
-    return tcp_upload(host, port, "/file/upload", data,
-                      timeout=timeout, filename=filename)
+    safe_fname = _safe_header_filename(filename) if filename else "file.bin"
+    mime = _mime_for(filename) if filename else "application/octet-stream"
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        # HTTP/1.0 để tránh chunked encoding — ESP32 chỉ hỗ trợ Content-Length
+        req = (
+            f"POST /file/upload HTTP/1.0\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: {mime}\r\n"
+            f"Content-Length: {len(data)}\r\n"
+            f"X-Filename: {safe_fname}\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode("ascii")
+        # Gửi header trước, đợi ESP32 sẵn sàng đọc body
+        s.sendall(req)
+        # Gửi body theo chunk nhỏ để WiFi stack không bị overrun
+        sent = 0
+        chunk_sz = 1024
+        while sent < len(data):
+            end = min(sent + chunk_sz, len(data))
+            s.sendall(data[sent:end])
+            sent = end
+        # Đọc response
+        resp = b""
+        s.settimeout(15)
+        try:
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                resp += c
+        except Exception:
+            pass
+        return resp.decode(errors="replace"), sent
+    except Exception as e:
+        return f"ERROR: {e}", 0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def http_download_file(host, port, filename: str, timeout=45) -> bytes:
     """Download file từ /file/download?name=<filename> qua HTTP port 80.
@@ -1041,6 +1101,7 @@ class App(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
     def _check_wav(self):
         """Đọc file đã chọn (bất kỳ định dạng). Tên giữ nguyên để giữ tương thích."""
+        import zipfile
         path = self.wav_path.get().strip()
         if not path or not os.path.exists(path):
             self._log("Chưa chọn file hoặc file không tồn tại", "warn")
@@ -1049,10 +1110,24 @@ class App(ctk.CTk):
         if len(data) == 0:
             self._log("File rỗng, không thể gửi", "warn")
             return None
-        ext  = os.path.splitext(path)[1].upper() or "FILE"
+        ext  = os.path.splitext(path)[1].lower()
         size_kb = len(data) / 1024
         size_str = f"{size_kb:.0f} KB" if size_kb >= 1 else f"{len(data)} B"
-        self._log(f"File: {os.path.basename(path)}  ({size_str})  [{ext}]", "data")
+        # Kiểm tra ZIP integrity cho xlsx/docx/zip (chúng là ZIP archives)
+        zip_exts = {".xlsx", ".xls", ".docx", ".doc", ".pptx", ".zip", ".odt", ".ods"}
+        if ext in zip_exts:
+            try:
+                import io
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    bad = zf.testzip()
+                    if bad:
+                        self._log(f"CẢNH BÁO: File {os.path.basename(path)} bị hỏng (entry: {bad}). Vẫn upload nhưng có thể không mở được.", "warn")
+            except zipfile.BadZipFile:
+                self._log(f"LỖI: {os.path.basename(path)} không phải ZIP hợp lệ — file bị hỏng trên máy tính. Hãy lấy file gốc lại.", "error")
+                return None
+            except Exception as e:
+                self._log(f"CẢNH BÁO: Không kiểm tra được ZIP: {e}", "warn")
+        self._log(f"File: {os.path.basename(path)}  ({size_str})  [{ext.upper()}]", "data")
         return data
 
     def _upload_to_server(self):
@@ -1063,9 +1138,9 @@ class App(ctk.CTk):
             self._upload_pb.pack(fill="x", padx=12, pady=(0, 2)),
             self._upload_pb.start()
         ))
-        # Luôn upload qua HTTP port 80 /file/upload để giữ nguyên định dạng binary
-        upload_ip   = CLIENT_IP  if self._detected_node == 2 else SERVER_IP
-        upload_port = CLIENT_HTTP if self._detected_node == 2 else SERVER_HTTP
+        # Upload qua raw TCP port 8081 — bypass WebServer body consume issue
+        upload_ip   = CLIENT_IP    if self._detected_node == 2 else SERVER_IP
+        upload_port = CLIENT_UPLOAD if self._detected_node == 2 else SERVER_UPLOAD
         node_label  = "Thiết bị B" if self._detected_node == 2 else "Thiết bị A"
         wav  = self.wav_path.get()
         data = self._check_wav()
@@ -1157,9 +1232,17 @@ class App(ctk.CTk):
             with open(save_path, "wb") as fout: fout.write(data)
         abs_path = os.path.abspath(save_path)
         # Unblock file khỏi Windows Security Zone để Word/Excel mở không bị chặn
+        # Cách 1: Xóa Zone.Identifier ADS trực tiếp (nhanh, không cần PowerShell)
+        try:
+            zone_path = abs_path + ":Zone.Identifier"
+            if os.path.exists(zone_path):
+                os.remove(zone_path)
+        except Exception:
+            pass
+        # Cách 2: PowerShell Unblock-File (dùng double quotes để an toàn với path có space)
         try:
             subprocess.run(
-                ["powershell", "-Command", f"Unblock-File '{abs_path}'"],
+                ["powershell", "-Command", f'Unblock-File -Path "{abs_path}"'],
                 capture_output=True, timeout=5
             )
         except Exception:
