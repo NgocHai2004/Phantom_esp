@@ -336,7 +336,7 @@ class App(ctk.CTk):
         self._dl_pb.pack_forget()
 
         ctk.CTkButton(card3,
-                      text="🗁   Mở thư mục folder_test",
+                      text="🗁   Mở thư mục Downloads",
                       font=ctk.CTkFont("Segoe UI", 10),
                       fg_color=BG_CARD, hover_color=BORDER,
                       border_color=BORDER, border_width=1,
@@ -750,9 +750,8 @@ class App(ctk.CTk):
                 text="Tải thất bại", text_color=RED))
             return
 
-        # Lưu vào folder_test/
-        import pathlib
-        dl_dir = str(pathlib.Path(__file__).parent.parent.resolve() / "folder_test")
+        # Lưu vào Downloads
+        dl_dir = os.path.join(os.path.expanduser("~"), "Downloads")
         os.makedirs(dl_dir, exist_ok=True)
         save_path = os.path.join(dl_dir, fname)
         try:
@@ -795,9 +794,7 @@ class App(ctk.CTk):
     # HELPERS
     # ─────────────────────────────────────────────────────────────────────────
     def _open_downloads(self):
-        import pathlib
-        dl = str(pathlib.Path(__file__).parent.parent.resolve() / "folder_test")
-        os.makedirs(dl, exist_ok=True)
+        dl = os.path.join(os.path.expanduser("~"), "Downloads")
         try: subprocess.Popen(f'explorer "{dl}"')
         except: pass
 

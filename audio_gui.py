@@ -13,8 +13,8 @@ import socket, threading, os, time, subprocess, json
 import urllib.request, urllib.error
 from pathlib import Path
 
-# ── Thư mục folder_test/ (cùng cấp với audio_gui.py) ─────────────────────────
-DONGBO_DIR = Path(__file__).parent / "folder_test"
+# ── Thư mục dongbo/ (cùng cấp với audio_gui.py) ──────────────────────────────
+DONGBO_DIR = Path(__file__).parent / "dongbo"
 
 # ── Network config ─────────────────────────────────────────────────────────────
 SERVER_IP     = "192.168.4.1"
@@ -407,7 +407,7 @@ class App(ctk.CTk):
         self._build_ui()
         self.after(600, self._auto_refresh)
         threading.Thread(target=self._poll_detect, daemon=True).start()
-        # Refresh tab folder_test khi focus vào
+        # Refresh tab dongbo khi focus vào
         self.bind("<FocusIn>", lambda e: None)
         # Khởi động auto_sync và bắt sự kiện đóng cửa sổ
         self._start_auto_sync()
@@ -473,7 +473,7 @@ class App(ctk.CTk):
         self._tabs.pack(fill="both", expand=True, padx=8, pady=(6, 8))
 
         self._tabs.add("📡  ESP32")
-        self._tabs.add("📁  Thư mục folder_test")
+        self._tabs.add("📁  Thư mục dongbo")
 
         # Tab 1: ESP32 — layout sidebar + main
         tab_esp = self._tabs.tab("📡  ESP32")
@@ -490,11 +490,11 @@ class App(ctk.CTk):
         self._build_sidebar(sidebar)
         self._build_main(main)
 
-        # Tab 2: Thư mục folder_test
-        tab_local = self._tabs.tab("📁  Thư mục folder_test")
+        # Tab 2: Thư mục dongbo
+        tab_local = self._tabs.tab("📁  Thư mục dongbo")
         self._build_local_tab(tab_local)
 
-        # Khi chuyển sang tab folder_test → tự refresh
+        # Khi chuyển sang tab dongbo → tự refresh
         self._tabs.configure(command=self._on_tab_change)
 
         # Start spinner animation
@@ -1277,7 +1277,7 @@ class App(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
     def _on_tab_change(self):
         name = self._tabs.get()
-        if "folder_test" in name:
+        if "dongbo" in name:
             threading.Thread(target=self._refresh_local_tab, daemon=True).start()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1288,7 +1288,7 @@ class App(ctk.CTk):
         hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hdr.pack(fill="x", pady=(6, 8), padx=4)
 
-        ctk.CTkLabel(hdr, text="File trong  folder_test/",
+        ctk.CTkLabel(hdr, text="File trong  dongbo/",
                      font=ctk.CTkFont("Segoe UI", 13, "bold"),
                      text_color=TEXT, anchor="w"
                      ).pack(side="left")
@@ -1366,7 +1366,7 @@ class App(ctk.CTk):
 
         # Placeholder
         self._local_empty_lbl = tk.Label(
-            self._local_rows, text="Thư mục folder_test/ chưa có file",
+            self._local_rows, text="Thư mục dongbo/ chưa có file",
             bg=BG_SURFACE, fg=MUTED,
             font=("Segoe UI", 10), pady=28)
         self._local_empty_lbl.pack()
@@ -1378,7 +1378,7 @@ class App(ctk.CTk):
 
     # ─────────────────────────────────────────────────────────────────────────
     def _refresh_local_tab(self):
-        """Quét folder_test/ và cập nhật UI — hiển thị TẤT CẢ file."""
+        """Quét dongbo/ và cập nhật UI — hiển thị TẤT CẢ file."""
         DONGBO_DIR.mkdir(parents=True, exist_ok=True)
         # Lấy tất cả file (không phải thư mục), bỏ qua file ẩn
         all_files = sorted(
@@ -1414,7 +1414,7 @@ class App(ctk.CTk):
 
         if not all_files:
             tk.Label(self._local_rows,
-                     text="Thư mục folder_test/ chưa có file",
+                     text="Thư mục dongbo/ chưa có file",
                      bg=BG_SURFACE, fg=MUTED,
                      font=("Segoe UI", 10), pady=28).pack()
             self._local_stat_lbl.configure(text="Không có file")

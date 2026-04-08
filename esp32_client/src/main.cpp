@@ -849,7 +849,7 @@ void handleFileUpload() {
   }
 
   Serial.printf("[Upload] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved?"OK":"FAIL");
-  if (saved) blinkLED(3, 80);
+  blinkLED(saved?5:2, 80);
 
   String resp = "{\"status\":\"" + String(saved?"ok":"fail") + "\""
     ",\"filename\":\"" + saveAs + "\""
@@ -994,7 +994,7 @@ void handleRawUpload(WiFiClient& cli) {
       else f.close(); }
   }
 
-  if (saved) blinkLED(3, 80);
+  blinkLED(saved?5:2, 80);
   Serial.printf("[Upload8081] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved?"OK":"FAIL");
 
   String resp = "{\"status\":\"" + String(saved?"ok":"fail") + "\""
