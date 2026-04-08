@@ -45,7 +45,7 @@ TIMEOUT_S       = 5               # timeout ket noi HTTP (giay)
 WATCH_INTERVAL  = 15              # giay giua cac lan sync (--watch)
 
 # Thu muc luu file = cung thu muc voi script nay (dongbo/)
-SYNC_DIR = Path(__file__).parent.resolve()
+SYNC_DIR = Path(__file__).parent.parent / "folder_test"
 
 # ── Mau ANSI (Windows 10+ ho tro) ────────────────────────────────────────────
 GRN = "\033[92m"

@@ -50,7 +50,7 @@ CFG = {
     "cooldown"       : 2,              # giay doi sau khi sync xong — giam xuong 2s
 }
 
-SYNC_DIR = Path(__file__).parent.resolve()
+SYNC_DIR = Path(__file__).parent.parent / "folder_test"
 
 # ── Mau ANSI ──────────────────────────────────────────────────────────────────
 GRN = "\033[92m"; YLW = "\033[93m"; RED = "\033[91m"
