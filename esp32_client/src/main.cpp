@@ -558,6 +558,116 @@ bool syncFromNode1() {
   }
 
   if (downloaded > 0) blinkLED(5, 100);
+
+  // ── Push file Node-2 → Node-1 (sync 2 chiều) ─────────────────
+  // Lấy danh sách file Node-1 còn đang kết nối để so sánh
+  Serial.println("[Push] Bắt đầu đẩy file từ Thiết bị B → Thiết bị A...");
+  int pushed = 0;
+  {
+    // Reconnect lại để push (vẫn đang STA)
+    WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
+    int rr = 0;
+    while (WiFi.status() != WL_CONNECTED && rr < 10) {
+      unsigned long tw = millis();
+      while (millis()-tw < 300) { server.handleClient(); delay(5); }
+      rr++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      // Lấy lại danh sách file Node-1 để tránh push file đã có
+      String node1List = httpGetFromNode1("/file/list", 4000);
+
+      // Duyệt tất cả file trong SPIFFS của Node-2
+      File root = SPIFFS.open("/");
+      File entry = root.openNextFile();
+      while (entry) {
+        String ename = String(entry.name());
+        // Bỏ dấu / đầu
+        if (ename.startsWith("/")) ename = ename.substring(1);
+        size_t esize = entry.size();
+        entry.close();
+
+        if (esize == 0) { entry = root.openNextFile(); continue; }
+
+        // Kiểm tra file đã có trên Node-1 chưa (so sánh size)
+        bool alreadyOnNode1 = false;
+        if (node1List.indexOf("\"" + ename + "\"") >= 0) {
+          // Kiểm tra size
+          int32_t remSz = getRemoteFileSize(node1List, ename);
+          if (remSz == (int32_t)esize) alreadyOnNode1 = true;
+        }
+
+        if (!alreadyOnNode1) {
+          Serial.printf("[Push] Đẩy '%s' (%d bytes) → Thiết bị A...\n",
+                        ename.c_str(), (int)esize);
+          // Đọc file từ SPIFFS
+          File f = SPIFFS.open("/" + ename, "r");
+          if (!f) { entry = root.openNextFile(); continue; }
+
+          // Kết nối TCP port 8081 của Node-1
+          WiFiClient tc;
+          if (!tc.connect(NODE1_IP, 8081)) {
+            Serial.printf("[Push] FAILED connect Node-1:8081 for '%s'\n", ename.c_str());
+            f.close(); entry = root.openNextFile(); continue;
+          }
+
+          // Xác định MIME type
+          String mime = "application/octet-stream";
+          String enl = ename; enl.toLowerCase();
+          if      (enl.endsWith(".jpg") || enl.endsWith(".jpeg")) mime = "image/jpeg";
+          else if (enl.endsWith(".png"))  mime = "image/png";
+          else if (enl.endsWith(".wav"))  mime = "audio/wav";
+          else if (enl.endsWith(".mp3"))  mime = "audio/mpeg";
+          else if (enl.endsWith(".docx")) mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+          else if (enl.endsWith(".xlsx")) mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+          else if (enl.endsWith(".pdf"))  mime = "application/pdf";
+          else if (enl.endsWith(".txt"))  mime = "text/plain";
+
+          // Gửi HTTP header
+          String hdr = String("POST /file/upload HTTP/1.1\r\n")
+            + "Host: " + NODE1_IP + ":8081\r\n"
+            + "Content-Type: " + mime + "\r\n"
+            + "Content-Length: " + String(esize) + "\r\n"
+            + "X-Filename: " + ename + "\r\n"
+            + "Connection: close\r\n\r\n";
+          tc.print(hdr);
+
+          // Stream file → TCP
+          uint8_t tbuf[512];
+          size_t sent = 0;
+          unsigned long tstart = millis();
+          while (sent < esize && f.available() && (millis()-tstart) < 30000) {
+            size_t rd = f.read(tbuf, sizeof(tbuf));
+            if (rd > 0) { tc.write(tbuf, rd); sent += rd; }
+            server.handleClient();
+          }
+          f.close();
+
+          // Đọc response
+          unsigned long tr = millis();
+          while (tc.connected() && (millis()-tr) < 5000) {
+            if (tc.available()) { tc.readStringUntil('\n'); tr = millis(); }
+            else delay(1);
+          }
+          tc.stop();
+
+          if (sent == esize) {
+            Serial.printf("[Push] '%s' %d bytes → OK\n", ename.c_str(), (int)sent);
+            pushed++;
+          } else {
+            Serial.printf("[Push] '%s' FAILED sent=%d/%d\n", ename.c_str(), (int)sent, (int)esize);
+          }
+        } else {
+          Serial.printf("[Push] Bỏ qua '%s' — đã có trên Thiết bị A\n", ename.c_str());
+        }
+        entry = root.openNextFile();
+      }
+    } else {
+      Serial.println("[Push] Không kết nối lại được Thiết bị A — bỏ qua push");
+    }
+  }
+  Serial.printf("[Push] Kết quả: đẩy %d file → Thiết bị A\n", pushed);
+  if (pushed > 0) blinkLED(3, 80);
+
   WiFi.disconnect(false); delay(300);
   Serial.printf("[Sync] Đã ngắt kết nối Thiết bị A. AP vẫn chạy.\n");
   Serial.printf("[Sync] Kết quả: tải %d, cập nhật %d, bỏ qua %d / %d file\n",
