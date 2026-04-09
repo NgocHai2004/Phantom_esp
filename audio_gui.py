@@ -30,7 +30,7 @@ _PHTM_KEY_SZ  = 32
 def _phtm_load_key(path: str) -> bytes:
     data = open(path, "rb").read()
     if len(data) < _PHTM_KEY_SZ:
-        raise ValueError(f"Key file quá ngắn: {len(data)} bytes (cần {_PHTM_KEY_SZ})")
+        raise ValueError(f"Key file too short: {len(data)} bytes (need {_PHTM_KEY_SZ})")
     return data[:_PHTM_KEY_SZ]
 
 def _phtm_derive(master: bytes):
@@ -54,12 +54,12 @@ def _phtm_unpack(bin_path: str, key_path: str, out_dir: str, log_cb=None):
         raise ValueError("Không phải file PHANTOM (.bin magic sai)")
     ver = struct.unpack_from("<I", raw, 4)[0]
     if ver != _PHTM_VERSION:
-        raise ValueError(f"Version không hỗ trợ: {ver} (cần {_PHTM_VERSION})")
+        raise ValueError(f"Unsupported version: {ver} (need {_PHTM_VERSION})")
     md5_stored  = raw[8:24]
     plen        = struct.unpack_from("<I", raw, 24)[0]
     payload     = raw[28:28 + plen]
     if hashlib.md5(payload).digest() != md5_stored:
-        raise ValueError("MD5 checksum không khớp — file có thể bị hỏng")
+        raise ValueError("MD5 checksum mismatch — file may be corrupted")
     log(f"✔  Header OK  |  Payload: {plen:,} bytes  |  MD5: {md5_stored.hex()}")
     master = _phtm_load_key(key_path)
     log(f"✔  Key loaded: {key_path}")
@@ -67,15 +67,15 @@ def _phtm_unpack(bin_path: str, key_path: str, out_dir: str, log_cb=None):
     results = []
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         entries = zf.namelist()
-        log(f"✔  ZIP chứa {len(entries)} file")
+        log(f"✔  ZIP contains {len(entries)} file(s)")
         for i, entry in enumerate(entries, 1):
             orig = entry.removesuffix(".enc")
-            log(f"\n[{i}/{len(entries)}] Giải mã: {entry}  →  {orig}")
+            log(f"\n[{i}/{len(entries)}] Decrypting: {entry}  →  {orig}")
             try:
-                plain = _phtm_decrypt_3layer(zf.read(entry), master)
+                plain    = _phtm_decrypt_3layer(zf.read(entry), master)
                 out_p = os.path.join(out_dir, orig)
                 open(out_p, "wb").write(plain)
-                log(f"    ✓  Lưu: {out_p}  ({len(plain):,} bytes)")
+                log(f"    ✓  Saved: {out_p}  ({len(plain):,} bytes)")
                 results.append((orig, out_p, len(plain), True))
             except Exception as e:
                 log(f"    ✗  Lỗi: {e}")
@@ -1306,10 +1306,10 @@ class App(ctk.CTk):
         ctk.CTkFrame(form_card, fg_color=BORDER, height=1, corner_radius=0
                      ).pack(fill="x", padx=16, pady=(16, 0))
 
-        # ── Nút Giải mã ───────────────────────────────────────────────────────
+        # ── Decrypt button ────────────────────────────────────────────────────
         self._dec_btn = ctk.CTkButton(
             form_card,
-            text="🔓   Giải mã ngay",
+            text="🔓   Decrypt Now",
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             fg_color=ACCENT, hover_color=ACCENT_GLOW,
             text_color="white",
@@ -1326,7 +1326,7 @@ class App(ctk.CTk):
         self._dec_pb.pack_forget()
 
         self._dec_status_lbl = ctk.CTkLabel(
-            form_card, text="Sẵn sàng" if _CRYPTO_OK else "⚠  pip install cryptography",
+            form_card, text="Ready" if _CRYPTO_OK else "⚠  pip install cryptography",
             font=ctk.CTkFont("Segoe UI", 9),
             text_color=TEAL if _CRYPTO_OK else WARN,
             anchor="w", wraplength=280)
@@ -1335,7 +1335,7 @@ class App(ctk.CTk):
         # ── Nút Open folder ───────────────────────────────────────────────────
         ctk.CTkButton(
             form_card,
-            text="🗁   Mở thư mục output",
+            text="🗁   Open Output Folder",
             font=ctk.CTkFont("Segoe UI", 10),
             fg_color=BG_CARD, hover_color=BORDER,
             border_color=BORDER, border_width=1,
@@ -1345,7 +1345,7 @@ class App(ctk.CTk):
 
         if not _CRYPTO_OK:
             ctk.CTkLabel(form_card,
-                         text="Chạy lệnh:\npip install cryptography",
+                         text="Run:\npip install cryptography",
                          font=ctk.CTkFont("Consolas", 9),
                          text_color=RED, anchor="w", justify="left"
                          ).pack(fill="x", padx=16, pady=(0, 10))
@@ -1387,7 +1387,7 @@ class App(ctk.CTk):
     # ── Decrypt helpers ───────────────────────────────────────────────────────
     def _dec_pick_bin(self):
         p = filedialog.askopenfilename(
-            title="Chọn file .bin PHANTOM",
+            title="Select PHANTOM .bin file",
             filetypes=[("PHANTOM bin", "*.bin"), ("All files", "*.*")],
             initialdir=str(Path(__file__).parent / "decode"))
         if p:
@@ -1396,14 +1396,14 @@ class App(ctk.CTk):
 
     def _dec_pick_key(self):
         p = filedialog.askopenfilename(
-            title="Chọn file phantom.key",
+            title="Select phantom.key file",
             filetypes=[("Key file", "*.key"), ("All files", "*.*")],
             initialdir=str(Path(__file__).parent / "decode"))
         if p: self._dec_key.set(p)
 
     def _dec_pick_out(self):
         p = filedialog.askdirectory(
-            title="Chọn thư mục output",
+            title="Select output folder",
             initialdir=self._dec_out.get())
         if p: self._dec_out.set(p)
 
@@ -1414,8 +1414,8 @@ class App(ctk.CTk):
             except: pass
         else:
             from tkinter import messagebox
-            messagebox.showinfo("Thư mục chưa tồn tại",
-                                "Chưa có file nào được giải mã vào thư mục này.")
+            messagebox.showinfo("Folder not found",
+                                "No files have been decrypted to this folder yet.")
 
     def _dec_log_msg(self, msg: str):
         """Thread-safe ghi log vào _dec_log với màu sắc."""
@@ -1442,7 +1442,7 @@ class App(ctk.CTk):
             self._dec_log.config(state="normal")
             fname = os.path.basename(out_path)
             sz_str = f"{size/1024:.1f} KB" if size >= 1024 else f"{size} B"
-            label  = f"    📂  {fname}  ({sz_str})  ← click để mở"
+            label  = f"    📂  {fname}  ({sz_str})  ← click to open"
             # Tạo unique tag cho từng link
             link_tag = f"link_{id(out_path)}_{self._dec_log.index('end')}"
             self._dec_log.tag_config(link_tag,
@@ -1468,15 +1468,15 @@ class App(ctk.CTk):
 
         if not bin_p or not os.path.isfile(bin_p):
             self.after(0, lambda: self._dec_status_lbl.configure(
-                text="⚠  Chưa chọn file .bin", text_color=WARN))
+                text="⚠  No .bin file selected", text_color=WARN))
             return
         if not key_p or not os.path.isfile(key_p):
             self.after(0, lambda: self._dec_status_lbl.configure(
-                text="⚠  Chưa chọn key file", text_color=WARN))
+                text="⚠  No key file selected", text_color=WARN))
             return
         if not out_d:
             self.after(0, lambda: self._dec_status_lbl.configure(
-                text="⚠  Chưa chọn output folder", text_color=WARN))
+                text="⚠  No output folder selected", text_color=WARN))
             return
 
         # Clear log
@@ -1489,7 +1489,7 @@ class App(ctk.CTk):
         self.after(0, lambda: [self._dec_pb.pack(fill="x", padx=12, pady=(0, 4)),
                                 self._dec_pb.start()])
         self.after(0, lambda: self._dec_status_lbl.configure(
-            text="Đang giải mã…", text_color=TEAL))
+            text="Decrypting…", text_color=TEAL))
 
         self._dec_log_msg(f"File .bin : {bin_p}")
         self._dec_log_msg(f"Key file  : {key_p}")
@@ -1507,19 +1507,19 @@ class App(ctk.CTk):
                     self._dec_log_file_link(out_path, size)
             if ok > 0:
                 self._dec_log_msg("")
-            self._dec_log_msg(f"✔  Hoàn tất: {ok} file OK,  {err} lỗi")
+            self._dec_log_msg(f"✔  Done: {ok} file(s) OK,  {err} error(s)")
             self.after(0, lambda: self._dec_status_lbl.configure(
-                text=f"✓  {ok}/{len(results)} file giải mã thành công",
+                text=f"✓  {ok}/{len(results)} file(s) decrypted successfully",
                 text_color=GREEN))
-            self._show_toast(f"✓  Decrypt: {ok} file thành công")
+            self._show_toast(f"✓  Decrypt: {ok} file(s) done")
             if ok > 0:
                 # Refresh Local Storage tab nếu output nằm trong DONGBO_DIR
                 if Path(out_d).resolve() == DONGBO_DIR.resolve():
                     threading.Thread(target=self._refresh_local_tab, daemon=True).start()
         except Exception as e:
-            self._dec_log_msg(f"\n✗  LỖI: {e}")
+            self._dec_log_msg(f"\n✗  ERROR: {e}")
             self.after(0, lambda: self._dec_status_lbl.configure(
-                text=f"Lỗi: {e}", text_color=RED))
+                text=f"Error: {e}", text_color=RED))
             self._log(f"Decrypt ERROR: {e}", "err")
         finally:
             self.after(0, lambda: [self._dec_pb.stop(), self._dec_pb.pack_forget()])
