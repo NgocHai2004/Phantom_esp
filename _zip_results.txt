@@ -1,6 +1,0 @@
-NOT FOUND: dongbo\U3listening.docx
-note.docx: sz=13811 pk=True eocd=-1 zip=BAD:File is not a zip file nulls=3006 first_null=5
-Testcase.xlsx: sz=10108 pk=True eocd=-1 zip=BAD:File is not a zip file nulls=2690 first_null=5
-NOT FOUND: C:\Users\Ad\Downloads\_check_U3listening.docx
-NOT FOUND: C:\Users\Ad\Downloads\_check_Testcase.xlsx
-NOT FOUND: C:\Users\Ad\Downloads\U3listening.docx

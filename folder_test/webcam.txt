@@ -1,0 +1,83 @@
+import cv2
+import socket
+from flask import Flask, Response
+
+app = Flask(__name__)
+
+# Mở webcam local
+cap = cv2.VideoCapture(0)
+
+# Model detect mặt có sẵn trong OpenCV
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+def generate_frames():
+    while True:
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(50, 50)
+        )
+
+        # Vẽ bbox lên frame
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        ret, buffer = cv2.imencode(".jpg", frame)
+        if not ret:
+            continue
+
+        frame_bytes = buffer.tobytes()
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+        )
+
+@app.route("/")
+def index():
+    return """
+    <html>
+        <head><title>Webcam Face BBox</title></head>
+        <body>
+            <h2>Webcam stream with face bbox</h2>
+            <img src="/video_feed" width="800">
+        </body>
+    </html>
+    """
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        generate_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+if __name__ == "__main__":
+    local_ip = get_local_ip()
+    print(f"Mo link nay tren may khac cung LAN: http://{local_ip}:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
+
+
+
+flask 
+opencv-python 

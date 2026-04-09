@@ -927,7 +927,7 @@ int countSpiffsFiles() {
   return n;
 }
 
-// ── Helper: HTTP GET text từ Node-2 ──────────────────────────
+// ── Helper: HTTP GET text từ Node-2 (buffer 1024B, nối nhanh) ─
 String httpGetFromNode2(const char* path, int timeoutMs = 6000) {
   WiFiClient c;
   if (!c.connect(NODE2_IP, NODE2_HTTP_PORT)) return "";
@@ -946,14 +946,15 @@ String httpGetFromNode2(const char* path, int timeoutMs = 6000) {
     t = millis();
   }
   String body = "";
-  uint8_t buf[256];
+  // Tăng buffer đọc lên 1024B để giảm số vòng lặp
+  uint8_t buf[1024];
   if (contentLength > 0) body.reserve(contentLength + 4);
   t = millis();
   while (c.connected() && (millis()-t) < (unsigned long)timeoutMs) {
     size_t av = c.available();
     if (av > 0) {
-      size_t rd = c.read(buf, min(av,(size_t)256));
-      for (size_t i = 0; i < rd; i++) body += (char)buf[i];
+      size_t rd = c.read(buf, min(av, (size_t)1024));
+      body.concat((const char*)buf, rd);
       t = millis();
       if (contentLength > 0 && (int)body.length() >= contentLength) break;
     } else { delay(1); }
@@ -962,57 +963,128 @@ String httpGetFromNode2(const char* path, int timeoutMs = 6000) {
   return body;
 }
 
-// ── Helper: download 1 file từ Node-2 → lưu SPIFFS ───────────
-bool httpDownloadFileFromNode2(const String& filename) {
+// ── Helper: download 1 file từ Node-2 → stream thẳng SPIFFS ───
+// Đổi từ malloc toàn bộ → stream 4096B/chunk như Node-2 đang làm
+// Hỗ trợ keep-alive: truyền persist != nullptr để dùng lại connection
+bool httpDownloadFileFromNode2(const String& filename,
+                               WiFiClient* persist = nullptr) {
   String path = "/file/download?name=" + filename;
-  WiFiClient c;
-  if (!c.connect(NODE2_IP, NODE2_HTTP_PORT)) {
-    Serial.printf("[Sync2] HTTP connect FAILED for '%s'\n", filename.c_str());
-    return false;
+
+  WiFiClient  _own;
+  WiFiClient* c = persist ? persist : &_own;
+
+  // Connect mới nếu không dùng keep-alive
+  if (!persist) {
+    if (!c->connect(NODE2_IP, NODE2_HTTP_PORT)) {
+      Serial.printf("[Sync2] HTTP connect FAILED for '%s'\n", filename.c_str());
+      return false;
+    }
+  } else if (!c->connected()) {
+    c->stop();
+    if (!c->connect(NODE2_IP, NODE2_HTTP_PORT)) {
+      Serial.printf("[Sync2] HTTP reconnect FAILED for '%s'\n", filename.c_str());
+      return false;
+    }
   }
-  c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-           path.c_str(), NODE2_IP);
+
+  c->printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
+            path.c_str(), NODE2_IP);
+
   int contentLength = 0;
+  bool is200 = false;
   unsigned long t = millis();
-  while (c.connected() && (millis()-t) < 8000) {
-    if (!c.available()) { delay(1); continue; }
-    String line = c.readStringUntil('\n'); line.trim();
+  while (c->connected() && (millis()-t) < 8000) {
+    if (!c->available()) { delay(1); continue; }
+    String line = c->readStringUntil('\n'); line.trim();
     if (line.length() == 0) break;
     String lo = line; lo.toLowerCase();
+    if (lo.startsWith("http/")) {
+      is200 = (lo.indexOf(" 200") >= 0);
+      if (!is200) {
+        if (!persist) c->stop();
+        Serial.printf("[Sync2] Non-200 for '%s'\n", filename.c_str());
+        return false;
+      }
+    }
     if (lo.startsWith("content-length:"))
       contentLength = line.substring(line.indexOf(':')+1).toInt();
-    if (lo.startsWith("http/") && lo.indexOf(" 200 ") < 0 && lo.indexOf(" 200\r") < 0) {
-      c.stop(); Serial.printf("[Sync2] Non-200 for '%s'\n", filename.c_str()); return false;
-    }
     t = millis();
   }
   if (contentLength <= 0 || contentLength > (int)MAX_FILE_SIZE) {
-    c.stop();
+    if (!persist) c->stop();
     Serial.printf("[Sync2] Bad CL=%d for '%s'\n", contentLength, filename.c_str());
     return false;
   }
-  uint8_t* buf = (uint8_t*)malloc(contentLength);
-  if (!buf) { c.stop(); Serial.println("[Sync2] OOM"); return false; }
-  size_t rx = 0; t = millis();
-  while (rx < (size_t)contentLength && c.connected() && (millis()-t) < 30000) {
-    size_t av = c.available();
+
+  // Kiểm tra dung lượng SPIFFS
+  size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
+  if ((size_t)contentLength > freeBytes) {
+    if (!persist) c->stop();
+    Serial.printf("[Sync2] SPIFFS không đủ chỗ: cần %d free %d bytes\n",
+                  contentLength, freeBytes);
+    return false;
+  }
+
+  // Mở SPIFFS để stream ghi (không malloc toàn bộ file)
+  String spiffsPath = "/" + filename;
+  if (SPIFFS.exists(spiffsPath)) SPIFFS.remove(spiffsPath);
+  File f = SPIFFS.open(spiffsPath, "w");
+  if (!f) {
+    if (!persist) c->stop();
+    Serial.printf("[Sync2] SPIFFS open FAILED for '%s'\n", filename.c_str());
+    return false;
+  }
+
+  // Stream TCP → SPIFFS chunk 4096B (tiết kiệm RAM, tăng throughput)
+  uint8_t chunk[4096];
+  size_t rx = 0;
+  t = millis();
+  while (rx < (size_t)contentLength && c->connected() && (millis()-t) < 45000) {
+    size_t av = c->available();
     if (av > 0) {
-      size_t want = min(min(av, (size_t)(contentLength-rx)), (size_t)4096);
-      size_t rd = c.readBytes(buf+rx, want);
-      rx += rd; t = millis();
+      size_t want = min(av, min((size_t)4096, (size_t)(contentLength - rx)));
+      size_t rd   = c->readBytes(chunk, want);
+      if (rd > 0) { f.write(chunk, rd); rx += rd; t = millis(); }
     } else { delay(1); }
   }
-  c.stop();
+  f.close();
+  if (!persist) c->stop();
+
   Serial.printf("[Sync2] '%s' rx=%d/%d bytes\n", filename.c_str(), rx, contentLength);
-  if (rx == 0) { free(buf); return false; }
-  bool saved = spiffsSaveAs(buf, rx, "/" + filename);
-  if (saved && filename == "audio.wav") {
-    if (ramBuf) { free(ramBuf); ramBuf=nullptr; ramSize=0; ramReady=false; }
-    ramBuf = buf; ramSize = rx; ramReady = true;
-  } else {
-    free(buf);
+
+  // Xác minh kích thước
+  bool saved = false;
+  if (rx > 0 && SPIFFS.exists(spiffsPath)) {
+    File chk = SPIFFS.open(spiffsPath, "r");
+    if (chk) { saved = ((size_t)chk.size() == rx); chk.close(); }
   }
-  return saved;
+  if (!saved) {
+    SPIFFS.remove(spiffsPath);
+    Serial.printf("[Sync2] '%s' verify FAIL → xóa\n", filename.c_str());
+    return false;
+  }
+
+  // Nếu là audio.wav → load vào RAM
+  if (filename == "audio.wav" && rx <= 1800000) {
+    if (ESP.getFreeHeap() > (int)rx + 32768) {
+      if (ramBuf) { free(ramBuf); ramBuf=nullptr; ramSize=0; ramReady=false; }
+      File fw = SPIFFS.open(spiffsPath, "r");
+      if (fw) {
+        ramBuf = (uint8_t*)malloc(rx);
+        if (ramBuf) {
+          size_t rd = fw.read(ramBuf, rx);
+          fw.close(); ramSize = rd; ramReady = (rd >= 44);
+        } else fw.close();
+      }
+    }
+  } else if (saved && filename == "audio.wav") {
+    // heap không đủ để load vào RAM — chỉ giữ SPIFFS
+    Serial.printf("[Sync2] heap thấp — audio.wav chỉ lưu SPIFFS\n");
+  }
+
+  Serial.printf("[Sync2] '%s' %d bytes → OK  heap=%d\n",
+                filename.c_str(), rx, ESP.getFreeHeap());
+  return true;
 }
 
 // ── Lấy size file từ JSON list ────────────────────────────────
@@ -1039,7 +1111,7 @@ int32_t getRemoteFileSizeNode2(const String& listJson, const String& fname) {
   return -1;
 }
 
-// ── Đồng bộ từ Node-2 → Node-1 ───────────────────────────────
+// ── Đồng bộ từ Node-2 → Node-1 (keep-alive TCP, chunk 4096B) ─
 bool syncFromNode2() {
   Serial.println("\n[Sync2] ══ Bắt đầu kết nối Thiết bị B (Node-2) ══");
 
@@ -1056,7 +1128,7 @@ bool syncFromNode2() {
   }
   Serial.printf("\n[Sync2] Đã kết nối Thiết bị B  IP: %s\n",
                 WiFi.localIP().toString().c_str());
-  delay(300);
+  delay(100);  // giảm từ 300ms → 100ms
 
   // Lấy danh sách file từ Node-2
   String listJson = "";
@@ -1065,7 +1137,7 @@ bool syncFromNode2() {
     if (listJson.length() > 10 && listJson.indexOf("\"name\"") >= 0) break;
     Serial.printf("[Sync2] /file/list trống (lần %d/3) — thử lại...\n", attempt+1);
     unsigned long tw = millis();
-    while (millis()-tw < 400) { server.handleClient(); delay(5); }
+    while (millis()-tw < 300) { server.handleClient(); delay(5); }
   }
 
   // Đếm file Node-2
@@ -1084,7 +1156,7 @@ bool syncFromNode2() {
 
   if (node2Count == 0) {
     Serial.println("[Sync2] Thiết bị B không có file — bỏ qua");
-    WiFi.disconnect(false); delay(300);
+    WiFi.disconnect(false); delay(100);
     return false;
   }
 
@@ -1102,6 +1174,15 @@ bool syncFromNode2() {
     pos = ne + 1;
   }
 
+  // ── Keep-alive: 1 WiFiClient cho tất cả file download ────────
+  WiFiClient keepAlive;
+  if (!keepAlive.connect(NODE2_IP, NODE2_HTTP_PORT)) {
+    Serial.println("[Sync2] Keep-alive connect FAILED — fallback per-file");
+    keepAlive.stop();
+  }
+  bool useKeepAlive = keepAlive.connected();
+  Serial.printf("[Sync2] Keep-alive: %s\n", useKeepAlive ? "ON" : "OFF (fallback)");
+
   int downloaded = 0, skipped = 0, updated = 0;
   for (auto& fname : remoteFiles) {
     String path = "/" + fname;
@@ -1118,16 +1199,21 @@ bool syncFromNode2() {
       Serial.printf("[Sync2] Cập nhật '%s' — local=%d remote=%d bytes\n",
                     fname.c_str(), localSize, remoteSize);
       SPIFFS.remove(path);
-      if (httpDownloadFileFromNode2(fname)) { downloaded++; updated++; }
+      if (httpDownloadFileFromNode2(fname, useKeepAlive ? &keepAlive : nullptr)) {
+        downloaded++; updated++;
+      }
     } else {
       Serial.printf("[Sync2] Tải mới '%s' (%d bytes)\n", fname.c_str(), remoteSize);
-      if (httpDownloadFileFromNode2(fname)) downloaded++;
+      if (httpDownloadFileFromNode2(fname, useKeepAlive ? &keepAlive : nullptr)) {
+        downloaded++;
+      }
     }
-    delay(80);
+    // Không delay(80) — tiết kiệm ~80ms × N file
   }
 
+  if (useKeepAlive) keepAlive.stop();
   if (downloaded > 0) blinkLED(5, 100);
-  WiFi.disconnect(false); delay(300);
+  WiFi.disconnect(false); delay(100);  // giảm từ 300ms → 100ms
   Serial.printf("[Sync2] Đã ngắt kết nối Thiết bị B. AP vẫn chạy.\n");
   Serial.printf("[Sync2] Kết quả: tải %d, cập nhật %d, bỏ qua %d / %d file\n",
                 downloaded, updated, skipped, (int)remoteFiles.size());

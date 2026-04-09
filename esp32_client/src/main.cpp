@@ -279,7 +279,7 @@ String wavInfoJson(const uint8_t* buf, size_t size) {
   return j;
 }
 
-// ── Helper: HTTP GET text từ Node-1 ──────────────────────────
+// ── Helper: HTTP GET text từ Node-1 (buffer 1024B, nối nhanh) ─
 String httpGetFromNode1(const char* path, int timeoutMs = 6000) {
   WiFiClient c;
   if (!c.connect(NODE1_IP, NODE1_HTTP_PORT)) return "";
@@ -298,14 +298,16 @@ String httpGetFromNode1(const char* path, int timeoutMs = 6000) {
     t = millis();
   }
   String body = "";
-  uint8_t buf[256];
+  // Tăng buffer đọc lên 1024B để giảm số vòng lặp
+  uint8_t buf[1024];
   if (contentLength > 0) body.reserve(contentLength + 4);
   t = millis();
   while (c.connected() && (millis()-t) < (unsigned long)timeoutMs) {
     size_t av = c.available();
     if (av > 0) {
-      size_t rd = c.read(buf, min(av,(size_t)256));
-      for (size_t i = 0; i < rd; i++) body += (char)buf[i];
+      size_t rd = c.read(buf, min(av, (size_t)1024));
+      // concat() nhanh hơn += từng char
+      body.concat((const char*)buf, rd);
       t = millis();
       if (contentLength > 0 && (int)body.length() >= contentLength) break;
     } else { delay(1); }
@@ -314,32 +316,48 @@ String httpGetFromNode1(const char* path, int timeoutMs = 6000) {
   return body;
 }
 
-// ── Helper: download một file từ Node-1 → stream thẳng vào SPIFFS ────
-// KHÔNG malloc toàn bộ file — đọc TCP 512B/chunk, ghi thẳng SPIFFS
-// Hỗ trợ file lớn không giới hạn bởi free heap
-bool httpDownloadFileFromNode1(const String& filename) {
+// ── Helper: download 1 file từ Node-1 qua WiFiClient đã connect ─
+// persistent=true: dùng lại connection đã có (keep-alive)
+// persistent=false: tự connect mới (dùng độc lập)
+bool httpDownloadFileFromNode1(const String& filename,
+                               WiFiClient* persist = nullptr) {
   String path = "/file/download?name=" + filename;
-  WiFiClient c;
-  if (!c.connect(NODE1_IP, NODE1_HTTP_PORT)) {
-    Serial.printf("[Sync] HTTP connect FAILED for '%s'\n", filename.c_str());
-    return false;
+
+  WiFiClient  _own;
+  WiFiClient* c = persist ? persist : &_own;
+
+  // Nếu không dùng keep-alive → connect mới
+  if (!persist) {
+    if (!c->connect(NODE1_IP, NODE1_HTTP_PORT)) {
+      Serial.printf("[Sync] HTTP connect FAILED for '%s'\n", filename.c_str());
+      return false;
+    }
+  } else if (!c->connected()) {
+    // Reconnect nếu connection bị drop
+    c->stop();
+    if (!c->connect(NODE1_IP, NODE1_HTTP_PORT)) {
+      Serial.printf("[Sync] HTTP reconnect FAILED for '%s'\n", filename.c_str());
+      return false;
+    }
   }
-  c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-           path.c_str(), NODE1_IP);
+
+  // Gửi request — keep-alive để tái dùng TCP
+  c->printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
+            path.c_str(), NODE1_IP);
 
   // Đọc HTTP headers
   int contentLength = 0;
   bool is200 = false;
   unsigned long t = millis();
-  while (c.connected() && (millis()-t) < 8000) {
-    if (!c.available()) { delay(1); continue; }
-    String line = c.readStringUntil('\n'); line.trim();
-    if (line.length() == 0) break;   // blank line = end of headers
+  while (c->connected() && (millis()-t) < 8000) {
+    if (!c->available()) { delay(1); continue; }
+    String line = c->readStringUntil('\n'); line.trim();
+    if (line.length() == 0) break;
     String lo = line; lo.toLowerCase();
     if (lo.startsWith("http/")) {
       is200 = (lo.indexOf(" 200") >= 0);
       if (!is200) {
-        c.stop();
+        if (!persist) c->stop();
         Serial.printf("[Sync] Non-200 for '%s': %s\n", filename.c_str(), line.c_str());
         return false;
       }
@@ -349,15 +367,15 @@ bool httpDownloadFileFromNode1(const String& filename) {
     t = millis();
   }
   if (contentLength <= 0 || contentLength > (int)MAX_FILE_SIZE) {
-    c.stop();
+    if (!persist) c->stop();
     Serial.printf("[Sync] Bad CL=%d for '%s'\n", contentLength, filename.c_str());
     return false;
   }
 
-  // Kiểm tra dung lượng SPIFFS trước
+  // Kiểm tra dung lượng SPIFFS
   size_t freeBytes = SPIFFS.totalBytes() - SPIFFS.usedBytes();
   if ((size_t)contentLength > freeBytes) {
-    c.stop();
+    if (!persist) c->stop();
     Serial.printf("[Sync] SPIFFS không đủ chỗ: cần %d free %d bytes\n",
                   contentLength, freeBytes);
     return false;
@@ -368,20 +386,20 @@ bool httpDownloadFileFromNode1(const String& filename) {
   if (SPIFFS.exists(spiffsPath)) SPIFFS.remove(spiffsPath);
   File f = SPIFFS.open(spiffsPath, "w");
   if (!f) {
-    c.stop();
+    if (!persist) c->stop();
     Serial.printf("[Sync] SPIFFS open FAILED for '%s'\n", filename.c_str());
     return false;
   }
 
-  // Stream TCP → SPIFFS chunk 512B, không malloc toàn bộ
-  uint8_t chunk[512];
+  // Stream TCP → SPIFFS chunk 4096B (tăng từ 512B → 4× nhanh hơn)
+  uint8_t chunk[4096];
   size_t rx = 0;
   t = millis();
-  while (rx < (size_t)contentLength && c.connected() && (millis()-t) < 45000) {
-    size_t av = c.available();
+  while (rx < (size_t)contentLength && c->connected() && (millis()-t) < 45000) {
+    size_t av = c->available();
     if (av > 0) {
-      size_t want = min(av, min((size_t)512, (size_t)(contentLength - rx)));
-      size_t rd   = c.readBytes(chunk, want);
+      size_t want = min(av, min((size_t)4096, (size_t)(contentLength - rx)));
+      size_t rd   = c->readBytes(chunk, want);
       if (rd > 0) {
         f.write(chunk, rd);
         rx += rd;
@@ -392,7 +410,7 @@ bool httpDownloadFileFromNode1(const String& filename) {
     }
   }
   f.close();
-  c.stop();
+  if (!persist) c->stop();
 
   Serial.printf("[Sync] '%s' rx=%d/%d bytes\n", filename.c_str(), rx, contentLength);
 
@@ -408,7 +426,7 @@ bool httpDownloadFileFromNode1(const String& filename) {
     return false;
   }
 
-  // Nếu là audio.wav → load vào RAM (chỉ load nếu đủ heap)
+  // Nếu là audio.wav → load vào RAM
   if (filename == "audio.wav" && rx <= 1800000) {
     if (ESP.getFreeHeap() > (int)rx + 32768) {
       if (ramBuf) { free(ramBuf); ramBuf=nullptr; ramSize=0; ramReady=false; }
@@ -456,7 +474,7 @@ int32_t getRemoteFileSize(const String& listJson, const String& fname) {
   return -1;
 }
 
-// ── Đồng bộ TẤT CẢ file từ Node-1 (so sánh kích thước) ───────
+// ── Đồng bộ TẤT CẢ file từ Node-1 (keep-alive TCP, chunk 4096B) ─
 bool syncFromNode1() {
   Serial.println("\n[Sync] ══ Bắt đầu kết nối Thiết bị A (Node-1) ══");
   syncMsg = "connecting";
@@ -475,7 +493,7 @@ bool syncFromNode1() {
   }
   Serial.printf("\n[Sync] Đã kết nối Thiết bị A  IP: %s\n",
                 WiFi.localIP().toString().c_str());
-  delay(300);
+  delay(100);  // giảm từ 300ms → 100ms
 
   // Lấy danh sách file từ Node-1 — retry 3 lần
   String listJson = "";
@@ -484,7 +502,7 @@ bool syncFromNode1() {
     if (listJson.length() > 10 && listJson.indexOf("\"name\"") >= 0) break;
     Serial.printf("[Sync] /file/list trống (lần %d/3) — thử lại...\n", attempt+1);
     unsigned long tw = millis();
-    while (millis()-tw < 400) { server.handleClient(); delay(5); }
+    while (millis()-tw < 300) { server.handleClient(); delay(5); }
   }
 
   // Đếm file Node-1
@@ -504,7 +522,7 @@ bool syncFromNode1() {
   if (listJson.indexOf("\"count\":0") >= 0 || listJson.indexOf("\"files\":[]") >= 0
       || node1Count == 0) {
     Serial.println("[Sync] Thiết bị A không có file — bỏ qua");
-    WiFi.disconnect(false); delay(300);
+    WiFi.disconnect(false); delay(100);
     syncMsg = "ok: node-1 empty";
     return false;
   }
@@ -527,12 +545,20 @@ bool syncFromNode1() {
   int skipped    = 0;
   int updated    = 0;
 
+  // ── Keep-alive: 1 WiFiClient cho tất cả file download ────────
+  WiFiClient keepAlive;
+  if (!keepAlive.connect(NODE1_IP, NODE1_HTTP_PORT)) {
+    Serial.println("[Sync] Keep-alive connect FAILED — fallback per-file");
+    keepAlive.stop();
+  }
+  bool useKeepAlive = keepAlive.connected();
+  Serial.printf("[Sync] Keep-alive: %s\n", useKeepAlive ? "ON" : "OFF (fallback)");
+
   for (auto& fname : remoteFiles) {
     String path = "/" + fname;
     int32_t remoteSize = getRemoteFileSize(listJson, fname);
 
     if (SPIFFS.exists(path)) {
-      // Kiểm tra kích thước — nếu khác thì tải lại
       File f = SPIFFS.open(path, "r");
       size_t localSize = f ? f.size() : 0;
       if (f) f.close();
@@ -542,24 +568,23 @@ bool syncFromNode1() {
         skipped++;
         continue;
       }
-      // Kích thước khác → xóa file cũ, tải lại
       Serial.printf("[Sync] Cập nhật '%s' — local=%d remote=%d bytes\n",
                     fname.c_str(), localSize, remoteSize);
       SPIFFS.remove(path);
-      bool ok = httpDownloadFileFromNode1(fname);
+      bool ok = httpDownloadFileFromNode1(fname, useKeepAlive ? &keepAlive : nullptr);
       if (ok) { downloaded++; updated++; }
     } else {
-      // File mới — tải về
       Serial.printf("[Sync] Tải mới '%s' (%d bytes)\n", fname.c_str(), remoteSize);
-      bool ok = httpDownloadFileFromNode1(fname);
+      bool ok = httpDownloadFileFromNode1(fname, useKeepAlive ? &keepAlive : nullptr);
       if (ok) downloaded++;
     }
-    delay(80);
+    // Không delay(80) — tiết kiệm ~80ms × N file
   }
 
+  if (useKeepAlive) keepAlive.stop();
   if (downloaded > 0) blinkLED(5, 100);
 
-  WiFi.disconnect(false); delay(300);
+  WiFi.disconnect(false); delay(100);  // giảm từ 300ms → 100ms
   Serial.printf("[Sync] Đã ngắt kết nối Thiết bị A. AP vẫn chạy.\n");
   Serial.printf("[Sync] Kết quả: tải %d, cập nhật %d, bỏ qua %d / %d file\n",
                 downloaded, updated, skipped, (int)remoteFiles.size());
@@ -567,10 +592,9 @@ bool syncFromNode1() {
   // Đảm bảo ramBuf có file WAV nếu chưa có
   if (!ramReady && !remoteFiles.empty()) {
     for (auto& fname : remoteFiles) {
-      String firstFile = "/" + fname;
-      // Ưu tiên WAV
       String fl = fname; fl.toLowerCase();
       if (!fl.endsWith(".wav")) continue;
+      String firstFile = "/" + fname;
       if (SPIFFS.exists(firstFile)) {
         File f = SPIFFS.open(firstFile, "r");
         if (f) {

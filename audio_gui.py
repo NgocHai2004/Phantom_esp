@@ -5,13 +5,82 @@ Run: .venv\Scripts\python audio_gui.py
 """
 
 import customtkinter as ctk
-from tkinter import filedialog
+from tkinter import filedialog, scrolledtext
 import tkinter as tk
 import tkinter.ttk as ttk
 import sys
 import socket, threading, os, time, subprocess, json
+import struct, zipfile, hashlib, io
 import urllib.request, urllib.error
 from pathlib import Path
+
+# ── PHANTOM Decrypt (3-layer crypto) ─────────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+    from cryptography.hazmat.primitives import hmac as _crypto_hmac, hashes as _crypto_hashes
+    from cryptography.hazmat.backends import default_backend as _crypto_backend
+    _CRYPTO_OK = True
+except ImportError:
+    _CRYPTO_OK = False
+
+_PHTM_MAGIC   = b"PHTM"
+_PHTM_VERSION = 2
+_PHTM_KEY_SZ  = 32
+
+def _phtm_load_key(path: str) -> bytes:
+    data = open(path, "rb").read()
+    if len(data) < _PHTM_KEY_SZ:
+        raise ValueError(f"Key file quá ngắn: {len(data)} bytes (cần {_PHTM_KEY_SZ})")
+    return data[:_PHTM_KEY_SZ]
+
+def _phtm_derive(master: bytes):
+    def dk(tag): return hashlib.sha256(master + tag).digest()
+    return dk(b"AES-GCM"), dk(b"HMAC-SHA256"), dk(b"CHACHA20")
+
+def _phtm_decrypt_3layer(enc: bytes, master: bytes) -> bytes:
+    k_aes, k_hmac, k_chacha = _phtm_derive(master)
+    payload = ChaCha20Poly1305(k_chacha).decrypt(enc[:12], enc[12:], None)
+    hmac_tag, inner = payload[-32:], payload[:-32]
+    h = _crypto_hmac.HMAC(k_hmac, _crypto_hashes.SHA256(), backend=_crypto_backend())
+    h.update(inner); h.verify(hmac_tag)
+    return AESGCM(k_aes).decrypt(inner[:12], inner[12:], None)
+
+def _phtm_unpack(bin_path: str, key_path: str, out_dir: str, log_cb=None):
+    def log(m):
+        if log_cb: log_cb(m)
+        else: print(m)
+    raw = open(bin_path, "rb").read()
+    if raw[:4] != _PHTM_MAGIC:
+        raise ValueError("Không phải file PHANTOM (.bin magic sai)")
+    ver = struct.unpack_from("<I", raw, 4)[0]
+    if ver != _PHTM_VERSION:
+        raise ValueError(f"Version không hỗ trợ: {ver} (cần {_PHTM_VERSION})")
+    md5_stored  = raw[8:24]
+    plen        = struct.unpack_from("<I", raw, 24)[0]
+    payload     = raw[28:28 + plen]
+    if hashlib.md5(payload).digest() != md5_stored:
+        raise ValueError("MD5 checksum không khớp — file có thể bị hỏng")
+    log(f"✔  Header OK  |  Payload: {plen:,} bytes  |  MD5: {md5_stored.hex()}")
+    master = _phtm_load_key(key_path)
+    log(f"✔  Key loaded: {key_path}")
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        entries = zf.namelist()
+        log(f"✔  ZIP chứa {len(entries)} file")
+        for i, entry in enumerate(entries, 1):
+            orig = entry.removesuffix(".enc")
+            log(f"\n[{i}/{len(entries)}] Giải mã: {entry}  →  {orig}")
+            try:
+                plain = _phtm_decrypt_3layer(zf.read(entry), master)
+                out_p = os.path.join(out_dir, orig)
+                open(out_p, "wb").write(plain)
+                log(f"    ✓  Lưu: {out_p}  ({len(plain):,} bytes)")
+                results.append((orig, out_p, len(plain), True))
+            except Exception as e:
+                log(f"    ✗  Lỗi: {e}")
+                results.append((orig, None, 0, False))
+    return results
 
 # ── Local folder (same level as audio_gui.py) ─────────────────────────────────
 DONGBO_DIR = Path(__file__).parent / "folder_test"
@@ -443,6 +512,7 @@ class App(ctk.CTk):
 
         self._tabs.add("📡  Phantom Devices")
         self._tabs.add("📁  Local Storage")
+        self._tabs.add("🔓  Decrypt")
 
         # Tab 1: Phantom
         tab_esp = self._tabs.tab("📡  Phantom Devices")
@@ -462,6 +532,10 @@ class App(ctk.CTk):
         # Tab 2: Local Storage
         tab_local = self._tabs.tab("📁  Local Storage")
         self._build_local_tab(tab_local)
+
+        # Tab 3: Decrypt
+        tab_dec = self._tabs.tab("🔓  Decrypt")
+        self._build_decrypt_tab(tab_dec)
 
         self._tabs.configure(command=self._on_tab_change)
         self._start_spinner()
@@ -1159,6 +1233,297 @@ class App(ctk.CTk):
 
     def _refresh_filelist(self):
         threading.Thread(target=self._fetch_filelist, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAB 3 — PHANTOM DECRYPT
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_decrypt_tab(self, parent):
+        # ── Title row ─────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(parent, fg_color="transparent")
+        hdr.pack(fill="x", padx=8, pady=(10, 4))
+
+        ctk.CTkLabel(hdr,
+                     text="🔓  PHANTOM Decrypt",
+                     font=ctk.CTkFont("Segoe UI", 14, "bold"),
+                     text_color=TEXT, anchor="w").pack(side="left")
+
+        ctk.CTkLabel(hdr,
+                     text="AES-256-GCM · HMAC-SHA256 · ChaCha20-Poly1305",
+                     font=ctk.CTkFont("Segoe UI", 9),
+                     text_color=MUTED, anchor="e").pack(side="right")
+
+        ctk.CTkFrame(parent, fg_color=BORDER, height=1, corner_radius=0
+                     ).pack(fill="x", padx=8, pady=(0, 10))
+
+        # ── Body: left form + right log ───────────────────────────────────────
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=4, pady=0)
+
+        # ── Left: form card ───────────────────────────────────────────────────
+        form_card = ctk.CTkFrame(body, fg_color=BG_SURFACE, corner_radius=14, width=320)
+        form_card.pack(side="left", fill="y", padx=(4, 8), pady=4)
+        form_card.pack_propagate(False)
+
+        ctk.CTkLabel(form_card, text="Input",
+                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=SUBTLE, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(14, 8))
+
+        # Helper — label + entry + browse button
+        def _field(lbl_text, var, pick_cmd):
+            ctk.CTkLabel(form_card, text=lbl_text,
+                         font=ctk.CTkFont("Segoe UI", 9),
+                         text_color=MUTED, anchor="w"
+                         ).pack(fill="x", padx=16, pady=(6, 0))
+            row = ctk.CTkFrame(form_card, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=(2, 0))
+            e = ctk.CTkEntry(row, textvariable=var,
+                             fg_color=BG_CARD, border_color=BORDER, border_width=1,
+                             text_color=TEXT, height=34, corner_radius=8,
+                             font=ctk.CTkFont("Consolas", 9))
+            e.pack(side="left", fill="x", expand=True, padx=(0, 6))
+            ctk.CTkButton(row, text="···", width=34, height=34,
+                          fg_color=BG_CARD, hover_color=BORDER,
+                          border_color=BORDER, border_width=1,
+                          text_color=SUBTLE, corner_radius=8,
+                          command=pick_cmd).pack(side="right")
+
+        self._dec_bin = ctk.StringVar()
+        self._dec_key = ctk.StringVar()
+        self._dec_out = ctk.StringVar()
+
+        # Auto-fill phantom.key nếu tồn tại cạnh audio_gui.py
+        _default_key = Path(__file__).parent / "decode" / "phantom.key"
+        if _default_key.exists():
+            self._dec_key.set(str(_default_key))
+        _default_out = Path(__file__).parent / "decode" / "output"
+        self._dec_out.set(str(_default_out))
+
+        _field("File .bin (PHANTOM)",   self._dec_bin, self._dec_pick_bin)
+        _field("Key file (phantom.key)", self._dec_key, self._dec_pick_key)
+        _field("Output folder",          self._dec_out, self._dec_pick_out)
+
+        ctk.CTkFrame(form_card, fg_color=BORDER, height=1, corner_radius=0
+                     ).pack(fill="x", padx=16, pady=(16, 0))
+
+        # ── Nút Giải mã ───────────────────────────────────────────────────────
+        self._dec_btn = ctk.CTkButton(
+            form_card,
+            text="🔓   Giải mã ngay",
+            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            fg_color=ACCENT, hover_color=ACCENT_GLOW,
+            text_color="white",
+            height=44, corner_radius=10,
+            command=lambda: threading.Thread(
+                target=self._dec_start, daemon=True).start(),
+            state="normal" if _CRYPTO_OK else "disabled")
+        self._dec_btn.pack(fill="x", padx=12, pady=(12, 4))
+
+        self._dec_pb = ctk.CTkProgressBar(
+            form_card, mode="indeterminate", height=3,
+            progress_color=TEAL, fg_color=BORDER, corner_radius=2)
+        self._dec_pb.pack(fill="x", padx=12, pady=(0, 4))
+        self._dec_pb.pack_forget()
+
+        self._dec_status_lbl = ctk.CTkLabel(
+            form_card, text="Sẵn sàng" if _CRYPTO_OK else "⚠  pip install cryptography",
+            font=ctk.CTkFont("Segoe UI", 9),
+            text_color=TEAL if _CRYPTO_OK else WARN,
+            anchor="w", wraplength=280)
+        self._dec_status_lbl.pack(fill="x", padx=16, pady=(0, 6))
+
+        # ── Nút Open folder ───────────────────────────────────────────────────
+        ctk.CTkButton(
+            form_card,
+            text="🗁   Mở thư mục output",
+            font=ctk.CTkFont("Segoe UI", 10),
+            fg_color=BG_CARD, hover_color=BORDER,
+            border_color=BORDER, border_width=1,
+            text_color=SUBTLE, height=36, corner_radius=8,
+            command=self._dec_open_output
+        ).pack(fill="x", padx=12, pady=(4, 12))
+
+        if not _CRYPTO_OK:
+            ctk.CTkLabel(form_card,
+                         text="Chạy lệnh:\npip install cryptography",
+                         font=ctk.CTkFont("Consolas", 9),
+                         text_color=RED, anchor="w", justify="left"
+                         ).pack(fill="x", padx=16, pady=(0, 10))
+
+        # ── Right: log panel ──────────────────────────────────────────────────
+        log_card = ctk.CTkFrame(body, fg_color=BG_SURFACE, corner_radius=14)
+        log_card.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=4)
+
+        ctk.CTkLabel(log_card, text="Log",
+                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=SUBTLE, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(14, 4))
+
+        # Dùng tk.Text thay vì CTkTextbox để hỗ trợ color tags
+        log_outer = tk.Frame(log_card, bg=BG_LOG)
+        log_outer.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self._dec_log = tk.Text(
+            log_outer, bg=BG_LOG, fg=TEXT,
+            font=("Consolas", 9),
+            relief="flat", bd=0,
+            insertbackground=TEXT,
+            state="disabled", wrap="word")
+        vsb = tk.Scrollbar(log_outer, orient="vertical",
+                           command=self._dec_log.yview,
+                           bg=BG_SURFACE, troughcolor=BG_LOG, bd=0,
+                           highlightthickness=0, width=6)
+        self._dec_log.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y", pady=4)
+        self._dec_log.pack(side="left", fill="both", expand=True)
+
+        # Color tags — theo palette audio_gui
+        self._dec_log.tag_config("ok",   foreground=GREEN)
+        self._dec_log.tag_config("err",  foreground=RED)
+        self._dec_log.tag_config("info", foreground=WARN)
+        self._dec_log.tag_config("dim",  foreground=MUTED)
+        self._dec_log.tag_config("head", foreground=ACCENT_ICON)
+
+    # ── Decrypt helpers ───────────────────────────────────────────────────────
+    def _dec_pick_bin(self):
+        p = filedialog.askopenfilename(
+            title="Chọn file .bin PHANTOM",
+            filetypes=[("PHANTOM bin", "*.bin"), ("All files", "*.*")],
+            initialdir=str(Path(__file__).parent / "decode"))
+        if p:
+            self._dec_bin.set(p)
+            self._dec_out.set(str(Path(p).parent / "output"))
+
+    def _dec_pick_key(self):
+        p = filedialog.askopenfilename(
+            title="Chọn file phantom.key",
+            filetypes=[("Key file", "*.key"), ("All files", "*.*")],
+            initialdir=str(Path(__file__).parent / "decode"))
+        if p: self._dec_key.set(p)
+
+    def _dec_pick_out(self):
+        p = filedialog.askdirectory(
+            title="Chọn thư mục output",
+            initialdir=self._dec_out.get())
+        if p: self._dec_out.set(p)
+
+    def _dec_open_output(self):
+        d = self._dec_out.get()
+        if os.path.isdir(d):
+            try: subprocess.Popen(f'explorer "{d}"')
+            except: pass
+        else:
+            from tkinter import messagebox
+            messagebox.showinfo("Thư mục chưa tồn tại",
+                                "Chưa có file nào được giải mã vào thư mục này.")
+
+    def _dec_log_msg(self, msg: str):
+        """Thread-safe ghi log vào _dec_log với màu sắc."""
+        def _append():
+            self._dec_log.config(state="normal")
+            if msg.startswith("    ✓") or msg.startswith("✔"):
+                tag = "ok"
+            elif msg.startswith("    ✗") or "Lỗi" in msg:
+                tag = "err"
+            elif msg.startswith("["):
+                tag = "info"
+            elif msg.startswith("─"):
+                tag = "head"
+            else:
+                tag = "dim"
+            self._dec_log.insert("end", msg + "\n", tag)
+            self._dec_log.see("end")
+            self._dec_log.config(state="disabled")
+        self.after(0, _append)
+
+    def _dec_log_file_link(self, out_path: str, size: int):
+        """Thêm dòng clickable vào log — click mở file bằng Explorer."""
+        def _append():
+            self._dec_log.config(state="normal")
+            fname = os.path.basename(out_path)
+            sz_str = f"{size/1024:.1f} KB" if size >= 1024 else f"{size} B"
+            label  = f"    📂  {fname}  ({sz_str})  ← click để mở"
+            # Tạo unique tag cho từng link
+            link_tag = f"link_{id(out_path)}_{self._dec_log.index('end')}"
+            self._dec_log.tag_config(link_tag,
+                                      foreground=TEAL,
+                                      underline=True,
+                                      font=("Consolas", 9))
+            self._dec_log.tag_bind(link_tag, "<Button-1>",
+                lambda e, p=out_path: subprocess.Popen(
+                    f'explorer /select,"{p}"'))
+            self._dec_log.tag_bind(link_tag, "<Enter>",
+                lambda e: self._dec_log.config(cursor="hand2"))
+            self._dec_log.tag_bind(link_tag, "<Leave>",
+                lambda e: self._dec_log.config(cursor=""))
+            self._dec_log.insert("end", label + "\n", link_tag)
+            self._dec_log.see("end")
+            self._dec_log.config(state="disabled")
+        self.after(0, _append)
+
+    def _dec_start(self):
+        bin_p = self._dec_bin.get().strip()
+        key_p = self._dec_key.get().strip()
+        out_d = self._dec_out.get().strip()
+
+        if not bin_p or not os.path.isfile(bin_p):
+            self.after(0, lambda: self._dec_status_lbl.configure(
+                text="⚠  Chưa chọn file .bin", text_color=WARN))
+            return
+        if not key_p or not os.path.isfile(key_p):
+            self.after(0, lambda: self._dec_status_lbl.configure(
+                text="⚠  Chưa chọn key file", text_color=WARN))
+            return
+        if not out_d:
+            self.after(0, lambda: self._dec_status_lbl.configure(
+                text="⚠  Chưa chọn output folder", text_color=WARN))
+            return
+
+        # Clear log
+        self.after(0, lambda: [
+            self._dec_log.config(state="normal"),
+            self._dec_log.delete("1.0", "end"),
+            self._dec_log.config(state="disabled")])
+
+        self.after(0, lambda: self._dec_btn.configure(state="disabled"))
+        self.after(0, lambda: [self._dec_pb.pack(fill="x", padx=12, pady=(0, 4)),
+                                self._dec_pb.start()])
+        self.after(0, lambda: self._dec_status_lbl.configure(
+            text="Đang giải mã…", text_color=TEAL))
+
+        self._dec_log_msg(f"File .bin : {bin_p}")
+        self._dec_log_msg(f"Key file  : {key_p}")
+        self._dec_log_msg(f"Output    : {out_d}")
+        self._dec_log_msg("─" * 55)
+
+        try:
+            results = _phtm_unpack(bin_p, key_p, out_d, log_cb=self._dec_log_msg)
+            ok  = sum(1 for r in results if r[3])
+            err = len(results) - ok
+            self._dec_log_msg("─" * 55)
+            # Render clickable link cho mỗi file thành công
+            for (orig, out_path, size, success) in results:
+                if success and out_path:
+                    self._dec_log_file_link(out_path, size)
+            if ok > 0:
+                self._dec_log_msg("")
+            self._dec_log_msg(f"✔  Hoàn tất: {ok} file OK,  {err} lỗi")
+            self.after(0, lambda: self._dec_status_lbl.configure(
+                text=f"✓  {ok}/{len(results)} file giải mã thành công",
+                text_color=GREEN))
+            self._show_toast(f"✓  Decrypt: {ok} file thành công")
+            if ok > 0:
+                # Refresh Local Storage tab nếu output nằm trong DONGBO_DIR
+                if Path(out_d).resolve() == DONGBO_DIR.resolve():
+                    threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+        except Exception as e:
+            self._dec_log_msg(f"\n✗  LỖI: {e}")
+            self.after(0, lambda: self._dec_status_lbl.configure(
+                text=f"Lỗi: {e}", text_color=RED))
+            self._log(f"Decrypt ERROR: {e}", "err")
+        finally:
+            self.after(0, lambda: [self._dec_pb.stop(), self._dec_pb.pack_forget()])
+            self.after(0, lambda: self._dec_btn.configure(state="normal"))
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAB CALLBACK
