@@ -944,24 +944,104 @@ class App(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
     # NODE AUTO-DETECT
     # ─────────────────────────────────────────────────────────────────────────
+    # ── Lấy subnet IPs của máy hiện tại để scan LAN ──────────────────────────
+    @staticmethod
+    def _get_local_subnets() -> list:
+        """Trả về danh sách prefix subnet dạng '192.168.1.' từ các interface của máy."""
+        prefixes = set()
+        try:
+            import socket as _s
+            hostname = _s.gethostname()
+            for info in _s.getaddrinfo(hostname, None):
+                ip = info[4][0]
+                if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+                    parts = ip.rsplit(".", 1)
+                    if len(parts) == 2:
+                        prefixes.add(parts[0] + ".")
+        except Exception:
+            pass
+        # Fallback: thử socket connect để lấy IP ra ngoài
+        try:
+            import socket as _s
+            with _s.socket(_s.AF_INET, _s.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                ip = sock.getsockname()[0]
+                parts = ip.rsplit(".", 1)
+                if len(parts) == 2:
+                    prefixes.add(parts[0] + ".")
+        except Exception:
+            pass
+        return list(prefixes)
+
+    def _scan_lan_for_node(self, prefix: str, target_node: int, timeout=1.0) -> str:
+        """Scan subnet prefix (vd '192.168.1.') tìm ESP32 node có node==target_node.
+        Trả về IP nếu tìm thấy, '' nếu không."""
+        import concurrent.futures
+
+        def _check(host):
+            try:
+                req = urllib.request.Request(
+                    f"http://{host}/status",
+                    headers={"User-Agent": "AudioGUI/3.0"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    d = json.loads(r.read().decode())
+                    if d.get("node") == target_node:
+                        return host
+            except Exception:
+                pass
+            return ""
+
+        candidates = [f"{prefix}{i}" for i in range(1, 255)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+            results = ex.map(_check, candidates)
+        for r in results:
+            if r:
+                return r
+        return ""
+
     def _poll_detect(self):
-        ips = [("192.168.4.1", 1), ("192.168.5.1", 2)]
-        _miss, _MISS_TH = 0, 3
+        # AP IPs cố định (khi máy kết nối thẳng vào WiFi của ESP32)
+        fixed_ips = [("192.168.4.1", 1), ("192.168.5.1", 2)]
+        _miss, _MISS_TH = 0, 6   # 6 × 5s = 30s grace period trước khi báo mất kết nối
         while True:
             found = 0
-            for ip, num in ips:
-                try:
-                    req = urllib.request.Request(
-                        f"http://{ip}/status",
-                        headers={"User-Agent": "AudioGUI/3.0"})
-                    with urllib.request.urlopen(req, timeout=2) as r:
-                        d = json.loads(r.read().decode())
-                        if d.get("node") == num:
-                            found = num
-                            self.after(0, lambda n=num, i=ip: self._on_node_detected(n, i))
+            # 1) Thử AP IPs cố định trước (nhanh) — retry 2 lần mỗi IP
+            for ip, num in fixed_ips:
+                for attempt in range(2):
+                    try:
+                        req = urllib.request.Request(
+                            f"http://{ip}/status",
+                            headers={"User-Agent": "AudioGUI/3.0"})
+                        with urllib.request.urlopen(req, timeout=4) as r:
+                            d = json.loads(r.read().decode())
+                            node_val = d.get("node")
+                            # Chấp nhận node==num hoặc node==str(num) để tương thích
+                            if node_val == num or node_val == str(num):
+                                found = num
+                                self.after(0, lambda n=num, i=ip: self._on_node_detected(n, i))
+                                break
+                    except Exception:
+                        if attempt == 0:
+                            time.sleep(0.5)   # thử lại sau 0.5s
+                if found:
+                    break
+
+            # 2) Nếu không thấy qua AP IPs → scan LAN subnet (kết nối qua router)
+            if not found:
+                subnets = self._get_local_subnets()
+                for prefix in subnets:
+                    # Bỏ qua prefix là AP của ESP32 (đã thử ở bước 1)
+                    if prefix in ("192.168.4.", "192.168.5."):
+                        continue
+                    for target_node in (1, 2):
+                        ip = self._scan_lan_for_node(prefix, target_node, timeout=0.8)
+                        if ip:
+                            found = target_node
+                            self.after(0, lambda n=target_node, i=ip: self._on_node_detected(n, i))
                             break
-                except Exception:
-                    pass
+                    if found:
+                        break
+
             if not found:
                 _miss += 1
                 if _miss >= _MISS_TH:

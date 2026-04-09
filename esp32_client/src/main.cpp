@@ -456,26 +456,70 @@ int32_t getRemoteFileSize(const String& listJson, const String& fname) {
   return -1;
 }
 
+// ── Kiểm tra Node-1 có đang bận sync không (qua AP IP) ────────
+bool isNode1Busy() {
+  WiFiClient c;
+  if (!c.connect(NODE1_IP, NODE1_HTTP_PORT)) return false;
+  c.print("GET /sync/busy HTTP/1.1\r\nHost: " NODE1_IP "\r\nConnection: close\r\n\r\n");
+  unsigned long t = millis();
+  while (c.connected() && (millis()-t) < 3000) {
+    if (c.available()) {
+      String resp = c.readString();
+      c.stop();
+      return resp.indexOf("\"busy\":true") >= 0;
+    }
+    delay(5);
+  }
+  c.stop();
+  return false;
+}
+
+// ── Kết nối trực tiếp vào Node-1 (không scan — tiết kiệm thời gian) ──────
+bool findAndConnectNode1() {
+  // Kết nối trực tiếp — biết SSID/pass rồi, không cần scan
+  // Giữ WIFI_AP_STA để AP Node-2 vẫn sống trong khi kết nối STA
+  Serial.printf("[Sync] Kết nối vào '%s'...\n", NODE1_SSID);
+  WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
+
+  // Chờ tối đa 8 giây, vừa handleClient() vừa đợi
+  int retries = 0;
+  int maxRetries = 16;  // 16 × 500ms = 8 giây
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    unsigned long tw = millis();
+    while (millis()-tw < 500) { server.handleClient(); delay(5); }
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[Sync] THẤT BẠI: Không tìm thấy Thiết bị A");
+    syncMsg = "failed: Node-1 not found";
+    WiFi.disconnect(false);
+    return false;
+  }
+  return true;
+}
+
 // ── Đồng bộ TẤT CẢ file từ Node-1 (so sánh kích thước) ───────
 bool syncFromNode1() {
   Serial.println("\n[Sync] ══ Bắt đầu kết nối Thiết bị A (Node-1) ══");
   syncMsg = "connecting";
 
-  WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12) {
-    unsigned long tw = millis();
-    while (millis()-tw < 300) { server.handleClient(); delay(5); }
-    Serial.print("."); retries++;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n[Sync] THẤT BẠI: Không tìm thấy Thiết bị A");
-    syncMsg = "failed: Node-1 not found";
-    WiFi.disconnect(false); return false;
+  // Tìm và kết nối Node-1 (với scan + timeout dài)
+  if (!findAndConnectNode1()) {
+    return false;
   }
   Serial.printf("\n[Sync] Đã kết nối Thiết bị A  IP: %s\n",
                 WiFi.localIP().toString().c_str());
   delay(300);
+
+  // Kiểm tra Node-1 có đang bận sync không → nếu bận thì ngắt kết nối, thử lại sau
+  if (isNode1Busy()) {
+    Serial.println("[Sync] Thiết bị A đang bận sync — bỏ qua lần này");
+    syncMsg = "deferred: node-1 busy";
+    WiFi.disconnect(false); delay(200);
+    return false;
+  }
 
   // Lấy danh sách file từ Node-1 — retry 3 lần
   String listJson = "";
@@ -560,7 +604,8 @@ bool syncFromNode1() {
   if (downloaded > 0) blinkLED(5, 100);
 
   WiFi.disconnect(false); delay(300);
-  Serial.printf("[Sync] Đã ngắt kết nối Thiết bị A. AP vẫn chạy.\n");
+  // AP Node-2 vẫn sống vì chưa bao giờ tắt (AP_STA mode)
+  Serial.printf("[Sync] Đã ngắt kết nối Thiết bị A. AP Node-2 vẫn chạy (AP_STA).\n");
   Serial.printf("[Sync] Kết quả: tải %d, cập nhật %d, bỏ qua %d / %d file\n",
                 downloaded, updated, skipped, (int)remoteFiles.size());
 
@@ -1159,6 +1204,10 @@ void setup() {
   Serial.println("\n[Khởi động] Chưa có file — thử đồng bộ từ Thiết bị A...");
   blinkLED(2,200); delay(1000);
 
+  // Đảm bảo AP_STA đã bật trước khi sync
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+  
   syncDone   = syncFromNode1();
   syncFailed = !syncDone;
 
@@ -1212,10 +1261,10 @@ void loop() {
     uc.stop();
   }
 
-  // Periodic sync từ Node-1 mỗi 10s
+  // Periodic sync từ Node-1 mỗi SYNC_INTERVAL_MS
+  // Reset timer SAU KHI sync kết thúc để tránh vòng lặp liên tục
   if (!_syncing && (millis() - _lastSync1 >= SYNC_INTERVAL_MS)) {
     _syncing    = true;
-    _lastSync1  = millis();
 
     int before = countSpiffsFiles();
     Serial.printf("\n[Sync] ── Bắt đầu đồng bộ (Thiết bị B có %d file) ──\n", before);
@@ -1226,5 +1275,6 @@ void loop() {
     Serial.printf("[Sync] Danh sách: %d file (Thiết bị B)\n", after);
     _node2Count = after;
     _syncing    = false;
+    _lastSync1  = millis();  // reset SAU khi xong → tránh overlap ngay lập tức
   }
 }

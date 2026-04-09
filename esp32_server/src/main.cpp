@@ -64,7 +64,7 @@
 #define MY_AP_IP_STR       "192.168.4.1"
 
 // ── Sync interval ─────────────────────────────────────────────
-#define SYNC_INTERVAL_MS   10000UL   // đồng bộ mỗi 10 giây
+#define SYNC_INTERVAL_MS   15000UL   // Node-1 đồng bộ mỗi 15 giây (lệch Node-2 để tránh deadlock)
 
 WebServer  server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);
@@ -648,6 +648,16 @@ void handleRamInfo() {
   server.send(200,"application/json",j);
 }
 
+// ── Busy flag — Node-2 dùng để kiểm tra trước khi kết nối ───────────────
+static bool _node1SyncBusy = false;  // true khi Node-1 đang là STA (đồng bộ từ Node-2)
+
+// GET /sync/busy — trả về {"busy": true/false}
+void handleSyncBusy() {
+  server.send(200, "application/json",
+    String("{\"busy\":") + (_node1SyncBusy ? "true" : "false") +
+    ",\"node\":1}");
+}
+
 // GET /sync/status — Node-2 gọi để kiểm tra trước khi đồng bộ
 void handleSyncStatus() {
   // Đếm số file trong SPIFFS
@@ -886,6 +896,7 @@ void setup() {
   server.on("/file/delete",   HTTP_POST, handleFileDelete);
   server.on("/ram/info",      HTTP_GET,  handleRamInfo);
   server.on("/sync/status",   HTTP_GET,  handleSyncStatus);   // Node-2 poll
+  server.on("/sync/busy",     HTTP_GET,  handleSyncBusy);     // Node-2 kiểm tra trước khi kết nối
   // Tương thích firmware cũ
   server.on("/audio/info",    HTTP_GET,  handleFileInfo);
   server.on("/ram/clear",     HTTP_POST, handleFileClear);
@@ -1039,20 +1050,38 @@ int32_t getRemoteFileSizeNode2(const String& listJson, const String& fname) {
   return -1;
 }
 
+// ── Kết nối trực tiếp vào Node-2 (không scan — tiết kiệm thời gian) ──────
+bool findAndConnectNode2() {
+  // Kết nối trực tiếp — biết SSID/pass rồi, không cần scan
+  // Giữ WIFI_AP_STA để AP Node-1 vẫn sống trong khi kết nối STA
+  Serial.printf("[Sync2] Kết nối vào '%s'...\n", NODE2_SSID);
+  WiFi.begin(NODE2_SSID, NODE2_PASSWORD);
+  
+  // Chờ tối đa 8 giây, vừa handleClient() vừa đợi
+  int retries = 0;
+  int maxRetries = 16;  // 16 × 500ms = 8 giây
+  while (WiFi.status() != WL_CONNECTED && retries < maxRetries) {
+    unsigned long tw = millis();
+    while (millis()-tw < 500) { server.handleClient(); delay(5); }
+    Serial.print(".");
+    retries++;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n[Sync2] THẤT BẠI: Không tìm thấy Thiết bị B");
+    WiFi.disconnect(false);
+    return false;
+  }
+  return true;
+}
+
 // ── Đồng bộ từ Node-2 → Node-1 ───────────────────────────────
 bool syncFromNode2() {
   Serial.println("\n[Sync2] ══ Bắt đầu kết nối Thiết bị B (Node-2) ══");
 
-  WiFi.begin(NODE2_SSID, NODE2_PASSWORD);
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12) {
-    unsigned long tw = millis();
-    while (millis()-tw < 300) { server.handleClient(); delay(5); }
-    Serial.print("."); retries++;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n[Sync2] THẤT BẠI: Không tìm thấy Thiết bị B");
-    WiFi.disconnect(false); return false;
+  // Tìm và kết nối Node-2 (với scan + timeout dài)
+  if (!findAndConnectNode2()) {
+    return false;
   }
   Serial.printf("\n[Sync2] Đã kết nối Thiết bị B  IP: %s\n",
                 WiFi.localIP().toString().c_str());
@@ -1128,7 +1157,8 @@ bool syncFromNode2() {
 
   if (downloaded > 0) blinkLED(5, 100);
   WiFi.disconnect(false); delay(300);
-  Serial.printf("[Sync2] Đã ngắt kết nối Thiết bị B. AP vẫn chạy.\n");
+  // AP Node-1 vẫn sống vì chưa bao giờ tắt (AP_STA mode)
+  Serial.printf("[Sync2] Đã ngắt kết nối Thiết bị B. AP Node-1 vẫn chạy (AP_STA).\n");
   Serial.printf("[Sync2] Kết quả: tải %d, cập nhật %d, bỏ qua %d / %d file\n",
                 downloaded, updated, skipped, (int)remoteFiles.size());
   return (downloaded > 0);
@@ -1137,6 +1167,9 @@ bool syncFromNode2() {
 // ── Loop ──────────────────────────────────────────────────────
 static unsigned long _lastSync2     = 0;
 static bool          _syncing2      = false;
+
+// _node1SyncBusy được set khi Node-1 bắt đầu act như STA
+// handleSyncBusy() đọc flag này để Node-2 biết không nên kết nối
 
 void loop() {
   checkBootButton();
@@ -1165,7 +1198,7 @@ void loop() {
 
   // Periodic sync từ Node-2 mỗi SYNC_INTERVAL_MS:
   // - Không sync nếu đang có AP station kết nối (laptop đang dùng)
-  // - Reset timer sau mỗi sync để tránh loop
+  // - Reset timer SAU KHI sync kết thúc để tránh overlap liên tục
   if (!_syncing2 && (millis() - _lastSync2 >= SYNC_INTERVAL_MS)) {
     // Kiểm tra có AP client không — nếu có, hoãn sync
     uint8_t apClients = WiFi.softAPgetStationNum();
@@ -1173,14 +1206,16 @@ void loop() {
       Serial.printf("[Sync2] Hoãn sync — có %d client đang kết nối AP\n", apClients);
       _lastSync2 = millis();  // đặt lại timer, thử sau SYNC_INTERVAL_MS
     } else {
-      _syncing2  = true;
-      _lastSync2 = millis();
+      _syncing2        = true;
+      _node1SyncBusy   = true;   // báo Node-2 biết Node-1 đang bận
       int before = countSpiffsFiles();
       Serial.printf("\n[Sync2] ── Bắt đầu đồng bộ (Thiết bị A có %d file) ──\n", before);
       syncFromNode2();
       int after  = countSpiffsFiles();
       Serial.printf("[Sync2] Danh sách: %d file (Thiết bị A)\n", after);
-      _syncing2  = false;
+      _node1SyncBusy   = false;
+      _syncing2        = false;
+      _lastSync2       = millis();  // reset SAU khi sync xong → tránh overlap ngay lập tức
     }
   }
 }
