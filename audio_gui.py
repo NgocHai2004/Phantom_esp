@@ -1,6 +1,6 @@
 """
 audio_gui.py — Phantom File Transfer Console
-Style: Modern dark blue — FBI / Tactical dark theme
+Style: macOS Sonoma / Ventura — Apple desktop HIG
 Run: .venv\Scripts\python audio_gui.py
 """
 
@@ -96,27 +96,57 @@ CLIENT_AUDIO  = 8080
 CLIENT_UPLOAD = 8081
 
 # ── Appearance ────────────────────────────────────────────────────────────────
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("dark-blue")
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-BG          = "#10131a"
-BG_CARD     = "#1a1f2e"
-BG_SURFACE  = "#222840"
-BG_ROW      = "#1e2438"
-BG_ROW_ALT  = "#232b3e"
-BG_LOG      = "#141820"
-BORDER      = "#2d3550"
-ACCENT      = "#2563eb"
-ACCENT_GLOW = "#1d4ed8"
-ACCENT_ICON = "#3b82f6"
-GREEN       = "#22c55e"
-WARN        = "#f59e0b"
-RED         = "#ef4444"
-TEAL        = "#14b8a6"
-TEXT        = "#e2e8f0"
-MUTED       = "#64748b"
-SUBTLE      = "#94a3b8"
+# ── Palette — macOS Launchpad Gradient ────────────────────────────────────────
+# Gradient stops: deep purple → magenta → pink (like the screenshot)
+GRAD_TOP    = "#4B1C6E"   # deep purple top
+GRAD_MID    = "#A0306A"   # magenta mid
+GRAD_BOT    = "#C0446E"   # pink bottom
+
+# Frosted-glass panels (opaque approximation — white with slight tint)
+BG          = "#4B1C6E"   # window bg (overridden by gradient canvas)
+BG_CARD     = "#FFFFFF"   # white card (frosted glass light)
+BG_SURFACE  = "#F4F0FA"   # very light purple tint surface
+BG_SIDEBAR  = "#EDE8F5"   # sidebar with subtle purple wash
+BG_ROW      = "#FFFFFF"
+BG_ROW_ALT  = "#F9F6FD"   # faint purple row alt
+BG_LOG      = "#F4F0FA"
+BORDER      = "#DDD6ED"   # light purple-tinted separator
+TOOLBAR     = "#FFFFFF"   # toolbar white
+ACCENT      = "#7B2FBE"   # purple accent (matches gradient)
+ACCENT_GLOW = "#5A1F8C"
+ACCENT_ICON = "#BF5AF2"   # macOS system purple
+GREEN       = "#28CD41"   # macOS green
+WARN        = "#FF9F0A"   # macOS orange
+RED         = "#FF453A"   # macOS red
+TEAL        = "#5AC8FA"
+TEXT        = "#1D1D1F"   # dark label on white cards
+MUTED       = "#6E6880"   # muted purple-grey
+SUBTLE      = "#AEA8BA"   # subtle purple-grey
+
+# ── Gradient helpers ──────────────────────────────────────────────────────────
+def _lerp_color(c1: str, c2: str, t: float) -> str:
+    """Linear interpolate between two hex colors. t in [0,1]."""
+    r1,g1,b1 = int(c1[1:3],16), int(c1[3:5],16), int(c1[5:7],16)
+    r2,g2,b2 = int(c2[1:3],16), int(c2[3:5],16), int(c2[5:7],16)
+    r = int(r1 + (r2-r1)*t)
+    g = int(g1 + (g2-g1)*t)
+    b = int(b1 + (b2-b1)*t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def _draw_gradient(canvas: tk.Canvas, w: int, h: int):
+    """Draw vertical 3-stop gradient on canvas (top→mid→bottom)."""
+    canvas.delete("gradient")
+    steps = max(h, 2)
+    for i in range(steps):
+        t = i / (steps - 1)
+        if t < 0.5:
+            color = _lerp_color(GRAD_TOP, GRAD_MID, t * 2)
+        else:
+            color = _lerp_color(GRAD_MID, GRAD_BOT, (t - 0.5) * 2)
+        canvas.create_line(0, i, w, i, fill=color, tags="gradient")
 
 # ── Network helpers ────────────────────────────────────────────────────────────
 _MIME_MAP = {
@@ -430,10 +460,10 @@ def http_post(host, port, path, timeout=6):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Phantom File Transfer Console")
-        self.geometry("1000x650")
-        self.minsize(820, 520)
-        self.configure(fg_color=BG)
+        self.title("Phantom Transfer")
+        self.geometry("1060x680")
+        self.minsize(860, 540)
+        self.configure(fg_color=GRAD_TOP)
 
         self.wav_path       = ctk.StringVar(value="")
         self.client_ip      = ctk.StringVar(value=CLIENT_IP)
@@ -444,6 +474,7 @@ class App(ctk.CTk):
         self._spin_angle    = 0
         self._spinning      = False
         self._sync_proc     = None
+        self._active_page   = "devices"
 
         self._build_ui()
         self.after(600, self._auto_refresh)
@@ -453,259 +484,364 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # BUILD UI
+    # BUILD UI  — macOS Launchpad gradient + frosted glass
     # ─────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        outer = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=16)
-        outer.pack(fill="both", expand=True, padx=12, pady=10)
+        # ── Gradient canvas (fills entire window, behind everything) ─────────
+        self._grad_canvas = tk.Canvas(self, highlightthickness=0, bd=0)
+        self._grad_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.bind("<Configure>", self._on_resize)
+        # draw immediately with initial size
+        self.update_idletasks()
+        self._on_resize(None)
 
-        # ── Header bar ───────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(outer, fg_color="transparent", height=52)
-        hdr.pack(fill="x", padx=20, pady=(14, 0))
-        hdr.pack_propagate(False)
+        # ── Semi-transparent toolbar ─────────────────────────────────────────
+        toolbar = ctk.CTkFrame(self, fg_color="#FFFFFF",
+                               height=48, corner_radius=0)
+        toolbar.place(x=0, y=0, relwidth=1)
+        toolbar.pack_propagate(False)
 
-        icon_box = ctk.CTkFrame(hdr, fg_color=ACCENT,
-                                width=28, height=28, corner_radius=7)
-        icon_box.pack(side="left", pady=12)
+        # Divider below toolbar
+        div = tk.Frame(self, bg="#FFFFFF", height=1)
+        div.place(x=0, y=48, relwidth=1)
+
+        # App icon
+        icon_box = ctk.CTkFrame(toolbar, fg_color=ACCENT,
+                                width=24, height=24, corner_radius=7)
+        icon_box.place(x=16, y=12)
         icon_box.pack_propagate(False)
-        ctk.CTkLabel(icon_box, text="▶", font=ctk.CTkFont("Segoe UI", 11, "bold"),
+        ctk.CTkLabel(icon_box, text="⇅",
+                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
                      text_color="white").place(relx=0.5, rely=0.5, anchor="center")
 
-        ctk.CTkLabel(hdr, text="  Phantom File Transfer Console",
-                     font=ctk.CTkFont("Segoe UI", 16, "bold"),
-                     text_color=TEXT).pack(side="left", pady=12)
+        # Title centered
+        ctk.CTkLabel(toolbar, text="Phantom Transfer",
+                     font=ctk.CTkFont("Segoe UI", 14, "bold"),
+                     text_color=TEXT,
+                     fg_color="transparent"
+                     ).place(relx=0.5, rely=0.5, anchor="center")
 
-        right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
-        right_hdr.pack(side="right", pady=8)
+        # Status right
+        status_badge = ctk.CTkFrame(toolbar, fg_color="transparent")
+        status_badge.place(relx=1.0, rely=0.5, anchor="e", x=-16)
 
         self._conn_spinner = ctk.CTkLabel(
-            right_hdr, text="◌",
-            font=ctk.CTkFont("Segoe UI", 14), text_color=MUTED)
-        self._conn_spinner.pack(side="left", padx=(0, 4))
+            status_badge, text="◌",
+            font=ctk.CTkFont("Segoe UI", 11), text_color=MUTED)
+        self._conn_spinner.pack(side="left", padx=(0, 3))
 
         self._conn_lbl = ctk.CTkLabel(
-            right_hdr, text="Scanning for devices…",
+            status_badge, text="Scanning…",
             font=ctk.CTkFont("Segoe UI", 11), text_color=MUTED)
-        self._conn_lbl.pack(side="left", padx=(0, 10))
+        self._conn_lbl.pack(side="left")
 
-        ctk.CTkLabel(right_hdr, text="···",
-                     font=ctk.CTkFont("Segoe UI", 16, "bold"),
-                     text_color=MUTED).pack(side="left")
+        # ── Main body below toolbar — use tk.Frame for place() geometry ──────
+        TOOLBAR_H = 49   # toolbar 48px + 1px divider
 
-        # ── Separator ────────────────────────────────────────────────────────
-        ctk.CTkFrame(outer, fg_color=BORDER, height=1, corner_radius=0
-                     ).pack(fill="x", padx=0, pady=(12, 0))
+        # Sidebar container (plain tk.Frame supports width/height in place)
+        _sidebar_tk = tk.Frame(self, bg="#FFFFFF", width=200)
+        _sidebar_tk.place(x=0, y=TOOLBAR_H, width=200, relheight=1.0,
+                          height=-TOOLBAR_H)
 
-        # ── Tab view ─────────────────────────────────────────────────────────
-        self._tabs = ctk.CTkTabview(
-            outer,
-            fg_color=BG_CARD,
-            segmented_button_fg_color=BG_SURFACE,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_GLOW,
-            segmented_button_unselected_color=BG_SURFACE,
-            segmented_button_unselected_hover_color=BORDER,
-            text_color=TEXT,
-            corner_radius=12,
-        )
-        self._tabs.pack(fill="both", expand=True, padx=8, pady=(6, 8))
+        # CTkFrame fills sidebar_tk
+        sidebar_outer = ctk.CTkFrame(_sidebar_tk, fg_color="#FFFFFF",
+                                     corner_radius=0)
+        sidebar_outer.pack(fill="both", expand=True)
 
-        self._tabs.add("📡  Phantom Devices")
-        self._tabs.add("📁  Local Storage")
-        self._tabs.add("🔓  Decrypt")
+        # Sidebar right-edge divider
+        tk.Frame(self, bg=BORDER).place(x=200, y=TOOLBAR_H,
+                                        width=1, relheight=1.0,
+                                        height=-TOOLBAR_H)
 
-        # Tab 1: Phantom
-        tab_esp = self._tabs.tab("📡  Phantom Devices")
-        body = ctk.CTkFrame(tab_esp, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=0, pady=0)
+        # Content container
+        _content_tk = tk.Frame(self, bg=GRAD_TOP)
+        _content_tk.place(x=201, y=TOOLBAR_H, relwidth=1.0,
+                          width=-201, relheight=1.0, height=-TOOLBAR_H)
 
-        sidebar = ctk.CTkFrame(body, fg_color="transparent", width=280)
-        sidebar.pack(side="left", fill="y", padx=(4, 8), pady=6)
-        sidebar.pack_propagate(False)
+        content_outer = ctk.CTkFrame(_content_tk, fg_color="transparent",
+                                     corner_radius=0)
+        content_outer.pack(fill="both", expand=True)
 
-        main = ctk.CTkFrame(body, fg_color="transparent")
-        main.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=6)
+        # Build sidebar nav
+        self._build_macos_sidebar(sidebar_outer)
 
-        self._build_sidebar(sidebar)
-        self._build_main(main)
+        # Build content pages (stacked)
+        self._pages = {}
 
-        # Tab 2: Local Storage
-        tab_local = self._tabs.tab("📁  Local Storage")
-        self._build_local_tab(tab_local)
+        p_dev = ctk.CTkFrame(content_outer, fg_color="transparent", corner_radius=0)
+        p_dev.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._pages["devices"] = p_dev
+        self._build_devices_page(p_dev)
 
-        # Tab 3: Decrypt
-        tab_dec = self._tabs.tab("🔓  Decrypt")
-        self._build_decrypt_tab(tab_dec)
+        p_local = ctk.CTkFrame(content_outer, fg_color="transparent", corner_radius=0)
+        p_local.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._pages["local"] = p_local
+        self._build_local_tab(p_local)
 
-        self._tabs.configure(command=self._on_tab_change)
+        p_dec = ctk.CTkFrame(content_outer, fg_color="transparent", corner_radius=0)
+        p_dec.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._pages["decrypt"] = p_dec
+        self._build_decrypt_tab(p_dec)
+
+        self._show_page("devices")
         self._start_spinner()
 
+    def _on_resize(self, event):
+        """Redraw gradient canvas on window resize."""
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 2 or h < 2:
+            return
+        self._grad_canvas.config(width=w, height=h)
+        _draw_gradient(self._grad_canvas, w, h)
+
     # ─────────────────────────────────────────────────────────────────────────
-    # SIDEBAR
+    # macOS SOURCE-LIST SIDEBAR
     # ─────────────────────────────────────────────────────────────────────────
-    def _build_sidebar(self, parent):
-        # ── Card: Connection Status ───────────────────────────────────────────
-        card1 = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
-        card1.pack(fill="x", pady=(0, 10))
+    def _build_macos_sidebar(self, parent):
+        # Section label — dark text on white sidebar
+        ctk.CTkLabel(parent, text="PHANTOM",
+                     font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                     text_color=MUTED, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(20, 6))
 
-        ctk.CTkLabel(card1, text="Connection Status",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=TEXT, anchor="w"
-                     ).pack(fill="x", padx=16, pady=(14, 6))
+        self._nav_btns = {}
+        nav_items = [
+            ("devices",  "📡",  "Devices"),
+            ("local",    "📁",  "Local Files"),
+            ("decrypt",  "🔓",  "Decrypt"),
+        ]
+        for key, icon, label in nav_items:
+            btn = ctk.CTkButton(
+                parent,
+                text=f"  {icon}  {label}",
+                font=ctk.CTkFont("Segoe UI", 13),
+                anchor="w",
+                fg_color="transparent",
+                hover_color=BG_SURFACE,
+                text_color=TEXT,
+                height=36,
+                corner_radius=8,
+                command=lambda k=key: self._show_page(k))
+            btn.pack(fill="x", padx=8, pady=2)
+            self._nav_btns[key] = btn
 
-        status_row = ctk.CTkFrame(card1, fg_color="transparent")
-        status_row.pack(fill="x", padx=16, pady=(0, 4))
+        # Divider
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=12, pady=(10, 4))
 
-        self._status_dot = ctk.CTkLabel(
-            status_row, text="●",
-            font=ctk.CTkFont("Segoe UI", 10),
-            text_color=WARN)
-        self._status_dot.pack(side="left", padx=(0, 6))
+        # Spacer
+        ctk.CTkFrame(parent, fg_color="transparent").pack(fill="both", expand=True)
 
-        self._detect_lbl = ctk.CTkLabel(
-            status_row, text="Not Connected",
-            font=ctk.CTkFont("Segoe UI", 11, "bold"),
-            text_color=SUBTLE)
+        # Bottom: connection status
+        btm = ctk.CTkFrame(parent, fg_color="transparent")
+        btm.pack(fill="x", padx=12, pady=(0, 16))
+
+        self._status_dot = ctk.CTkLabel(btm, text="●",
+                                         font=ctk.CTkFont("Segoe UI", 9),
+                                         text_color=WARN)
+        self._status_dot.pack(side="left", padx=(0, 5))
+
+        self._detect_lbl = ctk.CTkLabel(btm, text="Not Connected",
+                                         font=ctk.CTkFont("Segoe UI", 11),
+                                         text_color=MUTED)
         self._detect_lbl.pack(side="left")
 
-        self._ip_lbl = ctk.CTkLabel(
-            card1, text="Connect to Phantom WiFi to begin",
-            font=ctk.CTkFont("Segoe UI", 9),
-            text_color=MUTED, anchor="w")
-        self._ip_lbl.pack(fill="x", padx=16, pady=(0, 14))
+    def _show_page(self, key: str):
+        self._active_page = key
+        for k, p in self._pages.items():
+            if k == key:
+                p.lift()
+            else:
+                p.lower()
+        # Highlight active nav item
+        for k, btn in self._nav_btns.items():
+            if k == key:
+                btn.configure(fg_color=ACCENT, text_color="white",
+                              hover_color=ACCENT_GLOW)
+            else:
+                btn.configure(fg_color="transparent", text_color=TEXT,
+                              hover_color=BG_SURFACE)
+        # Trigger local refresh
+        if key == "local":
+            threading.Thread(target=self._refresh_local_tab, daemon=True).start()
 
-        # ── Card: Send File ───────────────────────────────────────────────────
-        card2 = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
-        card2.pack(fill="x", pady=(0, 10))
+    # ─────────────────────────────────────────────────────────────────────────
+    # DEVICES PAGE
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_devices_page(self, parent):
+        # Page header bar (white frosted glass)
+        phdr = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=0, height=46)
+        phdr.pack(fill="x")
+        phdr.pack_propagate(False)
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x")
 
-        ctk.CTkLabel(card2, text="Send File",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+        ctk.CTkLabel(phdr, text="Devices",
+                     font=ctk.CTkFont("Segoe UI", 15, "bold"),
                      text_color=TEXT, anchor="w"
-                     ).pack(fill="x", padx=16, pady=(14, 8))
+                     ).pack(side="left", padx=20, pady=12)
 
-        file_row = ctk.CTkFrame(card2, fg_color="transparent")
-        file_row.pack(fill="x", padx=12, pady=(0, 10))
+        self._ip_lbl = ctk.CTkLabel(
+            phdr, text="Connect to Phantom WiFi to begin",
+            font=ctk.CTkFont("Segoe UI", 11), text_color=MUTED)
+        self._ip_lbl.pack(side="right", padx=16)
+
+        # Body — transparent to show gradient through
+        body = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+
+        # Action column — white frosted glass card
+        action_col = ctk.CTkFrame(body, fg_color=BG_CARD, corner_radius=12,
+                                  border_color=BORDER, border_width=1,
+                                  width=258)
+        action_col.pack(side="left", fill="y", padx=(0, 10))
+        action_col.pack_propagate(False)
+
+        main_col = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
+        main_col.pack(side="left", fill="both", expand=True)
+
+        self._build_sidebar(action_col)
+        self._build_main(main_col)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ACTION COLUMN (right of devices page sidebar)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_sidebar(self, parent):
+        # ── Section: Send File ────────────────────────────────────────────────
+        ctk.CTkLabel(parent, text="SEND",
+                     font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                     text_color=MUTED, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(16, 6))
+
+        # File picker row
+        file_row = ctk.CTkFrame(parent, fg_color="transparent")
+        file_row.pack(fill="x", padx=12, pady=(0, 8))
 
         self._file_entry = ctk.CTkEntry(
             file_row,
             textvariable=self.wav_path,
-            placeholder_text="Select file…",
+            placeholder_text="Choose a file…",
             font=ctk.CTkFont("Segoe UI", 10),
             fg_color=BG_CARD,
             border_color=BORDER,
             border_width=1,
             text_color=TEXT,
-            height=36,
-            corner_radius=8)
+            placeholder_text_color=MUTED,
+            height=30,
+            corner_radius=6)
         self._file_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        ctk.CTkButton(file_row, text="···",
-                      width=36, height=36,
-                      font=ctk.CTkFont("Segoe UI", 13, "bold"),
+        ctk.CTkButton(file_row, text="…",
+                      width=30, height=30,
+                      font=ctk.CTkFont("Segoe UI", 13),
                       fg_color=BG_CARD,
                       hover_color=BORDER,
                       border_color=BORDER,
                       border_width=1,
-                      text_color=SUBTLE,
-                      corner_radius=8,
+                      text_color=MUTED,
+                      corner_radius=6,
                       command=self._browse
                       ).pack(side="right")
 
         self._upload_btn = ctk.CTkButton(
-            card2,
-            text="🚀   Upload File",
+            parent,
+            text="Upload to Device",
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             fg_color=ACCENT,
             hover_color=ACCENT_GLOW,
             text_color="white",
-            height=44,
-            corner_radius=10,
+            height=34,
+            corner_radius=8,
             command=lambda: threading.Thread(
                 target=self._upload_to_server, daemon=True).start())
         self._upload_btn.pack(fill="x", padx=12, pady=(0, 4))
 
         self._upload_pb = ctk.CTkProgressBar(
-            card2, mode="indeterminate", height=3,
-            progress_color=ACCENT, fg_color=BORDER,
-            corner_radius=2)
+            parent, mode="indeterminate", height=2,
+            progress_color=ACCENT, fg_color=BORDER, corner_radius=1)
         self._upload_pb.pack(fill="x", padx=12, pady=(0, 2))
         self._upload_pb.pack_forget()
 
         self._upload_result_lbl = ctk.CTkLabel(
-            card2, text="",
+            parent, text="",
             font=ctk.CTkFont("Segoe UI", 9),
-            text_color=TEAL, anchor="w", wraplength=240)
-        self._upload_result_lbl.pack(fill="x", padx=16, pady=(0, 10))
+            text_color=GREEN, anchor="w", wraplength=230)
+        self._upload_result_lbl.pack(fill="x", padx=14, pady=(0, 4))
 
-        # ── Card: Receive File ────────────────────────────────────────────────
-        card3 = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
-        card3.pack(fill="x", pady=(0, 10))
+        # Divider
+        ctk.CTkFrame(parent, fg_color=BORDER, height=1, corner_radius=0
+                     ).pack(fill="x", padx=12, pady=(8, 0))
 
-        ctk.CTkLabel(card3, text="Receive File",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=TEXT, anchor="w"
-                     ).pack(fill="x", padx=16, pady=(14, 6))
+        # ── Section: Receive File ─────────────────────────────────────────────
+        ctk.CTkLabel(parent, text="RECEIVE",
+                     font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                     text_color=MUTED, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(12, 4))
 
         self._dl_status_lbl = ctk.CTkLabel(
-            card3, text="Awaiting connection…",
-            font=ctk.CTkFont("Segoe UI", 9),
-            text_color=MUTED, anchor="w", wraplength=240)
-        self._dl_status_lbl.pack(fill="x", padx=16, pady=(0, 6))
+            parent, text="Awaiting connection…",
+            font=ctk.CTkFont("Segoe UI", 10),
+            text_color=MUTED, anchor="w", wraplength=230)
+        self._dl_status_lbl.pack(fill="x", padx=14, pady=(0, 6))
 
         self._dl_pb = ctk.CTkProgressBar(
-            card3, mode="indeterminate", height=3,
-            progress_color=TEAL, fg_color=BORDER, corner_radius=2)
-        self._dl_pb.pack(fill="x", padx=12, pady=(0, 4))
+            parent, mode="indeterminate", height=2,
+            progress_color=ACCENT, fg_color=BORDER, corner_radius=1)
+        self._dl_pb.pack(fill="x", padx=12, pady=(0, 6))
         self._dl_pb.pack_forget()
 
-        ctk.CTkButton(card3,
-                      text="🗁   Open Downloads Folder",
-                      font=ctk.CTkFont("Segoe UI", 10),
+        ctk.CTkButton(parent,
+                      text="Open Downloads Folder",
+                      font=ctk.CTkFont("Segoe UI", 11),
                       fg_color=BG_CARD,
                       hover_color=BORDER,
                       border_color=BORDER,
                       border_width=1,
-                      text_color=SUBTLE,
-                      height=36, corner_radius=8,
+                      text_color=MUTED,
+                      height=30, corner_radius=6,
                       command=self._open_downloads
-                      ).pack(fill="x", padx=12, pady=(0, 12))
+                      ).pack(fill="x", padx=12, pady=(0, 8))
 
+        # Spacer pushes content up
+        ctk.CTkFrame(parent, fg_color="transparent").pack(fill="both", expand=True)
         self._upload_section_lbl = ctk.CTkLabel(parent, text="", width=0, height=0)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # MAIN AREA
+    # MAIN CONTENT AREA
     # ─────────────────────────────────────────────────────────────────────────
     def _build_main(self, parent):
-        # ── File list header ─────────────────────────────────────────────────
-        fhdr = ctk.CTkFrame(parent, fg_color="transparent")
-        fhdr.pack(fill="x", pady=(0, 8))
+        # ── File list header ──────────────────────────────────────────────────
+        fhdr = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0, height=36)
+        fhdr.pack(fill="x", pady=(0, 4))
+        fhdr.pack_propagate(False)
 
         self._filelist_title = ctk.CTkLabel(
-            fhdr, text="Remote File List",
+            fhdr, text="Remote Files",
             font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            text_color=TEXT, anchor="w")
-        self._filelist_title.pack(side="left")
+            text_color="white", anchor="w")
+        self._filelist_title.pack(side="left", pady=8)
 
         for icon, tip, cmd in [
-            ("↻",  "Refresh",     lambda: threading.Thread(target=self._fetch_filelist, daemon=True).start()),
-            ("↓",  "Download",    lambda: threading.Thread(target=self._download, args=("server",), daemon=True).start()),
-            ("🗑", "Delete",      lambda: threading.Thread(target=self._delete_selected_file, daemon=True).start()),
+            ("↻",  "Refresh",  lambda: threading.Thread(target=self._fetch_filelist, daemon=True).start()),
+            ("↓",  "Download", lambda: threading.Thread(target=self._download, args=("server",), daemon=True).start()),
+            ("✕",  "Delete",   lambda: threading.Thread(target=self._delete_selected_file, daemon=True).start()),
         ]:
-            ctk.CTkButton(fhdr, text=icon, width=32, height=28,
-                          font=ctk.CTkFont("Segoe UI", 13),
+            ctk.CTkButton(fhdr, text=icon, width=28, height=26,
+                          font=ctk.CTkFont("Segoe UI", 11),
                           fg_color="transparent",
-                          hover_color=BG_SURFACE,
-                          text_color=MUTED,
+                          hover_color="#7B4FAA",
+                          text_color="white",
                           corner_radius=6,
                           command=cmd
-                          ).pack(side="right", padx=2)
+                          ).pack(side="right", padx=1, pady=5)
 
-        # ── File list table ───────────────────────────────────────────────────
-        table_card = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
-        table_card.pack(fill="x", pady=(0, 14))
+        # ── File list table — white frosted glass card ─────────────────────
+        table_wrap = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12,
+                                  border_color=BORDER, border_width=1)
+        table_wrap.pack(fill="x", pady=(0, 10))
+        table_card = table_wrap
 
-        col_hdr = tk.Frame(table_card, bg=BG_CARD)
-        col_hdr.pack(fill="x", padx=2, pady=(2, 0))
+        col_hdr = tk.Frame(table_card, bg=BG_SURFACE)
+        col_hdr.pack(fill="x", padx=1, pady=(1, 0))
 
         for txt, w, anchor in [
             ("Filename",   360, "w"),
@@ -714,70 +850,74 @@ class App(ctk.CTk):
             ("",            80, "center"),
         ]:
             lbl = tk.Label(col_hdr, text=txt,
-                           bg=BG_CARD, fg=MUTED,
+                           bg=BG_SURFACE, fg=MUTED,
                            font=("Segoe UI", 9),
-                           padx=10 if anchor == "w" else 0,
+                           padx=12 if anchor == "w" else 0,
                            anchor=anchor, width=0)
             lbl.pack(side="left", fill="x",
                      expand=(txt == "Filename"),
-                     ipadx=6, ipady=6)
+                     ipadx=6, ipady=5)
 
-        self._rows_frame = tk.Frame(table_card, bg=BG_SURFACE)
-        self._rows_frame.pack(fill="x", padx=2, pady=(0, 2))
+        self._rows_frame = tk.Frame(table_card, bg=BG_CARD)
+        self._rows_frame.pack(fill="x", padx=1, pady=(0, 1))
 
         self._empty_lbl = tk.Label(self._rows_frame,
                                     text="No files found",
-                                    bg=BG_SURFACE, fg=MUTED,
+                                    bg=BG_CARD, fg=MUTED,
                                     font=("Segoe UI", 10),
                                     pady=24)
         self._empty_lbl.pack()
 
-        # ── Activity Log ──────────────────────────────────────────────────────
-        log_hdr = ctk.CTkFrame(parent, fg_color="transparent")
-        log_hdr.pack(fill="x", pady=(0, 6))
+        # ── Activity Log header ───────────────────────────────────────────────
+        log_hdr = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0, height=34)
+        log_hdr.pack(fill="x", pady=(8, 4))
+        log_hdr.pack_propagate(False)
 
         ctk.CTkLabel(log_hdr, text="Activity Log",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
-                     text_color=TEXT
-                     ).pack(side="left")
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color="white"
+                     ).pack(side="left", pady=8)
 
-        ctk.CTkButton(log_hdr, text="🗑", width=28, height=24,
-                      font=ctk.CTkFont("Segoe UI", 11),
-                      fg_color="transparent", hover_color=BG_SURFACE,
-                      text_color=MUTED, corner_radius=6,
+        ctk.CTkButton(log_hdr, text="Clear", width=50, height=22,
+                      font=ctk.CTkFont("Segoe UI", 10),
+                      fg_color="transparent", hover_color="#7B4FAA",
+                      text_color="white", corner_radius=6,
                       command=self._clear_log
-                      ).pack(side="right")
+                      ).pack(side="right", pady=6)
 
-        log_card = ctk.CTkFrame(parent, fg_color=BG_LOG, corner_radius=14)
-        log_card.pack(fill="both", expand=True)
+        # White frosted glass card for log
+        log_wrap = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12,
+                                border_color=BORDER, border_width=1)
+        log_wrap.pack(fill="both", expand=True, pady=(0, 0))
+        log_card = log_wrap
 
         self.log = tk.Text(
             log_card,
             font=("Consolas", 10),
-            bg=BG_LOG, fg="#94a3b8",
+            bg=BG_CARD, fg=TEXT,
             relief="flat", bd=0,
             insertbackground=TEXT,
             state="disabled", wrap="word",
             highlightthickness=0,
-            selectbackground=BG_SURFACE,
+            selectbackground=BORDER,
             selectforeground=TEXT,
             padx=14, pady=10)
         self.log.pack(fill="both", expand=True, padx=2, pady=2)
 
         vsb = tk.Scrollbar(log_card, command=self.log.yview,
-                            bg=BG_LOG, troughcolor=BG_LOG,
-                            bd=0, highlightthickness=0, width=6)
-        vsb.pack(side="right", fill="y", padx=(0, 2), pady=4)
+                            bg=BG_CARD, troughcolor=BG_CARD,
+                            bd=0, highlightthickness=0, width=5)
+        vsb.pack(side="right", fill="y", padx=(0, 3), pady=6)
         self.log.configure(yscrollcommand=vsb.set)
 
-        self.log.tag_config("ok",     foreground="#22c55e")
-        self.log.tag_config("err",    foreground="#ef4444")
-        self.log.tag_config("info",   foreground="#60a5fa")
-        self.log.tag_config("warn",   foreground="#fbbf24")
+        self.log.tag_config("ok",     foreground=GREEN)
+        self.log.tag_config("err",    foreground=RED)
+        self.log.tag_config("info",   foreground=ACCENT)
+        self.log.tag_config("warn",   foreground=WARN)
         self.log.tag_config("header", foreground=ACCENT,
                              font=("Consolas", 10, "bold"))
-        self.log.tag_config("data",   foreground="#86efac")
-        self.log.tag_config("prompt", foreground="#475569")
+        self.log.tag_config("data",   foreground=GREEN)
+        self.log.tag_config("prompt", foreground=SUBTLE)
 
     # ─────────────────────────────────────────────────────────────────────────
     # FILE ROWS
@@ -788,7 +928,7 @@ class App(ctk.CTk):
 
         if not files:
             tk.Label(self._rows_frame, text="No files found",
-                     bg=BG_SURFACE, fg=MUTED,
+                     bg=BG_CARD, fg=MUTED,
                      font=("Segoe UI", 10), pady=24
                      ).pack()
             self._statusbar_set("No files found")
@@ -830,9 +970,9 @@ class App(ctk.CTk):
                                  text=icon_txt,
                                  bg=BG_SURFACE, fg=icon_color,
                                  font=("Segoe UI", 14),
-                                 width=3, pady=10,
+                                 width=3, pady=8,
                                  relief="flat")
-            icon_lbl.pack(side="left", padx=(8, 8), pady=6)
+            icon_lbl.pack(side="left", padx=(8, 8), pady=4)
 
             tk.Label(inner, text=name,
                      bg=row_bg, fg=TEXT,
@@ -841,13 +981,13 @@ class App(ctk.CTk):
                      ).pack(side="left", fill="x", expand=True)
 
             tk.Label(inner, text=sz_str,
-                     bg=row_bg, fg=SUBTLE,
+                     bg=row_bg, fg=MUTED,
                      font=("Segoe UI", 10),
                      width=10, anchor="center"
                      ).pack(side="left", padx=4)
 
             tk.Label(inner, text=dur_str,
-                     bg=row_bg, fg=SUBTLE,
+                     bg=row_bg, fg=MUTED,
                      font=("Segoe UI", 10),
                      width=7, anchor="center"
                      ).pack(side="left", padx=4)
@@ -858,7 +998,7 @@ class App(ctk.CTk):
             fname_cap = name
 
             dl_btn = tk.Label(btn_frame, text="↓",
-                               bg=BG_SURFACE, fg=SUBTLE,
+                               bg=BG_SURFACE, fg=ACCENT,
                                font=("Segoe UI", 12),
                                width=3, pady=4,
                                relief="flat", cursor="hand2")
@@ -867,21 +1007,21 @@ class App(ctk.CTk):
                 target=self._download_file,
                 args=(fn, "client" if self._detected_node == 2 else "server"),
                 daemon=True).start())
-            dl_btn.bind("<Enter>", lambda e, b=dl_btn: b.configure(bg=ACCENT))
-            dl_btn.bind("<Leave>", lambda e, b=dl_btn: b.configure(bg=BG_SURFACE))
+            dl_btn.bind("<Enter>", lambda e, b=dl_btn: b.configure(fg=ACCENT_GLOW))
+            dl_btn.bind("<Leave>", lambda e, b=dl_btn: b.configure(fg=ACCENT))
 
-            rm_btn = tk.Label(btn_frame, text="🗑",
-                               bg=BG_SURFACE, fg=SUBTLE,
+            rm_btn = tk.Label(btn_frame, text="✕",
+                               bg=BG_SURFACE, fg=MUTED,
                                font=("Segoe UI", 10),
                                width=3, pady=4,
                                relief="flat", cursor="hand2")
             rm_btn.pack(side="left", padx=2)
             rm_btn.bind("<Button-1>", lambda e, fn=fname_cap: threading.Thread(
                 target=self._delete_file, args=(fn,), daemon=True).start())
-            rm_btn.bind("<Enter>", lambda e, b=rm_btn: b.configure(bg=RED))
-            rm_btn.bind("<Leave>", lambda e, b=rm_btn: b.configure(bg=BG_SURFACE))
+            rm_btn.bind("<Enter>", lambda e, b=rm_btn: b.configure(fg=RED))
+            rm_btn.bind("<Leave>", lambda e, b=rm_btn: b.configure(fg=MUTED))
 
-            def on_enter(e, w=row, c=row_bg): w.configure(bg=c)
+            def on_enter(e, w=row, c=row_bg): w.configure(bg=BORDER)
             def on_leave(e, w=row, c=row_bg): w.configure(bg=c)
             row.bind("<Enter>", on_enter)
             row.bind("<Leave>", on_leave)
@@ -977,18 +1117,19 @@ class App(ctk.CTk):
         except: pass
 
     def _show_toast(self, msg, error=False):
-        color = RED if error else "#1e4d2b"
-        border_color = RED if error else GREEN
-        toast = ctk.CTkFrame(self, fg_color=color,
-                              corner_radius=10,
+        # White frosted glass toast floating over gradient
+        border_color = RED   if error else GREEN
+        text_color   = RED   if error else GREEN
+        toast = ctk.CTkFrame(self, fg_color="#FFFFFF",
+                              corner_radius=22,
                               border_color=border_color,
                               border_width=1)
-        toast.place(relx=0.5, y=70, anchor="n")
+        toast.place(relx=0.5, y=68, anchor="n")
         ctk.CTkLabel(toast, text=msg,
-                     font=ctk.CTkFont("Segoe UI", 11),
-                     text_color=TEXT, padx=18, pady=10
+                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                     text_color=text_color, padx=22, pady=10
                      ).pack()
-        self.after(3500, toast.destroy)
+        self.after(3000, toast.destroy)
 
     # ─────────────────────────────────────────────────────────────────────────
     # STATUS REFRESH
@@ -1048,17 +1189,17 @@ class App(ctk.CTk):
         dev_label = "Phantom 1" if node == 1 else "Phantom 2"
         self._detected_node = node
         self._detect_lbl.configure(text=dev_label, text_color=GREEN)
-        self._status_dot.configure(text_color=GREEN)
-        self._ip_lbl.configure(text=f"Connected  •  {dev_label}")
+        self._status_dot.configure(text="●", text_color=GREEN)
+        self._ip_lbl.configure(text=f"Connected  ·  {dev_label}  ·  {ip}")
         self._conn_lbl.configure(text=f"{dev_label} Online", text_color=GREEN)
         threading.Thread(target=self._fetch_filelist, daemon=True).start()
 
     def _on_node_lost(self):
         self._detected_node = 0
-        self._detect_lbl.configure(text="Not Connected", text_color=SUBTLE)
-        self._status_dot.configure(text_color=WARN)
+        self._detect_lbl.configure(text="Not Connected", text_color=TEXT)
+        self._status_dot.configure(text="●", text_color=WARN)
         self._ip_lbl.configure(text="Connect to Phantom WiFi to begin")
-        self._conn_lbl.configure(text="No device detected", text_color=MUTED)
+        self._conn_lbl.configure(text="No device", text_color=MUTED)
 
     # ─────────────────────────────────────────────────────────────────────────
     # FILE LIST FETCH
@@ -1136,7 +1277,7 @@ class App(ctk.CTk):
             sz_str = f"{kb:.1f} KB" if kb >= 1 else f"{len(data)} B"
             self._log(f"✓  Sent: '{filename}'  ({sz_str}  {elapsed:.1f}s)", "ok")
             self.after(0, lambda: self._upload_result_lbl.configure(
-                text=f"✓  {filename}  ({sz_str})", text_color=TEAL))
+                text=f"✓  {filename}  ({sz_str})", text_color=GREEN))
             self._show_toast(f"✓  Uploaded: {filename}")
             threading.Thread(target=self._fetch_filelist, daemon=True).start()
 
@@ -1175,7 +1316,7 @@ class App(ctk.CTk):
 
         self._log(f"Downloading '{filename}'…", "header")
         self.after(0, lambda: self._dl_status_lbl.configure(
-            text=f"Downloading  {filename}…"))
+            text=f"Downloading  {filename}…", text_color=ACCENT))
         self.after(0, lambda: [self._dl_pb.pack(fill="x", padx=12, pady=(0, 4)),
                                self._dl_pb.start()])
 
@@ -1188,7 +1329,7 @@ class App(ctk.CTk):
         if not data:
             self._log(f"Download FAILED: '{filename}'", "err")
             self.after(0, lambda: self._dl_status_lbl.configure(
-                text="Download failed"))
+                text="Download failed", text_color=RED))
             self._show_toast(f"✗  Download failed: {filename}", error=True)
             return
 
@@ -1212,6 +1353,8 @@ class App(ctk.CTk):
         kb = len(data) / 1024
         size_str = f"{kb:.0f} KB" if kb >= 1 else f"{len(data)} B"
         self._log(f"✓  Saved: {save_name}  ({size_str}  {elapsed:.1f}s)", "ok")
+        self.after(0, lambda: self._dl_status_lbl.configure(
+            text=f"✓  Saved: {save_name}  ({size_str})", text_color=GREEN))
         self._show_toast(f"✓  Downloaded: {save_name}")
         try: subprocess.Popen(f'explorer /select,"{abs_path}"')
         except: pass
@@ -1235,39 +1378,39 @@ class App(ctk.CTk):
         threading.Thread(target=self._fetch_filelist, daemon=True).start()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # TAB 3 — PHANTOM DECRYPT
+    # PAGE: DECRYPT
     # ─────────────────────────────────────────────────────────────────────────
     def _build_decrypt_tab(self, parent):
-        # ── Title row ─────────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(parent, fg_color="transparent")
-        hdr.pack(fill="x", padx=8, pady=(10, 4))
+        # ── Transparent header on gradient ────────────────────────────────────
+        hdr = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0, height=46)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        ctk.CTkLabel(hdr, text="Decrypt",
+                     font=ctk.CTkFont("Segoe UI", 17, "bold"),
+                     text_color="white", anchor="w"
+                     ).pack(side="left", padx=4, pady=12)
 
         ctk.CTkLabel(hdr,
-                     text="🔓  PHANTOM Decrypt",
-                     font=ctk.CTkFont("Segoe UI", 14, "bold"),
-                     text_color=TEXT, anchor="w").pack(side="left")
+                     text="AES-256-GCM · HMAC-SHA256 · ChaCha20",
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color="#D4C8E8", anchor="e"
+                     ).pack(side="right", padx=4)
 
-        ctk.CTkLabel(hdr,
-                     text="AES-256-GCM · HMAC-SHA256 · ChaCha20-Poly1305",
-                     font=ctk.CTkFont("Segoe UI", 9),
-                     text_color=MUTED, anchor="e").pack(side="right")
-
-        ctk.CTkFrame(parent, fg_color=BORDER, height=1, corner_radius=0
-                     ).pack(fill="x", padx=8, pady=(0, 10))
-
-        # ── Body: left form + right log ───────────────────────────────────────
-        body = ctk.CTkFrame(parent, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=4, pady=0)
+        # ── Body: frosted glass cards on gradient ─────────────────────────────
+        body = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
+        body.pack(fill="both", expand=True)
 
         # ── Left: form card ───────────────────────────────────────────────────
-        form_card = ctk.CTkFrame(body, fg_color=BG_SURFACE, corner_radius=14, width=320)
+        form_card = ctk.CTkFrame(body, fg_color=BG_CARD, corner_radius=14,
+                                  border_color=BORDER, border_width=1, width=320)
         form_card.pack(side="left", fill="y", padx=(4, 8), pady=4)
         form_card.pack_propagate(False)
 
-        ctk.CTkLabel(form_card, text="Input",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=SUBTLE, anchor="w"
-                     ).pack(fill="x", padx=16, pady=(14, 8))
+        ctk.CTkLabel(form_card, text="Input Files",
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=MUTED, anchor="w"
+                     ).pack(fill="x", padx=16, pady=(14, 6))
 
         # Helper — label + entry + browse button
         def _field(lbl_text, var, pick_cmd):
@@ -1278,14 +1421,15 @@ class App(ctk.CTk):
             row = ctk.CTkFrame(form_card, fg_color="transparent")
             row.pack(fill="x", padx=12, pady=(2, 0))
             e = ctk.CTkEntry(row, textvariable=var,
-                             fg_color=BG_CARD, border_color=BORDER, border_width=1,
-                             text_color=TEXT, height=34, corner_radius=8,
+                             fg_color=BG_SURFACE, border_color=BORDER, border_width=1,
+                             text_color=TEXT, placeholder_text_color=MUTED,
+                             height=34, corner_radius=10,
                              font=ctk.CTkFont("Consolas", 9))
             e.pack(side="left", fill="x", expand=True, padx=(0, 6))
-            ctk.CTkButton(row, text="···", width=34, height=34,
-                          fg_color=BG_CARD, hover_color=BORDER,
+            ctk.CTkButton(row, text="…", width=34, height=34,
+                          fg_color=BG_SURFACE, hover_color=BORDER,
                           border_color=BORDER, border_width=1,
-                          text_color=SUBTLE, corner_radius=8,
+                          text_color=MUTED, corner_radius=10,
                           command=pick_cmd).pack(side="right")
 
         self._dec_bin = ctk.StringVar()
@@ -1309,37 +1453,37 @@ class App(ctk.CTk):
         # ── Decrypt button ────────────────────────────────────────────────────
         self._dec_btn = ctk.CTkButton(
             form_card,
-            text="🔓   Decrypt Now",
+            text="Decrypt Now",
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             fg_color=ACCENT, hover_color=ACCENT_GLOW,
             text_color="white",
-            height=44, corner_radius=10,
+            height=42, corner_radius=12,
             command=lambda: threading.Thread(
                 target=self._dec_start, daemon=True).start(),
             state="normal" if _CRYPTO_OK else "disabled")
         self._dec_btn.pack(fill="x", padx=12, pady=(12, 4))
 
         self._dec_pb = ctk.CTkProgressBar(
-            form_card, mode="indeterminate", height=3,
-            progress_color=TEAL, fg_color=BORDER, corner_radius=2)
+            form_card, mode="indeterminate", height=2,
+            progress_color=ACCENT, fg_color=BORDER, corner_radius=1)
         self._dec_pb.pack(fill="x", padx=12, pady=(0, 4))
         self._dec_pb.pack_forget()
 
         self._dec_status_lbl = ctk.CTkLabel(
             form_card, text="Ready" if _CRYPTO_OK else "⚠  pip install cryptography",
             font=ctk.CTkFont("Segoe UI", 9),
-            text_color=TEAL if _CRYPTO_OK else WARN,
+            text_color=GREEN if _CRYPTO_OK else WARN,
             anchor="w", wraplength=280)
         self._dec_status_lbl.pack(fill="x", padx=16, pady=(0, 6))
 
         # ── Nút Open folder ───────────────────────────────────────────────────
         ctk.CTkButton(
             form_card,
-            text="🗁   Open Output Folder",
+            text="↗   Open Output Folder",
             font=ctk.CTkFont("Segoe UI", 10),
-            fg_color=BG_CARD, hover_color=BORDER,
+            fg_color=BG_SURFACE, hover_color=BORDER,
             border_color=BORDER, border_width=1,
-            text_color=SUBTLE, height=36, corner_radius=8,
+            text_color=MUTED, height=36, corner_radius=10,
             command=self._dec_open_output
         ).pack(fill="x", padx=12, pady=(4, 12))
 
@@ -1351,38 +1495,39 @@ class App(ctk.CTk):
                          ).pack(fill="x", padx=16, pady=(0, 10))
 
         # ── Right: log panel ──────────────────────────────────────────────────
-        log_card = ctk.CTkFrame(body, fg_color=BG_SURFACE, corner_radius=14)
+        log_card = ctk.CTkFrame(body, fg_color=BG_CARD, corner_radius=14,
+                                border_color=BORDER, border_width=1)
         log_card.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=4)
 
         ctk.CTkLabel(log_card, text="Log",
-                     font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                     text_color=SUBTLE, anchor="w"
+                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                     text_color=TEXT, anchor="w"
                      ).pack(fill="x", padx=16, pady=(14, 4))
 
         # Dùng tk.Text thay vì CTkTextbox để hỗ trợ color tags
-        log_outer = tk.Frame(log_card, bg=BG_LOG)
+        log_outer = tk.Frame(log_card, bg=BG_SURFACE)
         log_outer.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self._dec_log = tk.Text(
-            log_outer, bg=BG_LOG, fg=TEXT,
+            log_outer, bg=BG_SURFACE, fg=TEXT,
             font=("Consolas", 9),
             relief="flat", bd=0,
             insertbackground=TEXT,
             state="disabled", wrap="word")
         vsb = tk.Scrollbar(log_outer, orient="vertical",
                            command=self._dec_log.yview,
-                           bg=BG_SURFACE, troughcolor=BG_LOG, bd=0,
-                           highlightthickness=0, width=6)
+                           bg=BG_SURFACE, troughcolor=BG_SURFACE, bd=0,
+                           highlightthickness=0, width=5)
         self._dec_log.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y", pady=4)
         self._dec_log.pack(side="left", fill="both", expand=True)
 
-        # Color tags — theo palette audio_gui
+        # Color tags — iOS light palette
         self._dec_log.tag_config("ok",   foreground=GREEN)
         self._dec_log.tag_config("err",  foreground=RED)
         self._dec_log.tag_config("info", foreground=WARN)
         self._dec_log.tag_config("dim",  foreground=MUTED)
-        self._dec_log.tag_config("head", foreground=ACCENT_ICON)
+        self._dec_log.tag_config("head", foreground=ACCENT)
 
     # ── Decrypt helpers ───────────────────────────────────────────────────────
     def _dec_pick_bin(self):
@@ -1446,9 +1591,9 @@ class App(ctk.CTk):
             # Tạo unique tag cho từng link
             link_tag = f"link_{id(out_path)}_{self._dec_log.index('end')}"
             self._dec_log.tag_config(link_tag,
-                                      foreground=TEAL,
-                                      underline=True,
-                                      font=("Consolas", 9))
+                                          foreground=ACCENT,
+                                          underline=True,
+                                          font=("Consolas", 9))
             self._dec_log.tag_bind(link_tag, "<Button-1>",
                 lambda e, p=out_path: subprocess.Popen(
                     f'explorer /select,"{p}"'))
@@ -1489,7 +1634,7 @@ class App(ctk.CTk):
         self.after(0, lambda: [self._dec_pb.pack(fill="x", padx=12, pady=(0, 4)),
                                 self._dec_pb.start()])
         self.after(0, lambda: self._dec_status_lbl.configure(
-            text="Decrypting…", text_color=TEAL))
+            text="Decrypting…", text_color=ACCENT))
 
         self._dec_log_msg(f"File .bin : {bin_p}")
         self._dec_log_msg(f"Key file  : {key_p}")
@@ -1529,48 +1674,49 @@ class App(ctk.CTk):
     # TAB CALLBACK
     # ─────────────────────────────────────────────────────────────────────────
     def _on_tab_change(self):
-        name = self._tabs.get()
-        if "Local Storage" in name:
-            threading.Thread(target=self._refresh_local_tab, daemon=True).start()
+        # Legacy stub — navigation now handled by _show_page()
+        pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAB 2 — LOCAL STORAGE
     # ─────────────────────────────────────────────────────────────────────────
     def _build_local_tab(self, parent):
-        # ── Header ──────────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(parent, fg_color="transparent")
-        hdr.pack(fill="x", pady=(6, 8), padx=4)
+        # ── Transparent header on gradient ────────────────────────────────────
+        hdr = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0, height=46)
+        hdr.pack(fill="x", pady=(0, 0))
+        hdr.pack_propagate(False)
 
-        ctk.CTkLabel(hdr, text="Files in  folder_test/",
-                     font=ctk.CTkFont("Segoe UI", 13, "bold"),
-                     text_color=TEXT, anchor="w"
-                     ).pack(side="left")
+        ctk.CTkLabel(hdr, text="Local Files",
+                     font=ctk.CTkFont("Segoe UI", 17, "bold"),
+                     text_color="white", anchor="w"
+                     ).pack(side="left", padx=4, pady=12)
 
         for icon, tip, cmd in [
-            ("↻", "Refresh",        lambda: threading.Thread(target=self._refresh_local_tab, daemon=True).start()),
-            ("🗁", "Open Folder",   self._open_dongbo_folder),
-            ("🗑", "Delete Selected", self._delete_local_selected),
+            ("↻",  "Refresh",         lambda: threading.Thread(target=self._refresh_local_tab, daemon=True).start()),
+            ("↗",  "Open Folder",     self._open_dongbo_folder),
+            ("✕",  "Delete Selected", self._delete_local_selected),
         ]:
-            ctk.CTkButton(hdr, text=icon, width=32, height=28,
-                          font=ctk.CTkFont("Segoe UI", 12),
-                          fg_color="transparent", hover_color=BG_SURFACE,
-                          text_color=MUTED, corner_radius=6,
+            ctk.CTkButton(hdr, text=icon, width=28, height=26,
+                          font=ctk.CTkFont("Segoe UI", 11),
+                          fg_color="transparent", hover_color="#7B4FAA",
+                          text_color="white", corner_radius=6,
                           command=cmd
-                          ).pack(side="right", padx=2)
+                          ).pack(side="right", padx=2, pady=10)
 
         # ── Stat bar ────────────────────────────────────────────────────────
         self._local_stat_lbl = ctk.CTkLabel(
             parent, text="",
             font=ctk.CTkFont("Segoe UI", 9),
-            text_color=MUTED, anchor="w")
-        self._local_stat_lbl.pack(fill="x", padx=8, pady=(0, 6))
+            text_color="#D4C8E8", anchor="w")
+        self._local_stat_lbl.pack(fill="x", padx=4, pady=(2, 4))
 
-        # ── Table ────────────────────────────────────────────────────────────
-        table_card = ctk.CTkFrame(parent, fg_color=BG_SURFACE, corner_radius=14)
-        table_card.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        # ── Table — white frosted glass ───────────────────────────────────────
+        table_card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=14,
+                                  border_color=BORDER, border_width=1)
+        table_card.pack(fill="both", expand=True, pady=(0, 0))
 
-        col_hdr = tk.Frame(table_card, bg=BG_CARD)
-        col_hdr.pack(fill="x", padx=2, pady=(2, 0))
+        col_hdr = tk.Frame(table_card, bg=BG_SURFACE)
+        col_hdr.pack(fill="x", padx=1, pady=(1, 0))
         for txt, w, anchor in [
             ("Filename",    0,   "w"),
             ("Size",        90,  "center"),
@@ -1578,30 +1724,30 @@ class App(ctk.CTk):
             ("",            80,  "center"),
         ]:
             tk.Label(col_hdr, text=txt,
-                     bg=BG_CARD, fg=MUTED,
+                     bg=BG_SURFACE, fg=MUTED,
                      font=("Segoe UI", 9),
-                     padx=10 if anchor == "w" else 0,
+                     padx=12 if anchor == "w" else 0,
                      anchor=anchor, width=0
                      ).pack(side="left",
                             fill="x", expand=(txt == "Filename"),
-                            ipadx=6, ipady=6)
+                            ipadx=6, ipady=5)
 
-        scroll_outer = tk.Frame(table_card, bg=BG_SURFACE)
-        scroll_outer.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        scroll_outer = tk.Frame(table_card, bg=BG_CARD)
+        scroll_outer.pack(fill="both", expand=True, padx=1, pady=(0, 1))
 
         vsb = tk.Scrollbar(scroll_outer, orient="vertical",
-                           bg=BG_SURFACE, troughcolor=BG_SURFACE,
-                           bd=0, highlightthickness=0, width=6)
+                           bg=BG_CARD, troughcolor=BG_CARD,
+                           bd=0, highlightthickness=0, width=5)
         vsb.pack(side="right", fill="y", padx=(0, 2), pady=4)
 
         self._local_canvas = tk.Canvas(
-            scroll_outer, bg=BG_SURFACE,
+            scroll_outer, bg=BG_CARD,
             highlightthickness=0, bd=0,
             yscrollcommand=vsb.set)
         self._local_canvas.pack(side="left", fill="both", expand=True)
         vsb.configure(command=self._local_canvas.yview)
 
-        self._local_rows = tk.Frame(self._local_canvas, bg=BG_SURFACE)
+        self._local_rows = tk.Frame(self._local_canvas, bg=BG_CARD)
         self._local_rows_id = self._local_canvas.create_window(
             (0, 0), window=self._local_rows, anchor="nw")
 
@@ -1616,7 +1762,7 @@ class App(ctk.CTk):
 
         self._local_empty_lbl = tk.Label(
             self._local_rows, text="No files in folder_test/",
-            bg=BG_SURFACE, fg=MUTED,
+            bg=BG_CARD, fg=MUTED,
             font=("Segoe UI", 10), pady=28)
         self._local_empty_lbl.pack()
 
@@ -1659,14 +1805,14 @@ class App(ctk.CTk):
         if not all_files:
             tk.Label(self._local_rows,
                      text="No files in folder_test/",
-                     bg=BG_SURFACE, fg=MUTED,
+                     bg=BG_CARD, fg=MUTED,
                      font=("Segoe UI", 10), pady=28).pack()
             self._local_stat_lbl.configure(text="No files")
             return
 
         total_kb = sum(p.stat().st_size for p in all_files) // 1024
         self._local_stat_lbl.configure(
-            text=f"{len(all_files)} file(s)  •  {total_kb} KB  •  {DONGBO_DIR}")
+            text=f"{len(all_files)} file(s)  ·  {total_kb} KB  ·  {DONGBO_DIR}")
 
         for i, p in enumerate(all_files):
             sz    = p.stat().st_size
@@ -1682,7 +1828,7 @@ class App(ctk.CTk):
             inner = tk.Frame(row, bg=row_bg)
             inner.pack(fill="x", padx=4, pady=2)
 
-            chk_lbl = tk.Label(inner, text="☐",
+            chk_lbl = tk.Label(inner, text="○",
                                 bg=row_bg, fg=MUTED,
                                 font=("Segoe UI", 13),
                                 width=2, cursor="hand2")
@@ -1690,9 +1836,9 @@ class App(ctk.CTk):
 
             tk.Label(inner, text=icon,
                      bg=BG_SURFACE, fg=icon_color,
-                     font=("Segoe UI", 14),
-                     width=3, pady=10
-                     ).pack(side="left", padx=(4, 8), pady=6)
+                     font=("Segoe UI", 13),
+                     width=3, pady=8
+                     ).pack(side="left", padx=(4, 8), pady=4)
 
             name_lbl = tk.Label(inner, text=p.name,
                                  bg=row_bg, fg=TEXT,
@@ -1701,13 +1847,13 @@ class App(ctk.CTk):
             name_lbl.pack(side="left", fill="x", expand=True)
 
             tk.Label(inner, text=sz_str,
-                     bg=row_bg, fg=SUBTLE,
+                     bg=row_bg, fg=MUTED,
                      font=("Segoe UI", 10),
                      width=9, anchor="center"
                      ).pack(side="left", padx=4)
 
             tk.Label(inner, text=mtime,
-                     bg=row_bg, fg=MUTED,
+                     bg=row_bg, fg=SUBTLE,
                      font=("Segoe UI", 9),
                      width=12, anchor="center"
                      ).pack(side="left", padx=4)
@@ -1717,8 +1863,8 @@ class App(ctk.CTk):
 
             path_cap = p
 
-            open_btn = tk.Label(btn_frame, text="⬡",
-                                 bg=BG_SURFACE, fg=SUBTLE,
+            open_btn = tk.Label(btn_frame, text="↗",
+                                 bg=row_bg, fg=ACCENT,
                                  font=("Segoe UI", 12),
                                  width=3, pady=4,
                                  relief="flat", cursor="hand2")
@@ -1726,11 +1872,11 @@ class App(ctk.CTk):
             open_btn.bind("<Button-1>",
                 lambda e, pp=path_cap: subprocess.Popen(
                     f'explorer /select,"{pp}"'))
-            open_btn.bind("<Enter>", lambda e, b=open_btn: b.configure(bg=TEAL))
-            open_btn.bind("<Leave>", lambda e, b=open_btn: b.configure(bg=BG_SURFACE))
+            open_btn.bind("<Enter>", lambda e, b=open_btn: b.configure(fg=ACCENT_GLOW))
+            open_btn.bind("<Leave>", lambda e, b=open_btn: b.configure(fg=ACCENT))
 
-            del_btn = tk.Label(btn_frame, text="🗑",
-                                bg=BG_SURFACE, fg=SUBTLE,
+            del_btn = tk.Label(btn_frame, text="✕",
+                                bg=row_bg, fg=MUTED,
                                 font=("Segoe UI", 10),
                                 width=3, pady=4,
                                 relief="flat", cursor="hand2")
@@ -1738,16 +1884,16 @@ class App(ctk.CTk):
             del_btn.bind("<Button-1>",
                 lambda e, pp=path_cap: threading.Thread(
                     target=self._delete_local_file, args=(pp,), daemon=True).start())
-            del_btn.bind("<Enter>", lambda e, b=del_btn: b.configure(bg=RED))
-            del_btn.bind("<Leave>", lambda e, b=del_btn: b.configure(bg=BG_SURFACE))
+            del_btn.bind("<Enter>", lambda e, b=del_btn: b.configure(fg=RED))
+            del_btn.bind("<Leave>", lambda e, b=del_btn: b.configure(fg=MUTED))
 
             def _toggle(e, pp=path_cap, cl=chk_lbl):
                 if pp.name in self._local_selected:
                     self._local_selected.discard(pp.name)
-                    cl.configure(text="☐", fg=MUTED)
+                    cl.configure(text="○", fg=MUTED)
                 else:
                     self._local_selected.add(pp.name)
-                    cl.configure(text="☑", fg=ACCENT)
+                    cl.configure(text="●", fg=ACCENT)
 
             chk_lbl.bind("<Button-1>", _toggle)
             name_lbl.bind("<Button-1>", _toggle)

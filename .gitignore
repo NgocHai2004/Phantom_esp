@@ -15,6 +15,10 @@ build/
 venv/
 env/
 
+# ── PyInstaller ──────────────────────────────────────────────
+*.spec
+*.pkg
+
 # ── Output files từ scripts ───────────────────────────────────
 downloaded_from_server.wav
 downloaded_from_client.wav
@@ -30,6 +34,20 @@ dongbo/*.wav
 # ── dongbo: chỉ commit script + hướng dẫn, không commit file tải về
 dongbo/downloaded/
 dongbo/__pycache__/
+
+# ── Phantom key files (bí mật, không commit) ─────────────────
+*.key
+
+# ── Phantom binary bundles (output, không commit) ────────────
+*.bin
+!folder_test/.gitkeep
+!decode/.gitkeep
+
+# ── folder_test / decode output (dữ liệu tải về) ─────────────
+folder_test/*.bin
+folder_test/output/
+decode/output/
+decode/*.bin
 
 # ── Credentials / môi trường ─────────────────────────────────
 .env
