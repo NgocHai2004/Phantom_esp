@@ -191,14 +191,6 @@ class App(ctk.CTk):
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        # Left — macOS traffic light dots
-        tl = ctk.CTkFrame(bar, fg_color="transparent")
-        tl.pack(side="left", padx=14)
-        for clr, cmd in [("#FF5F56", self.destroy), ("#FFBD2E", self.iconify), ("#27C93F", lambda: None)]:
-            dot = ctk.CTkFrame(tl, fg_color=clr, width=12, height=12, corner_radius=6)
-            dot.pack(side="left", padx=3, pady=17)
-            dot.bind("<Button-1>", lambda e, c=cmd: c())
-
         # Center — app title (teal accent color for decrypt)
         center = ctk.CTkFrame(bar, fg_color="transparent")
         center.place(relx=0.5, rely=0.5, anchor="center")
@@ -210,14 +202,12 @@ class App(ctk.CTk):
 
     # ── SIDEBAR ───────────────────────────────────────────────────────────────
     def _build_sidebar(self, parent):
-        # Plain frame — NO scroll, compact layout
+        import tkinter as _tk
         sc = ctk.CTkFrame(parent, fg_color=C_PANEL, corner_radius=0)
         sc.pack(fill="both", expand=True)
 
-        # ── FAVORITES section ─────────────────────────────────────────────────
+        # ── FAVORITES ─────────────────────────────────────────────────────────
         tg_sec(sc, "Favorites").pack(fill="x", padx=16, pady=(10, 3))
-
-        # Nav row with 3px left blue accent bar
         nav_outer = ctk.CTkFrame(sc, fg_color=C_WHITE, corner_radius=8, height=36)
         nav_outer.pack(fill="x", padx=8, pady=(0, 4))
         nav_outer.pack_propagate(False)
@@ -229,39 +219,106 @@ class App(ctk.CTk):
 
         hr(sc, pady=4)
 
-        # ── INPUT section ─────────────────────────────────────────────────────
-        tg_sec(sc, "Input").pack(fill="x", padx=16, pady=(2, 3))
+        # ── INPUT FILE (.bin) ─────────────────────────────────────────────────
+        tg_sec(sc, "Input File").pack(fill="x", padx=16, pady=(4, 2))
 
-        def _field(label_text, var, pick_fn):
-            ctk.CTkLabel(sc, text=label_text, font=_font(10),
-                         text_color=C_TEXT2, anchor="w").pack(fill="x", padx=14, pady=(0, 2))
-            r = ctk.CTkFrame(sc, fg_color="transparent")
-            r.pack(fill="x", padx=12, pady=(0, 5))
-            tg_entry(r, textvariable=var, height=34).pack(
-                side="left", fill="x", expand=True, padx=(0, 4))
-            tg_btn(r, "…", pick_fn, style="ghost",
-                   width=32, height=32, font=_font(13),
-                   corner_radius=20).pack(side="right")
+        _bz_browse = lambda e: self._dec_pick_bin()
+        self._bz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=8,
+                                border_color=C_TEXT3, border_width=1, height=36)
+        self._bz.pack(fill="x", padx=12, pady=(0, 2))
+        self._bz.pack_propagate(False)
+        bz_inner = ctk.CTkFrame(self._bz, fg_color="transparent")
+        bz_inner.place(relx=0.5, rely=0.5, anchor="center")
+        self._bz_icon  = ctk.CTkLabel(bz_inner, text="📦", font=_font(12))
+        self._bz_icon.pack(side="left", padx=(0, 4))
+        self._bz_title = ctk.CTkLabel(bz_inner, text="Click to select .bin file",
+                                      font=_font(10, "bold"), text_color=C_TEXT2)
+        self._bz_title.pack(side="left")
+        for w in (self._bz, bz_inner, self._bz_icon, self._bz_title):
+            w.bind("<Button-1>", _bz_browse)
 
-        _field("Input File (.bin)", self._dec_bin, self._dec_pick_bin)
-        _field("Key File (.key)",   self._dec_key, self._dec_pick_key)
-        _field("Output Folder",     self._dec_out, self._dec_pick_out)
+        # .bin display row
+        self._bin_list_frame = _tk.Frame(sc, bg=C_INPUT, height=24,
+                                         highlightbackground=C_BORDER,
+                                         highlightthickness=1, bd=0)
+        self._bin_list_frame.pack(fill="x", padx=12, pady=(0, 2))
+        self._bin_list_frame.pack_propagate(False)
+        self._bin_placeholder = _tk.Label(
+            self._bin_list_frame, text="No file selected",
+            bg=C_INPUT, fg=C_TEXT3, font=("Segoe UI", 9), anchor="w")
+        self._bin_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+        self._bin_display_lbl = None
 
-        hr(sc, pady=4)
+        tg_btn(sc, "Browse .bin", self._dec_pick_bin, style="outline",
+               height=26, font=_font(10), corner_radius=20
+               ).pack(fill="x", padx=12, pady=(0, 2))
 
-        # ── ACTIONS section ───────────────────────────────────────────────────
-        tg_sec(sc, "Actions").pack(fill="x", padx=16, pady=(2, 4))
+        hr(sc, pady=2)
+
+        # ── KEY FILE ──────────────────────────────────────────────────────────
+        tg_sec(sc, "Key File").pack(fill="x", padx=16, pady=(4, 2))
+
+        _kz_browse = lambda e: self._dec_pick_key()
+        self._kz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=8,
+                                border_color=C_TEXT3, border_width=1, height=36)
+        self._kz.pack(fill="x", padx=12, pady=(0, 2))
+        self._kz.pack_propagate(False)
+        kz_inner = ctk.CTkFrame(self._kz, fg_color="transparent")
+        kz_inner.place(relx=0.5, rely=0.5, anchor="center")
+        self._kz_icon  = ctk.CTkLabel(kz_inner, text="🔑", font=_font(12))
+        self._kz_icon.pack(side="left", padx=(0, 4))
+        self._kz_title = ctk.CTkLabel(kz_inner, text="Click to load key",
+                                      font=_font(10, "bold"), text_color=C_TEXT3)
+        self._kz_title.pack(side="left")
+        for w in (self._kz, kz_inner, self._kz_icon, self._kz_title):
+            w.bind("<Button-1>", _kz_browse)
+
+        # key display row
+        self._key_list_frame = _tk.Frame(sc, bg=C_INPUT, height=24,
+                                         highlightbackground=C_BORDER,
+                                         highlightthickness=1, bd=0)
+        self._key_list_frame.pack(fill="x", padx=12, pady=(0, 2))
+        self._key_list_frame.pack_propagate(False)
+        # show default key if pre-loaded
+        _def_name = os.path.basename(self._dec_key_path) if self._dec_key_path else ""
+        self._key_placeholder = _tk.Label(
+            self._key_list_frame,
+            text=f"\U0001f511 {_def_name}" if _def_name else "No key loaded",
+            bg=C_INPUT,
+            fg=C_BLUE if _def_name else C_TEXT3,
+            font=("Segoe UI", 9), anchor="w")
+        self._key_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+        self._key_display_widgets: list = []
+
+        key_btn_row = ctk.CTkFrame(sc, fg_color="transparent")
+        key_btn_row.pack(fill="x", padx=12, pady=(0, 2))
+        key_btn_row.grid_columnconfigure((0, 1), weight=1)
+        tg_btn(key_btn_row, "Load Key", self._dec_pick_key, style="outline",
+               height=26, font=_font(10), corner_radius=20
+               ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        tg_btn(key_btn_row, "↗ Output Folder", self._dec_pick_out, style="ghost",
+               height=26, font=_font(10), corner_radius=20
+               ).grid(row=0, column=1, sticky="ew")
+
+        hr(sc, pady=2)
+
+        # ── ACTIONS ───────────────────────────────────────────────────────────
+        tg_sec(sc, "Actions").pack(fill="x", padx=16, pady=(4, 4))
 
         self._dec_btn = tg_btn(
             sc, "▶  Run Decrypt",
             command=lambda: threading.Thread(target=self._dec_start, daemon=True).start(),
             style="primary", height=40, font=_font(13, "bold"), corner_radius=20,
             state="normal" if _CRYPTO_OK else "disabled")
-        self._dec_btn.pack(fill="x", padx=12, pady=(0, 5))
+        self._dec_btn.pack(fill="x", padx=12, pady=(0, 4))
+
+        tg_btn(sc, "↗ Open Output", self._dec_open_output,
+               style="outline", height=28, font=_font(10), corner_radius=20
+               ).pack(fill="x", padx=12, pady=(0, 4))
 
         # Progress row
         pr = ctk.CTkFrame(sc, fg_color="transparent")
-        pr.pack(fill="x", padx=12, pady=(0, 2))
+        pr.pack(fill="x", padx=12, pady=(2, 1))
         ctk.CTkLabel(pr, text="OVERALL", font=_font(10),
                      text_color=C_TEXT3, anchor="w").pack(side="left")
         self._dec_pct = ctk.CTkLabel(pr, text="0 %",
@@ -272,25 +329,19 @@ class App(ctk.CTk):
                                            corner_radius=2,
                                            progress_color=C_BLUE, fg_color=C_BORDER)
         self._dec_bar.set(0)
-        self._dec_bar.pack(fill="x", padx=12, pady=(0, 4))
+        self._dec_bar.pack(fill="x", padx=12, pady=(0, 3))
 
         self._dec_status = ctk.CTkLabel(
             sc,
             text="Ready" if _CRYPTO_OK else "⚠  pip install cryptography",
             font=_font(10), anchor="w",
             text_color=C_GREEN if _CRYPTO_OK else C_ORANGE)
-        self._dec_status.pack(fill="x", padx=14, pady=(0, 5))
-
-        hr(sc, pady=4)
-
-        tg_btn(sc, "↗  Open Output Folder", self._dec_open_output,
-               style="outline", height=30, font=_font(11), corner_radius=20
-               ).pack(fill="x", padx=12, pady=(0, 10))
+        self._dec_status.pack(fill="x", padx=14, pady=(0, 3))
 
         if not _CRYPTO_OK:
             err = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=8,
                                border_color=C_RED, border_width=1)
-            err.pack(fill="x", padx=12, pady=(0, 8))
+            err.pack(fill="x", padx=12, pady=(0, 6))
             ctk.CTkLabel(err, text="⚠  pip install cryptography",
                          font=_font(11), text_color=C_RED, anchor="w"
                          ).pack(padx=12, pady=6)
@@ -313,11 +364,11 @@ class App(ctk.CTk):
         inner = ctk.CTkFrame(parent, fg_color=C_BG, corner_radius=0)
         inner.pack(fill="both", expand=True, padx=20, pady=16)
 
-        # ── 3 Layer Cards (decrypt order: ChaCha20 → HMAC → AES) ─────────────
+        # ── 3 Layer Cards ─────────────────────────────────────────────────────
         _LAYERS = [
-            ("L1", "CHA",  "ChaCha20-Poly1305", "Symmetric stream decrypt", C_TEAL,   "#EBF9FF"),
-            ("L2", "HMAC", "HMAC-SHA256",        "Integrity verification",   C_ORANGE, "#FFF6E5"),
-            ("L3", "AES",  "AES-256-GCM",        "Final block decrypt",      C_BLUE,   "#EBF1FF"),
+            ("L1", "DEC",  "Decryption Layer 1", "First pass",   C_TEAL,   "#EBF9FF"),
+            ("L2", "INT",  "Decryption Layer 2", "Second pass",  C_ORANGE, "#FFF6E5"),
+            ("L3", "FIN",  "Decryption Layer 3", "Third pass",   C_BLUE,   "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
         lf.pack(fill="x", pady=(0, 14))
@@ -432,6 +483,37 @@ class App(ctk.CTk):
             self._dec_log.see("end")
         self.after(0, _append)
 
+    def _log_banner(self, filename: str, layers: int = 3, total: int = 3, mode: str = "decrypted"):
+        """Append a green ✔ Task completed banner to the terminal log."""
+        action = "Finish encrypted" if mode == "encrypted" else "Finish decrypted"
+        lines = [
+            "┌─────────────────────────────────────┐",
+            f"│  ✔  Task completed                  │",
+            f"│  \"{filename}\"",
+            f"│  {action:<37}│",
+            f"│  Status : {layers}/{total} layers               │",
+            "└─────────────────────────────────────┘",
+        ]
+        def _do():
+            self._dec_log.configure(state="normal")
+            try:
+                self._dec_log._textbox.tag_configure("banner_ok",
+                    foreground="#34C759",
+                    font=("Consolas", 11, "bold"))
+            except Exception:
+                pass
+            self._dec_log._textbox.insert("end", "\n")
+            for line in lines:
+                try:
+                    self._dec_log._textbox.insert("end", f"  {line}\n", "banner_ok")
+                except Exception:
+                    self._dec_log._textbox.insert("end", f"  {line}\n")
+            self._dec_log._textbox.insert("end", "\n")
+            self._dec_log.configure(state="disabled")
+            self._dec_log.see("end")
+        try: self.after(0, _do)
+        except: pass
+
     def _dec_clear_log(self):
         self._dec_log.configure(state="normal")
         self._dec_log.delete("1.0", "end")
@@ -460,17 +542,65 @@ class App(ctk.CTk):
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
+    def _refresh_bin_display(self, name: str = ""):
+        """Update the .bin file display row."""
+        import tkinter as _tk
+        # clear old widgets except placeholder
+        for w in self._bin_list_frame.winfo_children():
+            if w is not self._bin_placeholder:
+                w.destroy()
+        if name:
+            self._bin_placeholder.pack_forget()
+            lbl = _tk.Label(self._bin_list_frame,
+                            text=f"  \U0001f4e6 {name}",
+                            bg=C_INPUT, fg=C_TEXT,
+                            font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left", padx=4, fill="x", expand=True)
+            # update drop zone — stay green
+            self._bz_icon.configure(text="✓")
+            self._bz_title.configure(text=name, text_color=C_GREEN)
+            self._bz.configure(border_color=C_GREEN)
+        else:
+            self._bin_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+            self._bz_icon.configure(text="📦")
+            self._bz_title.configure(text="Click to select .bin file", text_color=C_TEXT2)
+            self._bz.configure(border_color=C_TEXT3)
+
+    def _refresh_key_display(self, name: str = ""):
+        """Update the key file display row."""
+        import tkinter as _tk
+        for w in self._key_list_frame.winfo_children():
+            if w is not self._key_placeholder:
+                w.destroy()
+        if name:
+            self._key_placeholder.pack_forget()
+            lbl = _tk.Label(self._key_list_frame,
+                            text=f"  \U0001f511 {name}",
+                            bg=C_INPUT, fg=C_GREEN,
+                            font=("Segoe UI", 9), anchor="w")
+            lbl.pack(side="left", padx=4, fill="x", expand=True)
+            # update drop zone — stay green
+            self._kz_icon.configure(text="✓")
+            self._kz_title.configure(text=name, text_color=C_GREEN)
+            self._kz.configure(border_color=C_GREEN)
+        else:
+            self._key_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+            self._kz_icon.configure(text="🔑")
+            self._kz_title.configure(text="Click to load key", text_color=C_TEXT3)
+            self._kz.configure(border_color=C_TEXT3)
+
     def _dec_pick_bin(self):
         p = filedialog.askopenfilename(
             title="Select PHANTOM .bin",
             filetypes=[("PHANTOM bin", "*.bin"), ("All files", "*.*")],
             initialdir=self._phantom_dir())
         if p:
-            self._dec_bin_full = p                      # real path — never shown
-            self._dec_bin.set(os.path.basename(p))      # display: filename only
+            self._dec_bin_full = p
+            self._dec_bin.set(os.path.basename(p))
             _out_full = str(Path(p).parent / "output")
-            self._dec_out_full = _out_full              # real path — never shown
-            self._dec_out.set("output")                 # display: folder name only
+            self._dec_out_full = _out_full
+            self._dec_out.set("output")
+            self._refresh_bin_display(os.path.basename(p))
 
     def _dec_pick_key(self):
         p = filedialog.askopenfilename(
@@ -478,8 +608,9 @@ class App(ctk.CTk):
             filetypes=[("Key file", "*.key"), ("All files", "*.*")],
             initialdir=self._phantom_dir())
         if p:
-            self._dec_key_path = p   # real path stored internally — never displayed
-            self._dec_key.set("")    # keep entry blank
+            self._dec_key_path = p
+            self._dec_key.set("")
+            self._refresh_key_display(os.path.basename(p))
 
     def _dec_pick_out(self):
         _init = self._dec_out_full if self._dec_out_full else self._phantom_dir()
@@ -566,9 +697,9 @@ class App(ctk.CTk):
             h_aes    = hashlib.sha256(k_aes   ).hexdigest()
 
             for idx, (hx, label) in enumerate([
-                (h_chacha, "[L1]  ChaCha20-Poly1305  —  stream decrypt"),
-                (h_hmac,   "[L2]  HMAC-SHA256        —  integrity verify"),
-                (h_aes,    "[L3]  AES-256-GCM        —  block decrypt"),
+                (h_chacha, "[L1]  Decryption Layer 1"),
+                (h_hmac,   "[L2]  Decryption Layer 2"),
+                (h_aes,    "[L3]  Decryption Layer 3"),
             ]):
                 self._dec_log_msg(f"\n{label}")
                 time.sleep(0.2)
@@ -613,6 +744,10 @@ class App(ctk.CTk):
                     self._dec_log_msg(f"  ▶  {orig}  ({sz_str})")
             self._dec_log_msg(f"\n  DONE   {ok} OK  ·  {err} ERROR(S)")
             self._dec_log_msg("══════════════════════════════════════")
+            # ── Green completion banner ───────────────────────────────────────
+            _ok_files = [r[0] for r in results if r[3]]
+            _bn = _ok_files[0] if _ok_files else os.path.basename(bin_p)
+            self._log_banner(_bn, layers=3, total=3, mode="decrypted")
 
             self.after(0, lambda: self._dec_status.configure(
                 text=f"Done — {ok}/{len(results)} decrypted",

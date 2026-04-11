@@ -255,14 +255,6 @@ class App(ctk.CTk):
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
 
-        # Left — macOS traffic light dots
-        tl = ctk.CTkFrame(bar, fg_color="transparent")
-        tl.pack(side="left", padx=14)
-        for clr, cmd in [("#FF5F56", self.destroy), ("#FFBD2E", self.iconify), ("#27C93F", lambda: None)]:
-            dot = ctk.CTkFrame(tl, fg_color=clr, width=12, height=12, corner_radius=6)
-            dot.pack(side="left", padx=3, pady=17)
-            dot.bind("<Button-1>", lambda e, c=cmd: c())
-
         # Center — app title
         center = ctk.CTkFrame(bar, fg_color="transparent")
         center.place(relx=0.5, rely=0.5, anchor="center")
@@ -288,16 +280,16 @@ class App(ctk.CTk):
 
     # ── SIDEBAR ───────────────────────────────────────────────────────────────
     def _build_sidebar(self, parent):
-        # Plain frame — NO scroll, fits content in fixed height
+        # Plain frame — NO scroll, top-aligned, no expand
         sc = ctk.CTkFrame(parent, fg_color=C_PANEL, corner_radius=0)
-        sc.pack(fill="both", expand=True)
+        sc.pack(fill="x", expand=False, anchor="n")
 
         # ── FAVORITES section ─────────────────────────────────────────────────
-        tg_sec(sc, "Favorites").pack(fill="x", padx=16, pady=(10, 3))
+        tg_sec(sc, "Favorites").pack(fill="x", padx=16, pady=(8, 2))
 
         # Nav row with 3px left blue accent bar
         nav_outer = ctk.CTkFrame(sc, fg_color=C_WHITE, corner_radius=8, height=36)
-        nav_outer.pack(fill="x", padx=8, pady=(0, 4))
+        nav_outer.pack(fill="x", padx=8, pady=(0, 3))
         nav_outer.pack_propagate(False)
         ctk.CTkFrame(nav_outer, fg_color=C_BLUE, width=3, height=36,
                      corner_radius=0).pack(side="left")
@@ -308,44 +300,47 @@ class App(ctk.CTk):
         hr(sc, pady=4)
 
         # ── FILES section ─────────────────────────────────────────────────────
-        tg_sec(sc, "Files").pack(fill="x", padx=16, pady=(10, 4))
+        tg_sec(sc, "Files").pack(fill="x", padx=16, pady=(4, 2))
 
-        # Drop zone — all child widgets bound so any click triggers _browse()
+        # Drop zone — compact single-row style
         _dz_browse = lambda e: self._browse()
-        self._dz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=10,
-                                border_color=C_TEXT3, border_width=2, height=76)
-        self._dz.pack(fill="x", padx=12, pady=(0, 3))
+        self._dz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=8,
+                                border_color=C_TEXT3, border_width=1, height=36)
+        self._dz.pack(fill="x", padx=12, pady=(0, 2))
         self._dz.pack_propagate(False)
         dz_inner = ctk.CTkFrame(self._dz, fg_color="transparent")
         dz_inner.place(relx=0.5, rely=0.5, anchor="center")
-        self._dz_icon  = ctk.CTkLabel(dz_inner, text="📄", font=_font(22))
-        self._dz_icon.pack()
+        self._dz_icon  = ctk.CTkLabel(dz_inner, text="📄", font=_font(12))
+        self._dz_icon.pack(side="left", padx=(0, 4))
         self._dz_title = ctk.CTkLabel(dz_inner, text="Drop files here",
-                                      font=_font(11, "bold"), text_color=C_TEXT2)
-        self._dz_title.pack()
+                                      font=_font(10, "bold"), text_color=C_TEXT2)
+        self._dz_title.pack(side="left")
         self._dz_sub   = ctk.CTkLabel(dz_inner, text="or click 'Add' to select files",
                                       font=_font(9), text_color=C_TEXT3)
-        self._dz_sub.pack()
+        # self._dz_sub hidden
         for w in (self._dz, dz_inner, self._dz_icon, self._dz_title, self._dz_sub):
             w.bind("<Button-1>", _dz_browse)
 
-        # File list (shown when files added)
-        self._file_list_frame = ctk.CTkScrollableFrame(
-            sc, fg_color=C_INPUT, height=60,
-            scrollbar_button_color=C_BORDER,
-            scrollbar_button_hover_color=C_TEXT3,
-            corner_radius=8,
-            border_color=C_BORDER, border_width=1)
-        self._file_list_frame.pack(fill="x", padx=12, pady=(0, 3))
+        # File list — tk.Frame for exact height control (CTkFrame ignores small heights)
+        import tkinter as _tk
+        self._file_list_frame = _tk.Frame(sc, bg=C_INPUT, height=24,
+                                          highlightbackground=C_BORDER,
+                                          highlightthickness=1, bd=0)
+        self._file_list_frame.pack(fill="x", padx=12, pady=(0, 2))
+        self._file_list_frame.pack_propagate(False)
         self._file_widgets: list = []
+        self._file_placeholder = _tk.Label(
+            self._file_list_frame, text="No files selected",
+            bg=C_INPUT, fg=C_TEXT3, font=("Segoe UI", 9), anchor="w")
+        self._file_placeholder.pack(side="left", padx=8, fill="x", expand=True)
 
         self._file_count_lbl = ctk.CTkLabel(
             sc, text="No files selected",
             font=_font(10), text_color=C_TEXT3, anchor="w")
-        self._file_count_lbl.pack(fill="x", padx=14, pady=(0, 4))
+        # hidden — filename already shown in _file_list_frame above
 
         btn_row = ctk.CTkFrame(sc, fg_color="transparent")
-        btn_row.pack(fill="x", padx=12, pady=(0, 4))
+        btn_row.pack(fill="x", padx=12, pady=(0, 2))
         btn_row.grid_columnconfigure((0, 1, 2), weight=1)
         tg_btn(btn_row, "Add", self._browse, style="outline",
                height=26, font=_font(10), corner_radius=20
@@ -357,26 +352,38 @@ class App(ctk.CTk):
                height=26, font=_font(10), corner_radius=20
                ).grid(row=0, column=2, sticky="ew")
 
-        hr(sc, pady=4)
+        hr(sc, pady=2)
 
         # ── KEY section ───────────────────────────────────────────────────────
-        tg_sec(sc, "Key").pack(fill="x", padx=16, pady=(2, 3))
+        tg_sec(sc, "Key").pack(fill="x", padx=16, pady=(4, 2))
 
-        # Key drop zone — same style as file drop zone
+        # Key drop zone — compact single-row style
         _kz_browse = lambda e: self._browse_key()
-        self._kz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=10,
-                                border_color=C_TEXT3, border_width=2, height=60)
-        self._kz.pack(fill="x", padx=12, pady=(0, 3))
+        self._kz = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=8,
+                                border_color=C_TEXT3, border_width=1, height=36)
+        self._kz.pack(fill="x", padx=12, pady=(0, 2))
         self._kz.pack_propagate(False)
         kz_inner = ctk.CTkFrame(self._kz, fg_color="transparent")
         kz_inner.place(relx=0.5, rely=0.5, anchor="center")
-        self._kz_icon  = ctk.CTkLabel(kz_inner, text="🔑", font=_font(18))
-        self._kz_icon.pack()
-        self._kz_title = ctk.CTkLabel(kz_inner, text="No key loaded",
-                                      font=_font(11, "bold"), text_color=C_TEXT3)
-        self._kz_title.pack()
+        self._kz_icon  = ctk.CTkLabel(kz_inner, text="🔑", font=_font(12))
+        self._kz_icon.pack(side="left", padx=(0, 4))
+        self._kz_title = ctk.CTkLabel(kz_inner, text="Click to load key",
+                                      font=_font(10, "bold"), text_color=C_TEXT3)
+        self._kz_title.pack(side="left")
         for w in (self._kz, kz_inner, self._kz_icon, self._kz_title):
             w.bind("<Button-1>", _kz_browse)
+
+        # Key file display — tk.Frame for exact height control
+        self._key_list_frame = _tk.Frame(sc, bg=C_INPUT, height=24,
+                                         highlightbackground=C_BORDER,
+                                         highlightthickness=1, bd=0)
+        self._key_list_frame.pack(fill="x", padx=12, pady=(0, 2))
+        self._key_list_frame.pack_propagate(False)
+        self._key_file_widgets: list = []
+        self._key_placeholder = _tk.Label(
+            self._key_list_frame, text="No key loaded",
+            bg=C_INPUT, fg=C_TEXT3, font=("Segoe UI", 9), anchor="w")
+        self._key_placeholder.pack(side="left", padx=8, fill="x", expand=True)
 
         # Key action buttons
         key_btn_row = ctk.CTkFrame(sc, fg_color="transparent")
@@ -392,12 +399,12 @@ class App(ctk.CTk):
         self._key_status_lbl = ctk.CTkLabel(
             sc, text="",
             font=_font(10), text_color=C_TEXT3, anchor="w")
-        self._key_status_lbl.pack(fill="x", padx=14, pady=(0, 4))
+        # hidden — key name already shown in _key_list_frame above
 
         # keep StringVar for internal use (unused visually now)
         self._key_var = ctk.StringVar()
 
-        hr(sc, pady=4)
+        hr(sc, pady=2)
 
         # ── ACTIONS section ───────────────────────────────────────────────────
         tg_sec(sc, "Actions").pack(fill="x", padx=16, pady=(2, 4))
@@ -458,14 +465,10 @@ class App(ctk.CTk):
                                              anchor="w", wraplength=215)
         self._sync_status_lbl.pack(fill="x", padx=14, pady=(0, 2))
 
-        hr(sc, pady=8)
-
-        # Connection info
-        sec_hdr(sc, "Connection").pack(fill="x", padx=16, pady=(0, 6))
-        self._ip_lbl = ctk.CTkLabel(sc, text="Connect to Phantom WiFi",
-                                    font=_font(11), text_color=C_TEXT3, anchor="w",
-                                    wraplength=210, justify="left")
-        self._ip_lbl.pack(fill="x", padx=14, pady=(0, 16))
+        # _ip_lbl kept as hidden widget so _on_scan_result doesn't crash
+        self._ip_lbl = ctk.CTkLabel(sc, text="",
+                                    font=_font(11), text_color=C_TEXT3, anchor="w")
+        # not packed — hidden
 
     # ── CONTENT ───────────────────────────────────────────────────────────────
     def _build_content(self, parent):
@@ -506,9 +509,9 @@ class App(ctk.CTk):
 
         # ── 3 Layer Cards ─────────────────────────────────────────────────────
         _LAYERS = [
-            ("L1", "AES",  "AES-256-GCM",      "Authenticated block cipher",  C_TEAL,   "#EBF9FF"),
-            ("L2", "HMAC", "HMAC-SHA256",       "Integrity verification",      C_ORANGE, "#FFF6E5"),
-            ("L3", "CHA",  "ChaCha20-Poly1305", "Stream cipher wrap",          C_BLUE,   "#EBF1FF"),
+            ("L1", "ENC",  "Encryption Layer 1", "First pass",   C_TEAL,   "#EBF9FF"),
+            ("L2", "INT",  "Encryption Layer 2", "Second pass",  C_ORANGE, "#FFF6E5"),
+            ("L3", "STR",  "Encryption Layer 3", "Third pass",   C_BLUE,   "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
         lf.pack(fill="x", pady=(0, 14))
@@ -588,13 +591,13 @@ class App(ctk.CTk):
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
 
-    # ── PHANTOM PANEL (right) ─────────────────────────────────────────────────
+    # ── FILE INFO PANEL (right) — macOS Finder style ──────────────────────────
     def _build_phantom_panel(self, parent):
-        tg_sec(parent, "Phantom").pack(fill="x", padx=14, pady=(14, 6))
-        ctk.CTkLabel(parent, text="Synced files",
-                     font=_font(10), text_color=C_TEXT3, anchor="w"
-                     ).pack(fill="x", padx=14, pady=(0, 8))
+        import tkinter as _tk
+        tg_sec(parent, "File Info").pack(fill="x", padx=14, pady=(14, 6))
         hr(parent, pady=2)
+
+        # Scrollable container for file info rows
         self._phantom_list = ctk.CTkScrollableFrame(
             parent, fg_color="transparent",
             scrollbar_button_color=C_BORDER,
@@ -603,25 +606,53 @@ class App(ctk.CTk):
         self._phantom_list.pack(fill="both", expand=True, padx=0, pady=0)
         self._phantom_rows: list = []
 
+        # Placeholder shown when no files yet
+        self._fi_placeholder = ctk.CTkLabel(
+            self._phantom_list,
+            text="No files encrypted yet",
+            font=_font(11), text_color=C_TEXT3)
+        self._fi_placeholder.pack(pady=24)
+
     def _phantom_add_file(self, filename: str, size_kb: float):
-        """Add a row to the phantom panel for a just-synced file."""
-        row = ctk.CTkFrame(self._phantom_list, fg_color=C_CARD, corner_radius=8,
-                           border_color=C_BORDER, border_width=1)
-        row.pack(fill="x", padx=10, pady=4)
-        # icon + name
-        top = ctk.CTkFrame(row, fg_color="transparent")
-        top.pack(fill="x", padx=10, pady=(8, 2))
-        ctk.CTkLabel(top, text="📦", font=_font(13)).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(top, text=filename, font=_font(11, "bold"),
-                     text_color=C_BLUE, anchor="w").pack(side="left", fill="x", expand=True)
-        # size + check badge
-        bot = ctk.CTkFrame(row, fg_color="transparent")
-        bot.pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkLabel(bot, text=f"{size_kb:.1f} KB",
-                     font=_font(10), text_color=C_TEXT3, anchor="w").pack(side="left")
-        ctk.CTkLabel(bot, text="✓ synced", font=_font(10, "bold"),
-                     text_color=C_GREEN).pack(side="right")
-        self._phantom_rows.append(row)
+        """Add a macOS Finder-style file info card to the right panel."""
+        import tkinter as _tk
+        # Hide placeholder on first file
+        try: self._fi_placeholder.pack_forget()
+        except: pass
+
+        card = ctk.CTkFrame(self._phantom_list, fg_color=C_CARD, corner_radius=10,
+                            border_color=C_BORDER, border_width=1)
+        card.pack(fill="x", padx=10, pady=(6, 2))
+
+        # ── File icon + name header ────────────────────────────────────────────
+        hdr = ctk.CTkFrame(card, fg_color="transparent")
+        hdr.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(hdr, text="📦", font=_font(24)).pack(side="left", padx=(0, 8))
+        name_lbl = ctk.CTkLabel(hdr, text=filename,
+                                font=_font(11, "bold"), text_color=C_TEXT,
+                                anchor="w", wraplength=130, justify="left")
+        name_lbl.pack(side="left", fill="x", expand=True)
+
+        hr(card, padx=12, pady=4)
+
+        # ── Info rows ─────────────────────────────────────────────────────────
+        def _row(key, val, val_color=C_TEXT):
+            r = ctk.CTkFrame(card, fg_color="transparent")
+            r.pack(fill="x", padx=14, pady=2)
+            ctk.CTkLabel(r, text=key, font=_font(10), text_color=C_TEXT3,
+                         width=72, anchor="w").pack(side="left")
+            ctk.CTkLabel(r, text=val, font=_font(10, "bold"), text_color=val_color,
+                         anchor="w").pack(side="left", fill="x", expand=True)
+
+        _row("Kind:",     "PHANTOM Bundle")
+        _row("Size:",     f"{size_kb:.1f} KB", C_BLUE)
+        _row("Status:",   "✓ encrypted", C_GREEN)
+        _row("Layers:",   "3 / 3", C_TEAL)
+        _row("Created:",  time.strftime("%d/%m/%Y  %H:%M"))
+
+        # bottom padding
+        ctk.CTkFrame(card, fg_color="transparent", height=8).pack()
+        self._phantom_rows.append(card)
 
     # ── FILE LIST ─────────────────────────────────────────────────────────────
     def _refresh_file_list(self, uploaded: set = None):
@@ -629,17 +660,22 @@ class App(ctk.CTk):
         for w in self._file_widgets: w.destroy()
         self._file_widgets.clear()
         uploaded = uploaded or set()
-        for i, p in enumerate(self._selected_files):
-            row = ctk.CTkFrame(self._file_list_frame,
-                               fg_color=C_SURFACE if i % 2 == 0 else C_CARD,
-                               corner_radius=3)
-            row.pack(fill="x", pady=1)
-            name = os.path.basename(p)
-            color = C_BLUE if name in uploaded else C_TEXT
-            ctk.CTkLabel(row, text=f"  {name}",
-                         font=_font(11), text_color=color,
-                         anchor="w").pack(side="left", fill="x", expand=True, pady=3)
-            self._file_widgets.append(row)
+        if not self._selected_files:
+            self._file_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+            return
+        self._file_placeholder.pack_forget()
+        # Show first file name + count badge
+        import tkinter as _tk
+        first = os.path.basename(self._selected_files[0])
+        n = len(self._selected_files)
+        display = first if n == 1 else f"{first}  +{n-1}"
+        color = C_BLUE if first in (uploaded or set()) else C_TEXT
+        lbl = _tk.Label(self._file_list_frame,
+                        text=f"  \U0001f4c4 {display}",
+                        bg=C_INPUT, fg=color,
+                        font=("Segoe UI", 9), anchor="w")
+        lbl.pack(side="left", padx=4, fill="x", expand=True)
+        self._file_widgets.append(lbl)
 
     # ── LAYER ANIMATION ───────────────────────────────────────────────────────
     def _animate_layer(self, idx, hash_hex, duration_ms, on_done):
@@ -684,6 +720,37 @@ class App(ctk.CTk):
         except: pass
 
     def _log_msg(self, msg): self._log(msg)
+
+    def _log_banner(self, filename: str, layers: int = 3, total: int = 3):
+        """Append a green ✔ Task completed banner to the terminal log."""
+        lines = [
+            "┌─────────────────────────────────────┐",
+            f"│  ✔  Task completed                  │",
+            f"│  \"{filename}\"",
+            f"│  Finish encrypted                   │",
+            f"│  Status : {layers}/{total} layers               │",
+            "└─────────────────────────────────────┘",
+        ]
+        def _do():
+            self.log.configure(state="normal")
+            # configure green tag once
+            try:
+                self.log._textbox.tag_configure("banner_ok",
+                    foreground="#34C759",
+                    font=("Consolas", 11, "bold"))
+            except Exception:
+                pass
+            self.log._textbox.insert("end", "\n")
+            for line in lines:
+                try:
+                    self.log._textbox.insert("end", f"  {line}\n", "banner_ok")
+                except Exception:
+                    self.log._textbox.insert("end", f"  {line}\n")
+            self.log._textbox.insert("end", "\n")
+            self.log.configure(state="disabled")
+            self.log.see("end")
+        try: self.after(0, _do)
+        except: pass
 
     def _clear_log(self):
         self.log.configure(state="normal")
@@ -744,34 +811,41 @@ class App(ctk.CTk):
         self._save_btn.configure(state="disabled")
         self._send_btn.configure(state="disabled")
 
+    # ── KEY LIST ──────────────────────────────────────────────────────────────
+    def _refresh_key_list(self, name: str = ""):
+        """Show the loaded key filename in the key list frame."""
+        for w in self._key_file_widgets:
+            w.destroy()
+        self._key_file_widgets.clear()
+        if not name:
+            self._key_placeholder.pack(side="left", padx=8, fill="x", expand=True)
+            return
+        self._key_placeholder.pack_forget()
+        import tkinter as _tk
+        icon = _tk.Label(self._key_list_frame, text="\U0001f511",
+                         bg=C_INPUT, fg=C_BLUE, font=("Segoe UI", 9), width=2)
+        icon.pack(side="left", padx=(6, 2))
+        lbl = _tk.Label(self._key_list_frame, text=name,
+                        bg=C_INPUT, fg=C_TEXT, font=("Segoe UI", 9), anchor="w")
+        lbl.pack(side="left", fill="x", expand=True)
+        self._key_file_widgets.extend([icon, lbl])
+
     # ── KEY ZONE FLASH ────────────────────────────────────────────────────────
     def _flash_key_zone(self, name: str):
-        """Flash key zone green to confirm key loaded."""
+        """Set key zone border green permanently when key is loaded."""
         self._kz.configure(border_color=C_GREEN)
         self._kz_icon.configure(text="✓")
         self._kz_title.configure(text=name, text_color=C_GREEN)
-        def _restore():
-            self._kz.configure(border_color=C_BORDER_HI)
-            self._kz_icon.configure(text="🔑")
-            self._kz_title.configure(text=name, text_color=C_BLUE)
-        self.after(1800, _restore)
 
     # ── DROP ZONE FLASH ───────────────────────────────────────────────────────
     def _flash_dropzone(self, count: int):
-        """Flash drop zone border green then back to normal."""
+        """Set drop zone border green permanently when files are loaded."""
+        n = len(self._selected_files)
         self._dz.configure(border_color=C_GREEN)
         self._dz_icon.configure(text="✓")
-        self._dz_title.configure(text=f"{count} file(s) added", text_color=C_GREEN)
-        self._dz_sub.configure(text="")
-        def _restore():
-            self._dz.configure(border_color=C_TEXT3)
-            self._dz_icon.configure(text="📄")
-            n = len(self._selected_files)
-            self._dz_title.configure(
-                text=f"{n} file(s) ready" if n else "Drop files here",
-                text_color=C_TEXT2)
-            self._dz_sub.configure(text="or click 'Add' to select files")
-        self.after(1800, _restore)
+        self._dz_title.configure(
+            text=f"{n} file(s) ready" if n else "Drop files here",
+            text_color=C_GREEN)
 
     # ── KEY ───────────────────────────────────────────────────────────────────
     def _browse_key(self):
@@ -785,6 +859,7 @@ class App(ctk.CTk):
             last4 = pub_fp[-4:].upper()
             name = os.path.basename(path)
             self._key_var.set(name)
+            self._refresh_key_list(name)
             self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_GREEN)
             self._log(f"Key loaded: {name}  […{last4}]")
             self._reset_bundle()
@@ -805,6 +880,7 @@ class App(ctk.CTk):
             last4 = pub_fp[-4:].upper()
             name = os.path.basename(out)
             self._key_var.set(name)
+            self._refresh_key_list(name)
             self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_GREEN)
             self._log(f"Generated: {name}  […{last4}]")
             self._show_toast(f"✓  Key saved: {name}")
@@ -953,9 +1029,9 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._enc_btn.configure(state="normal")); return
 
             for idx, (hx, label) in enumerate([
-                (h_aes,    "[L1]  AES-256-GCM  —  block encrypt"),
-                (h_hmac,   "[L2]  HMAC-SHA256  —  integrity"),
-                (h_chacha, "[L3]  ChaCha20     —  stream encrypt"),
+                (h_aes,    "[L1]  Encryption Layer 1"),
+                (h_hmac,   "[L2]  Encryption Layer 2"),
+                (h_chacha, "[L3]  Encryption Layer 3"),
             ]):
                 self._log_msg(f"\n{label}")
                 time.sleep(0.2)
@@ -1004,6 +1080,9 @@ class App(ctk.CTk):
                 self._log_msg(f"  MD5  : {md5_str}")
                 # self._log_msg(f"  PATH : {auto_path}")
                 self._log_msg("══════════════════════════════════════")
+                # ── Green completion banner ───────────────────────────────────
+                _first_fname = os.path.basename(files[0]) if files else "file"
+                self._log_banner(_first_fname, layers=3, total=3)
                 self.after(0, lambda i=save_info: self._bundle_lbl.configure(text=i))
                 self.after(0, lambda: self._enc_status.configure(
                     text=f"Done — {len(files)} file(s) encrypted", text_color=C_GREEN))
