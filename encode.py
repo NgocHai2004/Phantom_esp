@@ -450,7 +450,7 @@ class App(ctk.CTk):
             sc,
             text="Ready" if _CRYPTO_OK else "⚠  pip install cryptography",
             font=_font(10), anchor="w",
-            text_color=C_GREEN if _CRYPTO_OK else C_ORANGE)
+            text_color=C_BLUE if _CRYPTO_OK else C_ORANGE)
         self._enc_status.pack(fill="x", padx=14, pady=(0, 3))
 
         # .bin filename shown in blue after encrypt
@@ -461,7 +461,7 @@ class App(ctk.CTk):
 
         # Sync status shown after send
         self._sync_status_lbl = ctk.CTkLabel(sc, text="",
-                                             font=_font(10, "bold"), text_color=C_GREEN,
+                                             font=_font(10, "bold"), text_color=C_BLUE,
                                              anchor="w", wraplength=215)
         self._sync_status_lbl.pack(fill="x", padx=14, pady=(0, 2))
 
@@ -509,9 +509,9 @@ class App(ctk.CTk):
 
         # ── 3 Layer Cards ─────────────────────────────────────────────────────
         _LAYERS = [
-            ("L1", "ENC",  "Encryption Layer 1", "First pass",   C_TEAL,   "#EBF9FF"),
-            ("L2", "INT",  "Encryption Layer 2", "Second pass",  C_ORANGE, "#FFF6E5"),
-            ("L3", "STR",  "Encryption Layer 3", "Third pass",   C_BLUE,   "#EBF1FF"),
+            ("L1", "ENC",  "Encryption Layer 1", "First pass",   C_BLUE, "#EBF1FF"),
+            ("L2", "INT",  "Encryption Layer 2", "Second pass",  C_BLUE, "#EBF1FF"),
+            ("L3", "STR",  "Encryption Layer 3", "Third pass",   C_BLUE, "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
         lf.pack(fill="x", pady=(0, 14))
@@ -531,10 +531,12 @@ class App(ctk.CTk):
             dot = ctk.CTkLabel(top, text="●", font=_font(11), text_color=C_TEXT3)
             dot.pack(side="right")
 
-            ctk.CTkLabel(card, text=algo, font=_font(15, "bold"),
-                         text_color=color).pack(anchor="w", padx=14, pady=(4, 2))
-            ctk.CTkLabel(card, text=desc, font=_font(11),
-                         text_color=C_TEXT2).pack(anchor="w", padx=14, pady=(0, 8))
+            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(15, "bold"),
+                                     text_color=C_TEXT)
+            title_lbl.pack(anchor="w", padx=14, pady=(4, 2))
+            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(11),
+                                    text_color=C_TEXT2)
+            desc_lbl.pack(anchor="w", padx=14, pady=(0, 8))
 
             hash_f = ctk.CTkFrame(card, fg_color=C_SURFACE, corner_radius=6)
             hash_f.pack(fill="x", padx=14, pady=(0, 8))
@@ -553,7 +555,7 @@ class App(ctk.CTk):
                                text_color=color, anchor="e")
             pct.pack(fill="x", padx=14, pady=(0, 12))
 
-            self._layer_cards.append((card, hash_lbl, bar, pct, dot, color))
+            self._layer_cards.append((card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl))
 
         # ── Overall progress ──────────────────────────────────────────────────
         op = ctk.CTkFrame(inner, fg_color="transparent")
@@ -646,7 +648,7 @@ class App(ctk.CTk):
 
         _row("Kind:",     "PHANTOM Bundle")
         _row("Size:",     f"{size_kb:.1f} KB", C_BLUE)
-        _row("Status:",   "✓ encrypted", C_GREEN)
+        _row("Status:",   "✓ encrypted", C_BLUE)
         _row("Layers:",   "3 / 3", C_TEAL)
         _row("Created:",  time.strftime("%d/%m/%Y  %H:%M"))
 
@@ -679,17 +681,33 @@ class App(ctk.CTk):
 
     # ── LAYER ANIMATION ───────────────────────────────────────────────────────
     def _animate_layer(self, idx, hash_hex, duration_ms, on_done):
-        card, hash_lbl, bar, pct, dot, color = self._layer_cards[idx]
+        card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl = self._layer_cards[idx]
         steps = 40; interval = max(20, duration_ms // steps)
         start = idx / 3.0
         dot.configure(text="◌", text_color=color)
-        hash_lbl.configure(text=f"HASH  {hash_hex[:12]}…", text_color=color)
+        hash_lbl.configure(text=f"HASH  {hash_hex[:12]}…", text_color="#1C1C1E")
+        title_lbl.configure(text_color="#1C1C1E")
+        desc_lbl.configure(text_color="#1C1C1E")
+        card.configure(border_color=C_BLUE, border_width=2)
+
+        blink_active = [True]
+        def _blink(on=True):
+            if not blink_active[0]:
+                return
+            card.configure(border_color=C_BLUE if on else C_BORDER,
+                            border_width=2 if on else 1)
+            self.after(400, lambda: _blink(not on))
+        self.after(400, lambda: _blink(False))
 
         def _tick(step=0):
             if step > steps:
+                blink_active[0] = False
                 bar.set(1.0); pct.configure(text="100 %")
                 dot.configure(text="●", text_color=color)
                 hash_lbl.configure(text=f"HASH  {hash_hex[:24]}…", text_color=color)
+                title_lbl.configure(text_color=C_TEXT)
+                desc_lbl.configure(text_color=C_TEXT2)
+                card.configure(border_color=C_BLUE, border_width=2)
                 self._set_ov((idx + 1) / 3.0); on_done(); return
             frac = step / steps
             bar.set(frac); pct.configure(text=f"{int(frac*100)} %")
@@ -703,10 +721,13 @@ class App(ctk.CTk):
         self._enc_bar2.set(v); self._enc_pct2.configure(text=txt)
 
     def _reset_layers(self):
-        for card, hash_lbl, bar, pct, dot, color in self._layer_cards:
+        for card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl in self._layer_cards:
             bar.set(0); pct.configure(text="0 %", text_color=color)
             dot.configure(text="●", text_color=C_TEXT3)
             hash_lbl.configure(text="HASH ——", text_color=C_TEXT3)
+            title_lbl.configure(text_color=C_TEXT)
+            desc_lbl.configure(text_color=C_TEXT2)
+            card.configure(border_color=C_BORDER, border_width=1)
         self._set_ov(0)
 
     # ── LOG ───────────────────────────────────────────────────────────────────
@@ -760,7 +781,7 @@ class App(ctk.CTk):
 
     # ── TOAST ─────────────────────────────────────────────────────────────────
     def _show_toast(self, msg, error=False):
-        c = C_RED if error else C_GREEN
+        c = C_RED if error else C_BLUE
         t = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=12,
                          border_color=c, border_width=1)
         t.place(relx=0.5, y=54, anchor="n")
@@ -788,15 +809,24 @@ class App(ctk.CTk):
                 self._reset_bundle()
                 self._flash_dropzone(added)
 
+    def _reset_dropzone(self):
+        """Reset drop zone to idle/initial state."""
+        self._dz.configure(border_color=C_TEXT3, border_width=1)
+        self._dz_icon.configure(text="📄")
+        self._dz_title.configure(text="Drop files here", text_color=C_TEXT2)
+
     def _remove_selected(self):
         if self._selected_files:
             r = self._selected_files.pop()
             self._refresh_file_list(); self._update_count()
             self._log(f"Removed: {os.path.basename(r)}"); self._reset_bundle()
+            if not self._selected_files:
+                self._reset_dropzone()
 
     def _clear_files(self):
         self._selected_files.clear()
         self._refresh_file_list(); self._update_count(); self._reset_bundle()
+        self._reset_dropzone()
 
     def _update_count(self):
         n = len(self._selected_files)
@@ -832,20 +862,20 @@ class App(ctk.CTk):
 
     # ── KEY ZONE FLASH ────────────────────────────────────────────────────────
     def _flash_key_zone(self, name: str):
-        """Set key zone border green permanently when key is loaded."""
-        self._kz.configure(border_color=C_GREEN)
+        """Set key zone border blue permanently when key is loaded."""
+        self._kz.configure(border_color=C_BLUE)
         self._kz_icon.configure(text="✓")
-        self._kz_title.configure(text=name, text_color=C_GREEN)
+        self._kz_title.configure(text=name, text_color=C_BLUE)
 
     # ── DROP ZONE FLASH ───────────────────────────────────────────────────────
     def _flash_dropzone(self, count: int):
-        """Set drop zone border green permanently when files are loaded."""
+        """Set drop zone border blue permanently when files are loaded."""
         n = len(self._selected_files)
-        self._dz.configure(border_color=C_GREEN)
+        self._dz.configure(border_color=C_BLUE)
         self._dz_icon.configure(text="✓")
         self._dz_title.configure(
             text=f"{n} file(s) ready" if n else "Drop files here",
-            text_color=C_GREEN)
+            text_color=C_BLUE)
 
     # ── KEY ───────────────────────────────────────────────────────────────────
     def _browse_key(self):
@@ -860,7 +890,7 @@ class App(ctk.CTk):
             name = os.path.basename(path)
             self._key_var.set(name)
             self._refresh_key_list(name)
-            self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_GREEN)
+            self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_BLUE)
             self._log(f"Key loaded: {name}  […{last4}]")
             self._reset_bundle()
             self._flash_key_zone(name)
@@ -881,7 +911,7 @@ class App(ctk.CTk):
             name = os.path.basename(out)
             self._key_var.set(name)
             self._refresh_key_list(name)
-            self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_GREEN)
+            self._key_status_lbl.configure(text=f"✓  […{last4}]", text_color=C_BLUE)
             self._log(f"Generated: {name}  […{last4}]")
             self._show_toast(f"✓  Key saved: {name}")
             self._reset_bundle()
@@ -917,8 +947,8 @@ class App(ctk.CTk):
             self._active_ip = ""; self._active_name = ""; return
         ip, nm, l4, _ = results[0]
         self._active_ip = ip; self._active_name = nm
-        self._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_GREEN)
-        self._conn_dot.configure(text_color=C_GREEN)
+        self._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_BLUE)
+        self._conn_dot.configure(text_color=C_BLUE)
         self._ip_lbl.configure(text=f"{ip}  ·  KEY …{l4}")
         self._conn_spinner.configure(text="▼", text_color=C_TEXT3)
         self._log(f"Detected: {nm}")
@@ -964,8 +994,8 @@ class App(ctk.CTk):
             msg = f"✓  Sync complete  ·  {sent//1024:.0f} KB  ({elapsed:.1f}s)"
             _key_name = os.path.basename(self._key_path) if self._key_path else ""
             self.after(0, lambda m=msg: (
-                self._enc_status.configure(text=m, text_color=C_GREEN),
-                self._sync_status_lbl.configure(text="✓  Complete", text_color=C_GREEN)))
+                self._enc_status.configure(text=m, text_color=C_BLUE),
+                self._sync_status_lbl.configure(text="✓  Complete", text_color=C_BLUE)))
             # Show key filename in entry after successful sync
             if _key_name:
                 self.after(0, lambda k=_key_name: self._key_var.set(k))
@@ -1085,7 +1115,7 @@ class App(ctk.CTk):
                 self._log_banner(_first_fname, layers=3, total=3)
                 self.after(0, lambda i=save_info: self._bundle_lbl.configure(text=i))
                 self.after(0, lambda: self._enc_status.configure(
-                    text=f"Done — {len(files)} file(s) encrypted", text_color=C_GREEN))
+                    text=f"Done — {len(files)} file(s) encrypted", text_color=C_BLUE))
                 self.after(0, lambda: self._send_btn.configure(state="normal"))
                 self.after(0, lambda: self._save_btn.configure(state="normal"))
                 self._show_toast(f"✓  Saved → output/{bundle_name}.bin")
@@ -1118,7 +1148,7 @@ class App(ctk.CTk):
                         self.after(0, lambda: self._send_btn.configure(state="normal"))
                         if _ok:
                             _msg = f"✓  Auto-sent  {_sent//1024:.0f} KB  ({_elapsed:.1f}s)"
-                            self.after(0, lambda m=_msg: self._enc_status.configure(text=m, text_color=C_GREEN))
+                            self.after(0, lambda m=_msg: self._enc_status.configure(text=m, text_color=C_BLUE))
                             self._show_toast(_msg)
                         elif not _spiffs_ok:
                             _msg = "⚠  Storage full"

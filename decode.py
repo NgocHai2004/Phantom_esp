@@ -335,7 +335,7 @@ class App(ctk.CTk):
             sc,
             text="Ready" if _CRYPTO_OK else "⚠  pip install cryptography",
             font=_font(10), anchor="w",
-            text_color=C_GREEN if _CRYPTO_OK else C_ORANGE)
+            text_color=C_BLUE if _CRYPTO_OK else C_ORANGE)
         self._dec_status.pack(fill="x", padx=14, pady=(0, 3))
 
         if not _CRYPTO_OK:
@@ -366,9 +366,9 @@ class App(ctk.CTk):
 
         # ── 3 Layer Cards ─────────────────────────────────────────────────────
         _LAYERS = [
-            ("L1", "DEC",  "Decryption Layer 1", "First pass",   C_TEAL,   "#EBF9FF"),
-            ("L2", "INT",  "Decryption Layer 2", "Second pass",  C_ORANGE, "#FFF6E5"),
-            ("L3", "FIN",  "Decryption Layer 3", "Third pass",   C_BLUE,   "#EBF1FF"),
+            ("L1", "DEC",  "Decryption Layer 1", "First pass",   C_BLUE, "#EBF1FF"),
+            ("L2", "INT",  "Decryption Layer 2", "Second pass",  C_BLUE, "#EBF1FF"),
+            ("L3", "FIN",  "Decryption Layer 3", "Third pass",   C_BLUE, "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
         lf.pack(fill="x", pady=(0, 14))
@@ -389,10 +389,12 @@ class App(ctk.CTk):
             dot = ctk.CTkLabel(top, text="●", font=_font(11), text_color=C_TEXT3)
             dot.pack(side="right")
 
-            ctk.CTkLabel(card, text=algo, font=_font(15, "bold"),
-                         text_color=color).pack(anchor="w", padx=14, pady=(4, 2))
-            ctk.CTkLabel(card, text=desc, font=_font(11),
-                         text_color=C_TEXT2).pack(anchor="w", padx=14, pady=(0, 8))
+            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(15, "bold"),
+                                     text_color=C_TEXT)
+            title_lbl.pack(anchor="w", padx=14, pady=(4, 2))
+            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(11),
+                                    text_color=C_TEXT2)
+            desc_lbl.pack(anchor="w", padx=14, pady=(0, 8))
 
             # Hash display box
             hash_f = ctk.CTkFrame(card, fg_color=C_SURFACE, corner_radius=6)
@@ -412,7 +414,7 @@ class App(ctk.CTk):
                                text_color=color, anchor="e")
             pct.pack(fill="x", padx=14, pady=(0, 12))
 
-            self._layer_cards.append((card, hash_lbl, bar, pct, dot, color))
+            self._layer_cards.append((card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl))
 
         # ── Overall progress ──────────────────────────────────────────────────
         op = ctk.CTkFrame(inner, fg_color="transparent")
@@ -451,17 +453,33 @@ class App(ctk.CTk):
 
     # ── LAYER ANIMATION ───────────────────────────────────────────────────────
     def _dec_animate_layer(self, idx, hash_hex, duration_ms, on_done):
-        card, hash_lbl, bar, pct, dot, color = self._layer_cards[idx]
+        card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl = self._layer_cards[idx]
         steps = 40; interval = max(20, duration_ms // steps)
         start = idx / 3.0
         dot.configure(text="◌", text_color=color)
-        hash_lbl.configure(text=f"HASH  {hash_hex[:12]}…", text_color=color)
+        hash_lbl.configure(text=f"HASH  {hash_hex[:12]}…", text_color="#1C1C1E")
+        title_lbl.configure(text_color="#1C1C1E")
+        desc_lbl.configure(text_color="#1C1C1E")
+        card.configure(border_color=C_BLUE, border_width=2)
+
+        blink_active = [True]
+        def _blink(on=True):
+            if not blink_active[0]:
+                return
+            card.configure(border_color=C_BLUE if on else C_BORDER,
+                            border_width=2 if on else 1)
+            self.after(400, lambda: _blink(not on))
+        self.after(400, lambda: _blink(False))
 
         def _tick(step=0):
             if step > steps:
+                blink_active[0] = False
                 bar.set(1.0); pct.configure(text="100 %")
                 dot.configure(text="●", text_color=color)
                 hash_lbl.configure(text=f"HASH  {hash_hex[:24]}…", text_color=color)
+                title_lbl.configure(text_color=C_TEXT)
+                desc_lbl.configure(text_color=C_TEXT2)
+                card.configure(border_color=C_BLUE, border_width=2)
                 self._set_ov((idx + 1) / 3.0); on_done(); return
             frac = step / steps
             bar.set(frac); pct.configure(text=f"{int(frac*100)} %")
@@ -518,15 +536,18 @@ class App(ctk.CTk):
         self._dec_log.configure(state="normal")
         self._dec_log.delete("1.0", "end")
         self._dec_log.configure(state="disabled")
-        for card, hash_lbl, bar, pct, dot, color in self._layer_cards:
+        for card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl in self._layer_cards:
             bar.set(0); pct.configure(text="0 %", text_color=color)
             dot.configure(text="●", text_color=C_TEXT3)
             hash_lbl.configure(text="HASH ——", text_color=C_TEXT3)
+            title_lbl.configure(text_color=C_TEXT)
+            desc_lbl.configure(text_color=C_TEXT2)
+            card.configure(border_color=C_BORDER, border_width=1)
         self._set_ov(0)
 
     # ── TOAST ─────────────────────────────────────────────────────────────────
     def _show_toast(self, msg, error=False):
-        c = C_RED if error else C_GREEN
+        c = C_RED if error else C_BLUE
         t = ctk.CTkFrame(self, fg_color=C_CARD, corner_radius=12,
                          border_color=c, border_width=1)
         t.place(relx=0.5, y=54, anchor="n")
@@ -558,8 +579,8 @@ class App(ctk.CTk):
             lbl.pack(side="left", padx=4, fill="x", expand=True)
             # update drop zone — stay green
             self._bz_icon.configure(text="✓")
-            self._bz_title.configure(text=name, text_color=C_GREEN)
-            self._bz.configure(border_color=C_GREEN)
+            self._bz_title.configure(text=name, text_color=C_BLUE)
+            self._bz.configure(border_color=C_BLUE)
         else:
             self._bin_placeholder.pack(side="left", padx=8, fill="x", expand=True)
             self._bz_icon.configure(text="📦")
@@ -576,13 +597,13 @@ class App(ctk.CTk):
             self._key_placeholder.pack_forget()
             lbl = _tk.Label(self._key_list_frame,
                             text=f"  \U0001f511 {name}",
-                            bg=C_INPUT, fg=C_GREEN,
+                            bg=C_INPUT, fg=C_BLUE,
                             font=("Segoe UI", 9), anchor="w")
             lbl.pack(side="left", padx=4, fill="x", expand=True)
-            # update drop zone — stay green
+            # update drop zone — stay blue
             self._kz_icon.configure(text="✓")
-            self._kz_title.configure(text=name, text_color=C_GREEN)
-            self._kz.configure(border_color=C_GREEN)
+            self._kz_title.configure(text=name, text_color=C_BLUE)
+            self._kz.configure(border_color=C_BLUE)
         else:
             self._key_placeholder.pack(side="left", padx=8, fill="x", expand=True)
             self._kz_icon.configure(text="🔑")
@@ -751,7 +772,7 @@ class App(ctk.CTk):
 
             self.after(0, lambda: self._dec_status.configure(
                 text=f"Done — {ok}/{len(results)} decrypted",
-                text_color=C_GREEN))
+                text_color=C_BLUE))
             self._show_toast(f"✓  Decrypt: {ok} file(s) done")
             self.after(0, lambda: self._dec_btn.configure(state="normal"))
 
