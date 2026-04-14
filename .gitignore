@@ -52,6 +52,12 @@ decode/*.bin
 # ── Phantom output folder (auto-save từ encode.py) ───────────
 output/
 
+# ── project_nen: output & temp files (không commit) ──────────
+*.zfld
+project_nen/output/
+project_nen/zipfolder/__pycache__/
+zip-folder-master/
+
 # ── Phantom demo/test files (không commit dữ liệu thật) ──────
 phantom/
 !phantom/.gitkeep

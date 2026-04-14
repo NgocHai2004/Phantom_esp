@@ -6,9 +6,11 @@ Run:   .venv\Scripts\python decode.py
 
 import customtkinter as ctk
 from tkinter import filedialog
-import sys, os, time, subprocess, threading
+import sys, os, time, subprocess, threading, tempfile
 import struct, zipfile, hashlib, io
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent / "project_nen"))
+from zipfolder.decompressor import decompress_folder
 
 # ── PHANTOM 3-layer crypto ────────────────────────────────────────────────────
 try:
@@ -729,49 +731,53 @@ class App(ctk.CTk):
                            self._dec_animate_layer(i, h, 6000, ev.set))
                 ev.wait(); time.sleep(0.25)
 
-            self._dec_log_msg("\n[OUT]  Writing decrypted files…")
-            os.makedirs(out_d, exist_ok=True)
-            results = []
+            self._dec_log_msg("\n[OUT]  Decrypting & decompressing…")
+
+            # ── Step 1: decrypt the entire payload → .zfld bytes ─────────────
             try:
-                with zipfile.ZipFile(io.BytesIO(payload)) as zf:
-                    entries = zf.namelist()
-                    self._dec_log_msg(f"  Archive: {len(entries)} file(s)")
-                    for i, entry in enumerate(entries, 1):
-                        orig = entry.removesuffix(".enc")
-                        self._dec_log_msg(f"  [{i}/{len(entries)}] {orig}")
-                        try:
-                            plain = _phtm_decrypt_3layer(zf.read(entry), master)
-                            out_p = os.path.join(out_d, orig)
-                            open(out_p, "wb").write(plain)
-                            self._dec_log_msg(f"  ✓  {len(plain):,} bytes → {orig}")
-                            results.append((orig, out_p, len(plain), True))
-                        except Exception as e2:
-                            self._dec_log_msg(f"  ✗  {e2}")
-                            results.append((orig, None, 0, False))
+                zfld_bytes = _phtm_decrypt_3layer(payload, master)
             except Exception as e:
-                self._dec_log_msg(f"✗  UNPACK ERROR: {e}")
+                self._dec_log_msg(f"✗  DECRYPT ERROR: {e}")
                 self.after(0, lambda: self._dec_status.configure(
                     text=f"Error: {e}", text_color=C_RED))
                 self.after(0, lambda: self._dec_btn.configure(state="normal"))
                 return
 
-            ok  = sum(1 for r in results if r[3])
-            err = len(results) - ok
+            self._dec_log_msg(f"  Decrypted: {len(zfld_bytes):,} bytes (.zfld)")
+
+            # ── Step 2: write .zfld to temp, decompress to output_dir ────────
+            os.makedirs(out_d, exist_ok=True)
+            try:
+                with tempfile.TemporaryDirectory(prefix="phantom_dec_") as tmpdir:
+                    zfld_tmp = os.path.join(tmpdir, "bundle.zfld")
+                    with open(zfld_tmp, "wb") as f:
+                        f.write(zfld_bytes)
+
+                    result_folder = decompress_folder(zfld_tmp, out_d)
+                    result_path = result_folder if isinstance(result_folder, Path) else Path(result_folder)
+                    files_out = [f for f in result_path.rglob("*") if f.is_file()]
+            except Exception as e:
+                self._dec_log_msg(f"✗  DECOMPRESS ERROR: {e}")
+                self.after(0, lambda: self._dec_status.configure(
+                    text=f"Error: {e}", text_color=C_RED))
+                self.after(0, lambda: self._dec_btn.configure(state="normal"))
+                return
+
+            ok  = len(files_out)
+            err = 0
 
             self._dec_log_msg("══════════════════════════════════════")
-            for orig, out_path, size, success in results:
-                if success and out_path:
-                    sz_str = f"{size/1024:.1f} KB" if size >= 1024 else f"{size} B"
-                    self._dec_log_msg(f"  ▶  {orig}  ({sz_str})")
-            self._dec_log_msg(f"\n  DONE   {ok} OK  ·  {err} ERROR(S)")
+            for f in files_out:
+                sz_str = f"{f.stat().st_size/1024:.1f} KB" if f.stat().st_size >= 1024 else f"{f.stat().st_size} B"
+                self._dec_log_msg(f"  ▶  {f.name}  ({sz_str})")
+            self._dec_log_msg(f"\n  DONE   {ok} file(s) extracted")
             self._dec_log_msg("══════════════════════════════════════")
             # ── Green completion banner ───────────────────────────────────────
-            _ok_files = [r[0] for r in results if r[3]]
-            _bn = _ok_files[0] if _ok_files else os.path.basename(bin_p)
+            _bn = files_out[0].name if files_out else os.path.basename(bin_p)
             self._log_banner(_bn, layers=3, total=3, mode="decrypted")
 
             self.after(0, lambda: self._dec_status.configure(
-                text=f"Done — {ok}/{len(results)} decrypted",
+                text=f"Done — {ok} file(s) decrypted",
                 text_color=C_BLUE))
             self._show_toast(f"✓  Decrypt: {ok} file(s) done")
             self.after(0, lambda: self._dec_btn.configure(state="normal"))

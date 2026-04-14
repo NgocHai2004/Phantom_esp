@@ -6,8 +6,11 @@ Run:   .venv\Scripts\python encode.py
 
 import customtkinter as ctk
 from tkinter import filedialog
-import sys, socket, threading, os, time, json
+import sys, socket, threading, os, time, json, tempfile, shutil
 import zipfile, hashlib, io, struct, urllib.request, urllib.error
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent / "project_nen"))
+from zipfolder.compressor import compress_folder
 
 # ── PHANTOM 3-layer crypto ────────────────────────────────────────────────────
 try:
@@ -1069,25 +1072,36 @@ class App(ctk.CTk):
                 self.after(0, lambda i=idx, h=hx: self._animate_layer(i, h, 5000, ev.set))
                 ev.wait(); time.sleep(0.25)
 
-            self._log_msg("\n[OUT]  Building encrypted bundle…")
+            # ── Step 1 — copy files into a temp folder ───────────────────────
+            self._log_msg("\n[1/3]  Packaging files into folder…")
             try:
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                with tempfile.TemporaryDirectory(prefix="phantom_enc_") as tmpdir:
+                    work_folder = Path(tmpdir) / "phantom_bundle"
+                    work_folder.mkdir()
                     for fpath in files:
-                        fname = os.path.basename(fpath)
-                        self._log_msg(f"  ›  {fname}")
-                        raw = open(fpath, "rb").read()
-                        enc = _phtm_encrypt_3layer(raw, master)
-                        zf.writestr(fname + ".enc", enc)
-                        self._log_msg(f"  ✓  {len(raw):,} → {len(enc):,} bytes")
+                        shutil.copy2(fpath, work_folder / os.path.basename(fpath))
+                        self._log_msg(f"  ›  {os.path.basename(fpath)}")
 
-                zip_bytes   = zip_buf.getvalue()
-                bin_bytes   = _phtm_pack_bin(zip_bytes)
+                    # ── Step 2 — compress folder to .zfld ────────────────────
+                    self._log_msg("\n[2/3]  Compressing with 7-Zip LZMA2…")
+                    zfld_path = Path(tmpdir) / "bundle.zfld"
+                    compress_folder(str(work_folder), str(zfld_path), optimize=True, algorithm="7z")
+                    zfld_bytes = zfld_path.read_bytes()
+                    orig_kb = sum(Path(f).stat().st_size for f in files) / 1024
+                    comp_kb = len(zfld_bytes) / 1024
+                    ratio   = round((1 - comp_kb / orig_kb) * 100, 1) if orig_kb > 0 else 0
+                    self._log_msg(f"  Compressed: {orig_kb:.1f} KB → {comp_kb:.1f} KB  (↓{ratio}%)")
+
+                    # ── Step 3 — encrypt the entire .zfld as one blob ────────
+                    self._log_msg("\n[3/3]  Encrypting with 3-layer PHANTOM…")
+                    enc_bytes = _phtm_encrypt_3layer(zfld_bytes, master)
+                    bin_bytes = _phtm_pack_bin(enc_bytes)
                 md5_str     = hashlib.md5(bin_bytes).hexdigest()
                 ts          = time.strftime("%Y%m%d_%H%M%S")
                 bundle_name = f"phantom_{ts}"
                 self._bin_bytes = bin_bytes; self._bundle_name = bundle_name
                 size_kb = len(bin_bytes) / 1024
+                orig_kb_total = sum(Path(f).stat().st_size for f in files) / 1024
 
                 # ── AUTO-SAVE to output/ folder next to encode.py ─────────────
                 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1102,13 +1116,15 @@ class App(ctk.CTk):
                     # self._log_msg(f"  💾  Saved → {auto_path}")
                 except Exception as _se:
                     self._log_msg(f"  ⚠  Auto-save error: {_se}")
-                save_info = f"📦  {bundle_name}.bin  ·  {size_kb:.1f} KB"
+                _comp_kb = len(enc_bytes) / 1024   # zfld+crypto (before pack header)
+                save_info = f"📦  {bundle_name}.bin  ·  {size_kb:.1f} KB  (orig {orig_kb_total:.1f} KB)"
 
                 self._log_msg("══════════════════════════════════════")
                 self._log_msg(f"  DONE   {bundle_name}.bin")
-                self._log_msg(f"  SIZE : {size_kb:.1f} KB")
+                self._log_msg(f"  ORIG : {orig_kb_total:.1f} KB")
+                self._log_msg(f"  COMP : {_comp_kb:.1f} KB  (compressed+encrypted)")
+                self._log_msg(f"  BIN  : {size_kb:.1f} KB  (with PHANTOM header)")
                 self._log_msg(f"  MD5  : {md5_str}")
-                # self._log_msg(f"  PATH : {auto_path}")
                 self._log_msg("══════════════════════════════════════")
                 # ── Green completion banner ───────────────────────────────────
                 _first_fname = os.path.basename(files[0]) if files else "file"
