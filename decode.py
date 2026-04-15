@@ -95,17 +95,80 @@ def tg_card(parent, **kw):
 mac_card = tg_card
 
 def tg_btn(parent, text, command, style="primary", **kw):
-    # ALL styles = black pill + white text + subtle border for "bubble" depth
-    _BLACK    = "#1C1C1E"
-    _BLACK_HV = "#3A3A3C"
-    _BLACK_BR = "#4A4A4C"   # slightly lighter border → gives 3-D raised look
+    # ALL styles = gray pill + white text + subtle border for "bubble" depth
+    _BLACK    = "#6E6E73"   # gray (was black #1C1C1E)
+    _BLACK_HV = "#8E8E93"   # lighter gray on hover
+    _BLACK_BR = "#AEAEB2"   # border gray
     base = dict(corner_radius=20, height=38, command=command, font=_font(13, "bold"),
                 fg_color=_BLACK, hover_color=_BLACK_HV,
                 text_color="#FFFFFF",
                 border_color=_BLACK_BR, border_width=1)
     # style kwarg kept for API compatibility — ignored, all black now
     base.update(kw)
-    return ctk.CTkButton(parent, text=text, **base)
+    btn = ctk.CTkButton(parent, text=text, **base)
+    _attach_hover(btn)
+    return btn
+
+def _attach_hover(btn: ctk.CTkButton):
+    """Attach corner-bracket hover effect to a CTkButton."""
+    _HOVER_COLOR  = "#2979FF"   # blue corner brackets
+    _NORMAL_BR    = btn.cget("border_color") if btn.cget("border_color") else "#4A4A4C"
+    _NORMAL_BW    = btn.cget("border_width") if btn.cget("border_width") else 1
+    _SZ           = 6    # bracket arm length (px)
+    _TH           = 2    # bracket thickness (px)
+
+    corners: list = []
+
+    def _make_corners():
+        nonlocal corners
+        for c in corners:
+            try: c.destroy()
+            except: pass
+        corners.clear()
+
+        specs = [
+            # top-left
+            ("tl_h", dict(relx=0.0, rely=0.0, x=0,    y=0,    width=_SZ, height=_TH)),
+            ("tl_v", dict(relx=0.0, rely=0.0, x=0,    y=0,    width=_TH, height=_SZ)),
+            # top-right
+            ("tr_h", dict(relx=1.0, rely=0.0, x=-_SZ, y=0,    width=_SZ, height=_TH)),
+            ("tr_v", dict(relx=1.0, rely=0.0, x=-_TH, y=0,    width=_TH, height=_SZ)),
+            # bottom-left
+            ("bl_h", dict(relx=0.0, rely=1.0, x=0,    y=-_TH, width=_SZ, height=_TH)),
+            ("bl_v", dict(relx=0.0, rely=1.0, x=0,    y=-_SZ, width=_TH, height=_SZ)),
+            # bottom-right
+            ("br_h", dict(relx=1.0, rely=1.0, x=-_SZ, y=-_TH, width=_SZ, height=_TH)),
+            ("br_v", dict(relx=1.0, rely=1.0, x=-_TH, y=-_SZ, width=_TH, height=_SZ)),
+        ]
+        import tkinter as _tk
+        for name, pkw in specs:
+            arm = _tk.Frame(btn, bg=_HOVER_COLOR, bd=0, highlightthickness=0)
+            arm.place(**pkw)
+            arm.lower()
+            corners.append(arm)
+
+    def _on_enter(e):
+        try:
+            btn.configure(border_color=_HOVER_COLOR, border_width=2)
+            if not corners:
+                _make_corners()
+            for c in corners:
+                try: c.lift(); c.place_configure()
+                except: pass
+        except Exception:
+            pass
+
+    def _on_leave(e):
+        try:
+            btn.configure(border_color=_NORMAL_BR, border_width=_NORMAL_BW)
+            for c in corners:
+                try: c.lower()
+                except: pass
+        except Exception:
+            pass
+
+    btn.bind("<Enter>", _on_enter, add="+")
+    btn.bind("<Leave>", _on_leave, add="+")
 
 def pill(parent, text, color, tint):
     f = ctk.CTkFrame(parent, fg_color=tint, corner_radius=10, border_width=0)
@@ -152,13 +215,20 @@ class App(ctk.CTk):
         self._dec_key = ctk.StringVar()   # display only (blank)
         self._dec_key_path = ""           # actual full path — never displayed
         self._dec_out = ctk.StringVar()
-        self._dec_out_full = str(Path(__file__).parent / "decode" / "output")  # real path
+
+        # Default output → ~/Documents/Phantom/output/return_user
+        _out_default = Path.home() / "Documents" / "Phantom" / "output" / "return_user"
+        try:
+            _out_default.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            _out_default = Path(__file__).parent / "decode" / "output"
+        self._dec_out_full = str(_out_default)
 
         _def_key = Path(__file__).parent / "decode" / "phantom.key"
         if _def_key.exists():
             self._dec_key_path = str(_def_key)
             # Leave _dec_key display empty — key loaded silently
-        self._dec_out.set("decode/output")   # display label only — no absolute path
+        self._dec_out.set("Phantom/output/return_user")   # display label only
 
         self._build_ui()
 
@@ -559,11 +629,24 @@ class App(ctk.CTk):
 
     # ── FILE PICKERS ──────────────────────────────────────────────────────────
     @staticmethod
-    def _phantom_dir():
-        """Default picker start dir: ~/Documents/phantom (created if needed)."""
-        d = Path.home() / "Documents" / "phantom"
-        d.mkdir(parents=True, exist_ok=True)
-        return str(d)
+    def _phantom_input_dir() -> str:
+        """Default picker dir for .bin files: ~/Documents/Phantom/output"""
+        d = Path.home() / "Documents" / "Phantom" / "output"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return str(d) if d.exists() else str(Path.home())
+
+    @staticmethod
+    def _phantom_key_dir() -> str:
+        """Default picker dir for key files: ~/Documents/Phantom/output"""
+        d = Path.home() / "Documents" / "Phantom" / "output"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return str(d) if d.exists() else str(Path.home())
 
     def _refresh_bin_display(self, name: str = ""):
         """Update the .bin file display row."""
@@ -616,20 +699,25 @@ class App(ctk.CTk):
         p = filedialog.askopenfilename(
             title="Select PHANTOM .bin",
             filetypes=[("PHANTOM bin", "*.bin"), ("All files", "*.*")],
-            initialdir=self._phantom_dir())
+            initialdir=self._phantom_input_dir())
         if p:
             self._dec_bin_full = p
             self._dec_bin.set(os.path.basename(p))
-            _out_full = str(Path(p).parent / "output")
-            self._dec_out_full = _out_full
-            self._dec_out.set("output")
+            # Output always goes to ~/Documents/Phantom/output/return_user
+            _out_default = Path.home() / "Documents" / "Phantom" / "output" / "return_user"
+            try:
+                _out_default.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                _out_default = Path(p).parent / "return_user"
+            self._dec_out_full = str(_out_default)
+            self._dec_out.set("Phantom/output/return_user")
             self._refresh_bin_display(os.path.basename(p))
 
     def _dec_pick_key(self):
         p = filedialog.askopenfilename(
             title="Select phantom.key",
             filetypes=[("Key file", "*.key"), ("All files", "*.*")],
-            initialdir=self._phantom_dir())
+            initialdir=self._phantom_key_dir())
         if p:
             self._dec_key_path = p
             self._dec_key.set("")

@@ -158,17 +158,91 @@ def tg_card(parent, **kw):
 mac_card = tg_card
 
 def tg_btn(parent, text, command, style="primary", **kw):
-    # ALL styles = black pill + white text + subtle border for "bubble" depth
-    _BLACK    = "#1C1C1E"
-    _BLACK_HV = "#3A3A3C"
-    _BLACK_BR = "#4A4A4C"   # slightly lighter border → gives 3-D raised look
+    # ALL styles = gray pill + white text + subtle border for "bubble" depth
+    _BLACK    = "#6E6E73"   # gray (was black #1C1C1E)
+    _BLACK_HV = "#8E8E93"   # lighter gray on hover
+    _BLACK_BR = "#AEAEB2"   # border gray
     base = dict(corner_radius=20, height=38, command=command, font=_font(13, "bold"),
                 fg_color=_BLACK, hover_color=_BLACK_HV,
                 text_color="#FFFFFF",
                 border_color=_BLACK_BR, border_width=1)
     # style kwarg kept for API compatibility — ignored, all black now
     base.update(kw)
-    return ctk.CTkButton(parent, text=text, **base)
+    btn = ctk.CTkButton(parent, text=text, **base)
+    _attach_hover(btn)
+    return btn
+
+def _attach_hover(btn: ctk.CTkButton):
+    """Attach corner-bracket hover effect to a CTkButton."""
+    _HOVER_COLOR  = "#2979FF"   # blue corner brackets
+    _NORMAL_BR    = btn.cget("border_color") if btn.cget("border_color") else "#4A4A4C"
+    _NORMAL_BW    = btn.cget("border_width") if btn.cget("border_width") else 1
+    _SZ           = 6    # bracket arm length (px)
+    _TH           = 2    # bracket thickness (px)
+
+    corners: list = []
+
+    def _make_corners():
+        nonlocal corners
+        # Remove old overlays if any
+        for c in corners:
+            try: c.destroy()
+            except: pass
+        corners.clear()
+
+        p = btn.winfo_parent()
+        try:
+            parent_widget = btn.nametowidget(p)
+        except Exception:
+            return
+
+        # We'll place overlays on the button itself using place() inside it
+        # 4 L-shaped corners: top-left, top-right, bottom-left, bottom-right
+        # Each corner = 2 thin frames (horizontal + vertical arm)
+        specs = [
+            # (x_rel, y_rel, w_h, w_v, anchor)
+            # top-left
+            ("tl_h", dict(relx=0.0, rely=0.0, x=0,    y=0,    width=_SZ, height=_TH)),
+            ("tl_v", dict(relx=0.0, rely=0.0, x=0,    y=0,    width=_TH, height=_SZ)),
+            # top-right
+            ("tr_h", dict(relx=1.0, rely=0.0, x=-_SZ, y=0,    width=_SZ, height=_TH)),
+            ("tr_v", dict(relx=1.0, rely=0.0, x=-_TH, y=0,    width=_TH, height=_SZ)),
+            # bottom-left
+            ("bl_h", dict(relx=0.0, rely=1.0, x=0,    y=-_TH, width=_SZ, height=_TH)),
+            ("bl_v", dict(relx=0.0, rely=1.0, x=0,    y=-_SZ, width=_TH, height=_SZ)),
+            # bottom-right
+            ("br_h", dict(relx=1.0, rely=1.0, x=-_SZ, y=-_TH, width=_SZ, height=_TH)),
+            ("br_v", dict(relx=1.0, rely=1.0, x=-_TH, y=-_SZ, width=_TH, height=_SZ)),
+        ]
+        import tkinter as _tk
+        for name, pkw in specs:
+            arm = _tk.Frame(btn, bg=_HOVER_COLOR, bd=0, highlightthickness=0)
+            arm.place(**pkw)
+            arm.lower()   # keep below button text — raise on hover
+            corners.append(arm)
+
+    def _on_enter(e):
+        try:
+            btn.configure(border_color=_HOVER_COLOR, border_width=2)
+            if not corners:
+                _make_corners()
+            for c in corners:
+                try: c.lift(); c.place_configure()
+                except: pass
+        except Exception:
+            pass
+
+    def _on_leave(e):
+        try:
+            btn.configure(border_color=_NORMAL_BR, border_width=_NORMAL_BW)
+            for c in corners:
+                try: c.lower()
+                except: pass
+        except Exception:
+            pass
+
+    btn.bind("<Enter>", _on_enter, add="+")
+    btn.bind("<Leave>", _on_leave, add="+")
 
 def pill(parent, text, color, tint):
     f = ctk.CTkFrame(parent, fg_color=tint, corner_radius=10, border_width=0)
@@ -200,6 +274,18 @@ sec_hdr = tg_sec
 def hr(parent, color=None, padx=12, pady=6):
     ctk.CTkFrame(parent, fg_color=color or C_BORDER, height=1,
                  corner_radius=0).pack(fill="x", padx=padx, pady=pady)
+
+# ── Phantom directory helper ──────────────────────────────────────────────────
+def _phantom_dir(sub: str) -> str:
+    """Return ~/Documents/Phantom/<sub>, falling back to <script_dir>/<sub>."""
+    primary = Path.home() / "Documents" / "Phantom" / sub
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return str(primary)
+    except Exception:
+        fallback = Path(__file__).parent / sub
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
 
 # ═════════════════════════════════════════════════════════════════════════════
 class App(ctk.CTk):
@@ -794,8 +880,10 @@ class App(ctk.CTk):
 
     # ── FILE OPS ──────────────────────────────────────────────────────────────
     def _browse(self):
+        _input_dir = _phantom_dir("input")
         paths = filedialog.askopenfilenames(
             title="Select files to encrypt",
+            initialdir=_input_dir,
             filetypes=[("All supported",
                         "*.wav *.mp3 *.ogg *.flac *.aac "
                         "*.doc *.docx *.xls *.xlsx *.pdf "
@@ -882,7 +970,9 @@ class App(ctk.CTk):
 
     # ── KEY ───────────────────────────────────────────────────────────────────
     def _browse_key(self):
+        _input_dir = _phantom_dir("input")
         path = filedialog.askopenfilename(title="Select key file",
+            initialdir=_input_dir,
             filetypes=[("Key file", "*.key"), ("All files", "*.*")])
         if not path: return
         try:
@@ -959,8 +1049,10 @@ class App(ctk.CTk):
     # ── SAVE ──────────────────────────────────────────────────────────────────
     def _save_bin(self):
         if not self._bin_bytes: return
+        _output_dir = _phantom_dir("output")
         path = filedialog.asksaveasfilename(
             defaultextension=".bin", initialfile=self._bundle_name + ".bin",
+            initialdir=_output_dir,
             filetypes=[("Binary", "*.bin"), ("All files", "*.*")])
         if path:
             open(path, "wb").write(self._bin_bytes)
@@ -1103,11 +1195,9 @@ class App(ctk.CTk):
                 size_kb = len(bin_bytes) / 1024
                 orig_kb_total = sum(Path(f).stat().st_size for f in files) / 1024
 
-                # ── AUTO-SAVE to output/ folder next to encode.py ─────────────
-                _script_dir = os.path.dirname(os.path.abspath(__file__))
-                out_dir     = os.path.join(_script_dir, "output")
-                os.makedirs(out_dir, exist_ok=True)
-                auto_path   = os.path.join(out_dir, bundle_name + ".bin")
+                # ── AUTO-SAVE to ~/Documents/Phantom/output ───────────────────
+                out_dir   = _phantom_dir("output")
+                auto_path = os.path.join(out_dir, bundle_name + ".bin")
                 _save_ok    = False
                 try:
                     with open(auto_path, "wb") as _f:
