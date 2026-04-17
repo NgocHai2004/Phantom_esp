@@ -1073,7 +1073,7 @@ class EncryptPage(ctk.CTkFrame):
     def _tick_spinner(self):
         if not self._spinning: return
         self._spin_angle = (self._spin_angle + 1) % 4
-        try: self._conn_spinner.configure(text=self._SPIN[self._spin_angle])
+        try: self._app._conn_spinner.configure(text=self._SPIN[self._spin_angle])
         except: pass
         self.after(350, self._tick_spinner)
 
@@ -1089,16 +1089,23 @@ class EncryptPage(ctk.CTkFrame):
 
     def _on_scan_result(self, results):
         if not results:
-            self._conn_lbl.configure(text="NO SIGNAL", text_color=C_TEXT3)
-            self._conn_dot.configure(text_color=C_TEXT3)
-            self._ip_lbl.configure(text="Connect to Phantom WiFi")
+            try: self._app._conn_lbl.configure(text="NO SIGNAL", text_color=C_TEXT3)
+            except: pass
+            try: self._app._conn_dot.configure(text_color=C_TEXT3)
+            except: pass
+            try: self._ip_lbl.configure(text="Connect to Phantom WiFi")
+            except: pass
             self._active_ip = ""; self._active_name = ""; return
         ip, nm, l4, _ = results[0]
         self._active_ip = ip; self._active_name = nm
-        self._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_BLUE)
-        self._conn_dot.configure(text_color=C_BLUE)
-        self._ip_lbl.configure(text=f"{ip}  ·  KEY …{l4}")
-        self._conn_spinner.configure(text="▼", text_color=C_TEXT3)
+        try: self._app._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_BLUE)
+        except: pass
+        try: self._app._conn_dot.configure(text_color=C_BLUE)
+        except: pass
+        try: self._ip_lbl.configure(text=f"{ip}  ·  KEY …{l4}")
+        except: pass
+        try: self._app._conn_spinner.configure(text="▼", text_color=C_TEXT3)
+        except: pass
         self._log(f"Detected: {nm}")
 
     # ── SAVE ──────────────────────────────────────────────────────────────────
