@@ -12,7 +12,7 @@ Run:   .venv\Scripts\python encode.py
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import sys, socket, threading, os, time, json, tempfile, shutil
+import sys, socket, threading, os, time, json, tempfile, shutil, subprocess
 import zipfile, hashlib, io, struct, urllib.request, urllib.error
 from pathlib import Path
 
@@ -46,6 +46,15 @@ def _phtm_load_key(path):
 def _phtm_derive(master):
     dk = lambda tag: hashlib.sha256(master + tag).digest()
     return dk(b"AES-GCM"), dk(b"HMAC-SHA256"), dk(b"CHACHA20")
+
+def _phtm_decrypt_3layer(enc: bytes, master: bytes) -> bytes:
+    k_aes, k_hmac, k_chacha = _phtm_derive(master)
+    payload = ChaCha20Poly1305(k_chacha).decrypt(enc[:12], enc[12:], None)
+    hmac_tag, inner = payload[-32:], payload[:-32]
+    h = _hmac.HMAC(k_hmac, _hashes.SHA256(), backend=_backend())
+    h.update(inner)
+    h.verify(hmac_tag)
+    return AESGCM(k_aes).decrypt(inner[:12], inner[12:], None)
 
 def _phtm_encrypt_3layer(data: bytes, master: bytes) -> bytes:
     k_aes, k_hmac, k_chacha = _phtm_derive(master)
@@ -352,6 +361,29 @@ def _phantom_dir(sub: str) -> str:
         fallback.mkdir(parents=True, exist_ok=True)
         return str(fallback)
 
+
+def _fmt_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes/1024:.1f} KB"
+    if num_bytes < 1024 * 1024 * 1024:
+        return f"{num_bytes/(1024*1024):.2f} MB"
+    return f"{num_bytes/(1024*1024*1024):.2f} GB"
+
+
+def _fmt_dt(ts: float) -> str:
+    return time.strftime("%d/%m/%Y %H:%M", time.localtime(ts))
+
+
+def _file_kind(path: Path) -> str:
+    if path.is_dir():
+        return "Folder"
+    ext = path.suffix.lower()
+    if not ext:
+        return "File"
+    return f"{ext[1:].upper()} file"
+
 # ═════════════════════════════════════════════════════════════════════════════
 
 class EncryptPage(ctk.CTkFrame):
@@ -362,6 +394,7 @@ class EncryptPage(ctk.CTkFrame):
         self._selected_files: list = []
         self._bin_bytes  = None
         self._bundle_name = ""
+        self._last_auto_bin = ""
         self._key_path   = ""
         self._key_bytes  = None
         self._key_pub_fp = ""
@@ -587,6 +620,15 @@ class EncryptPage(ctk.CTkFrame):
                                              font=_font(9, "bold"), text_color=C_BLUE,
                                              anchor="w", wraplength=215)
         # not packed initially
+
+        self._enc_file_info_lbl = ctk.CTkLabel(
+            sc, text="", font=_font(9), text_color=C_TEXT2,
+            anchor="w", justify="left", wraplength=240)
+        # not packed initially
+
+        tg_btn(sc, "↗ Open Output Folder", self._enc_open_output,
+               style="outline", height=20, font=_font(9), corner_radius=10
+               ).pack(fill="x", padx=8, pady=(0, 1))
 
         # _ip_lbl kept as hidden widget so _on_scan_result doesn't crash
         self._ip_lbl = ctk.CTkLabel(sc, text="",
@@ -986,6 +1028,9 @@ class EncryptPage(ctk.CTkFrame):
         self._sync_status_lbl.configure(text=""); self._sync_status_lbl.pack_forget()
         self._save_btn.configure(state="disabled")
         self._send_btn.configure(state="disabled")
+        self._last_auto_bin = ""
+        self._enc_file_info_lbl.configure(text="")
+        self._enc_file_info_lbl.pack_forget()
 
     # ── KEY LIST ──────────────────────────────────────────────────────────────
     def _refresh_key_list(self, name: str = ""):
@@ -1098,9 +1143,9 @@ class EncryptPage(ctk.CTkFrame):
             self._active_ip = ""; self._active_name = ""; return
         ip, nm, l4, _ = results[0]
         self._active_ip = ip; self._active_name = nm
-        try: self._app._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_BLUE)
+        try: self._app._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_GREEN)
         except: pass
-        try: self._app._conn_dot.configure(text_color=C_BLUE)
+        try: self._app._conn_dot.configure(text_color=C_GREEN)
         except: pass
         try: self._ip_lbl.configure(text=f"{ip}  ·  KEY …{l4}")
         except: pass
@@ -1120,6 +1165,41 @@ class EncryptPage(ctk.CTkFrame):
             open(path, "wb").write(self._bin_bytes)
             # self._log(f"✓  Saved: {os.path.basename(path)}")
             # self._app._show_toast(f"✓  Saved {os.path.basename(path)}")
+
+    def _enc_open_output(self):
+        target = Path(_phantom_dir("output"))
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            if sys.platform == "win32":
+                try:
+                    os.startfile(str(target))  # type: ignore[attr-defined]
+                except Exception:
+                    subprocess.Popen(["explorer", str(target)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception:
+            self._app._show_toast("⚠  Could not open output folder", error=True)
+
+    def _update_enc_file_info(self, output_path: str):
+        try:
+            p = Path(output_path)
+            st = p.stat()
+            ext = p.suffix.lower() if p.suffix else "(none)"
+            info = (
+                f"📦  {p.name}\n"
+                f"Kind: {_file_kind(p)}  ·  Ext: {ext}\n"
+                f"Size: {_fmt_size(st.st_size)}  ·  Created: {_fmt_dt(st.st_ctime)}"
+            )
+            self._enc_file_info_lbl.configure(text=info, text_color=C_BLUE)
+            self._enc_file_info_lbl.pack(fill="x", padx=8, pady=(0, 1))
+        except Exception:
+            pass
 
     # ── SEND / SYNC ───────────────────────────────────────────────────────────
     def _do_send(self):
@@ -1160,8 +1240,6 @@ class EncryptPage(ctk.CTkFrame):
             # Mark all selected files as uploaded (blue)
             _uploaded = {os.path.basename(p) for p in self._selected_files}
             self.after(0, lambda u=_uploaded: self._refresh_file_list(u))
-            # Add file card to phantom panel
-            self.after(0, lambda: self._phantom_add_file(fname, size_kb))
             self._app._show_toast(msg)
         elif not spiffs_ok:
             msg = "⚠  Storage full"
@@ -1266,6 +1344,7 @@ class EncryptPage(ctk.CTkFrame):
                     with open(auto_path, "wb") as _f:
                         _f.write(bin_bytes)
                     _save_ok = True
+                    self._last_auto_bin = auto_path
                     # self._log_msg(f"  💾  Saved → {auto_path}")
                 except Exception as _se:
                     self._log_msg(f"  ⚠  Auto-save error: {_se}")
@@ -1289,6 +1368,9 @@ class EncryptPage(ctk.CTkFrame):
                     text=f"Done — {len(files)} file(s) encrypted", text_color=C_BLUE))
                 self.after(0, lambda: self._send_btn.configure(state="normal"))
                 self.after(0, lambda: self._save_btn.configure(state="normal"))
+                self.after(0, lambda: self._phantom_add_file(f"{bundle_name}.bin", size_kb))
+                if _save_ok:
+                    self.after(0, lambda p=auto_path: self._update_enc_file_info(p))
                 self._app._show_toast(f"✓  Saved → output/{bundle_name}.bin")
                 # ── AUTO-SEND after 20s countdown ────────────────────────────
                 if self._active_ip:
@@ -1350,13 +1432,14 @@ class DecryptPage(ctk.CTkFrame):
         self._dec_key = ctk.StringVar()   # display only (blank)
         self._dec_key_path = ""           # actual full path — never displayed
         self._dec_out = ctk.StringVar()
+        self._dec_last_result = ""
 
-        # Default output → ~/Documents/Phantom/output/return_user
-        _out_default = Path.home() / "Documents" / "Phantom" / "output" / "return_user"
+        # Default output → fixed Windows path requested by user
+        _out_default = Path(r"C:\Users\Ad\Documents\Phantom\output\return_user")
         try:
             _out_default.mkdir(parents=True, exist_ok=True)
         except Exception:
-            _out_default = Path(__file__).parent / "decode" / "output"
+            pass
         self._dec_out_full = str(_out_default)
 
         # Do NOT auto-load phantom.key — user must explicitly load a key
@@ -1517,6 +1600,11 @@ class DecryptPage(ctk.CTkFrame):
             font=_font(9), anchor="w",
             text_color=C_BLUE if _CRYPTO_OK else C_ORANGE)
         self._dec_status.pack(fill="x", padx=8, pady=(0, 0))
+
+        self._dec_result_info_lbl = ctk.CTkLabel(
+            sc, text="", font=_font(9), text_color=C_TEXT2,
+            anchor="w", justify="left", wraplength=240)
+        # not packed initially
 
         if not _CRYPTO_OK:
             err = ctk.CTkFrame(sc, fg_color=C_SURFACE, corner_radius=6,
@@ -1829,12 +1917,12 @@ class DecryptPage(ctk.CTkFrame):
         if p:
             self._dec_bin_full = p
             self._dec_bin.set(os.path.basename(p))
-            # Output always goes to ~/Documents/Phantom/output/return_user
-            _out_default = Path.home() / "Documents" / "Phantom" / "output" / "return_user"
+            # Output always goes to fixed Windows target folder
+            _out_default = Path(r"C:\Users\Ad\Documents\Phantom\output\return_user")
             try:
                 _out_default.mkdir(parents=True, exist_ok=True)
             except Exception:
-                _out_default = Path(p).parent / "return_user"
+                pass
             self._dec_out_full = str(_out_default)
             self._dec_out.set("Phantom/output/return_user")
             self._refresh_bin_display(os.path.basename(p))
@@ -1850,7 +1938,7 @@ class DecryptPage(ctk.CTkFrame):
             self._refresh_key_display(os.path.basename(p))
 
     def _dec_pick_out(self):
-        _init = self._dec_out_full if self._dec_out_full else self._phantom_dir()
+        _init = self._dec_out_full if self._dec_out_full else _phantom_dir("output")
         p = filedialog.askdirectory(title="Select output folder", initialdir=_init)
         if p:
             self._dec_out_full = p                      # real path — never shown
@@ -1862,16 +1950,51 @@ class DecryptPage(ctk.CTkFrame):
                 self._dec_out.set(os.path.basename(p))  # different drive — show folder name
 
     def _dec_open_output(self):
-        # Resolve the real output path (stored internally)
-        d = self._dec_out_full if self._dec_out_full else str(Path(__file__).parent / self._dec_out.get())
-        if os.path.isdir(d):
-            try:
-                if sys.platform == "win32":   subprocess.Popen(f'explorer "{d}"')
-                elif sys.platform == "darwin": subprocess.Popen(["open", d])
-                else:                          subprocess.Popen(["xdg-open", d])
-            except: pass
-        else:
-            self._app._show_toast("⚠  Output folder not found yet", error=True)
+        # Must always open exactly this Windows folder
+        target = Path(r"C:\Users\Ad\Documents\Phantom\output\return_user")
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            if sys.platform == "win32":
+                try:
+                    os.startfile(str(target))  # type: ignore[attr-defined]
+                except Exception:
+                    subprocess.Popen(["explorer", str(target)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception:
+            self._app._show_toast("⚠  Could not open output folder", error=True)
+
+    def _update_dec_result_info(self, result_path: Path, files_out: list):
+        try:
+            path_obj = Path(result_path)
+            if path_obj.is_file():
+                st = path_obj.stat()
+                ext = path_obj.suffix.lower() if path_obj.suffix else "(none)"
+                info = (
+                    f"📄  {path_obj.name}\n"
+                    f"Kind: {_file_kind(path_obj)}  ·  Ext: {ext}\n"
+                    f"Size: {_fmt_size(st.st_size)}  ·  Created: {_fmt_dt(st.st_ctime)}"
+                )
+            else:
+                total_bytes = sum(f.stat().st_size for f in files_out) if files_out else 0
+                latest_ts = max((f.stat().st_mtime for f in files_out), default=time.time())
+                info = (
+                    f"📁  {path_obj.name}\n"
+                    f"Kind: Folder  ·  Items: {len(files_out)}\n"
+                    f"Total: {_fmt_size(total_bytes)}  ·  Updated: {_fmt_dt(latest_ts)}"
+                )
+            self._dec_result_info_lbl.configure(text=info, text_color=C_GREEN)
+            self._dec_result_info_lbl.pack(fill="x", padx=8, pady=(0, 1))
+            self._dec_last_result = str(path_obj)
+        except Exception:
+            pass
 
     # ── MAIN DECRYPT ──────────────────────────────────────────────────────────
     def _dec_start(self):
@@ -1893,6 +2016,7 @@ class DecryptPage(ctk.CTkFrame):
                 text="⚠  No output folder", text_color=C_ORANGE)); return
 
         self.after(0, self._dec_clear_log)
+        self.after(0, lambda: self._dec_result_info_lbl.configure(text="") or self._dec_result_info_lbl.pack_forget())
         self.after(0, lambda: self._dec_btn.configure(state="disabled"))
         self.after(0, lambda: self._dec_status.configure(
             text="Running…", text_color=C_BLUE))
@@ -1946,6 +2070,7 @@ class DecryptPage(ctk.CTkFrame):
                 ev.wait(); time.sleep(0.25)
 
             self._dec_log_msg("\n[OUT]  Decrypting & decompressing…")
+            self._dec_log_msg(f"  [DBG] _phtm_decrypt_3layer callable={callable(_phtm_decrypt_3layer)}")
 
             # ── Step 1: decrypt the entire payload → .zfld bytes ─────────────
             try:
@@ -1993,6 +2118,7 @@ class DecryptPage(ctk.CTkFrame):
             self.after(0, lambda: self._dec_status.configure(
                 text=f"Done — {ok} file(s) decrypted",
                 text_color=C_BLUE))
+            self.after(0, lambda rp=result_path, fo=files_out: self._update_dec_result_info(rp, fo))
             self._app._show_toast(f"✓  Decrypt: {ok} file(s) done")
             self.after(0, lambda: self._dec_btn.configure(state="normal"))
 
