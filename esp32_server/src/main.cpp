@@ -41,14 +41,14 @@
 // ── Cấu hình Node-1 ───────────────────────────────────────────
 #define NODE_ID            1
 
-#define MY_AP_SSID         "ESP32-Node-1"
+#define MY_AP_SSID         "Phantom-1"
 #define MY_AP_PASSWORD     "12345678"
 #define MY_AP_CHANNEL      1
 #define MY_AP_HIDDEN       false
 #define MY_AP_MAX_CON      4
 
 // Node-2 — Node-1 kết nối vào để lấy file (đồng bộ 2 chiều)
-#define NODE2_SSID         "ESP32-Node-2"
+#define NODE2_SSID         "Phantom-2"
 #define NODE2_PASSWORD     "12345678"
 #define NODE2_IP           "192.168.5.1"
 #define NODE2_HTTP_PORT    80
@@ -64,7 +64,7 @@
 #define MY_AP_IP_STR       "192.168.4.1"
 
 // ── Sync interval ─────────────────────────────────────────────
-#define SYNC_INTERVAL_MS   10000UL   // đồng bộ mỗi 10 giây
+#define SYNC_INTERVAL_MS   30000UL   // đồng bộ mỗi 30 giây
 
 WebServer  server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);

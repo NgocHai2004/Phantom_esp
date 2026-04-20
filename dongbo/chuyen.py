@@ -257,7 +257,7 @@ class App(ctk.CTk):
                                         text_color=SUBTLE)
         self._detect_lbl.pack(side="left")
 
-        self._ip_lbl = ctk.CTkLabel(card1, text="Bắt WiFi ESP32-Node-1/2",
+        self._ip_lbl = ctk.CTkLabel(card1, text="Bắt WiFi Phantom-1/2",
                                     font=ctk.CTkFont("Segoe UI", 9),
                                     text_color=MUTED, anchor="w")
         self._ip_lbl.pack(fill="x", padx=16, pady=(0, 14))
@@ -505,7 +505,7 @@ class App(ctk.CTk):
         else:
             self._detect_lbl.configure(text="Chưa kết nối", text_color=SUBTLE)
             self._status_dot.configure(text_color=WARN)
-            self._ip_lbl.configure(text="Bắt WiFi ESP32-Node-1 hoặc Node-2")
+            self._ip_lbl.configure(text="Bắt WiFi Phantom-1 hoặc Phantom-2")
             self._conn_spinner.configure(text="◌", text_color=MUTED)
             self._conn_lbl.configure(text="Đang tìm thiết bị…", text_color=MUTED)
             self._filelist_title.configure(text="Danh sách file")

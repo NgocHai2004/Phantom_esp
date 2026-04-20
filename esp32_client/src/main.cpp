@@ -35,14 +35,14 @@
 #define NODE_ID            2
 
 // AP của Node-2 (laptop kết nối vào đây để lấy file)
-#define MY_AP_SSID         "ESP32-Node-2"
+#define MY_AP_SSID         "Phantom-2"
 #define MY_AP_PASSWORD     "12345678"
 #define MY_AP_CHANNEL      6          // Kênh khác Node-1 (channel 1)
 #define MY_AP_HIDDEN       false      // Không ẩn SSID để Node-1 scan được
 #define MY_AP_MAX_CON      4
 
 // Node-1 cần kết nối để lấy file
-#define NODE1_SSID         "ESP32-Node-1"
+#define NODE1_SSID         "Phantom-1"
 #define NODE1_PASSWORD     "12345678"
 #define NODE1_IP           "192.168.4.1"
 #define NODE1_TCP_PORT     8080
@@ -1107,7 +1107,7 @@ void handleRawTCP(WiFiClient& client) {
 }
 
 // ── Khai báo trước setup() ────────────────────────────────────
-#define SYNC_INTERVAL_MS 10000UL   // đồng bộ mỗi 10 giây
+#define SYNC_INTERVAL_MS 30000UL   // đồng bộ mỗi 30 giây
 
 int countSpiffsFiles() {
   int n = 0;

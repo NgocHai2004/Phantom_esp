@@ -3,8 +3,8 @@ dongbo/auto_sync.py -- Tu dong dong bo khi ket noi WiFi ESP32
 =============================================================
 - Script chay lien tuc (daemon mode)
 - Cu 3 giay kiem tra xem laptop dang ket noi WiFi nao
-- Neu phat hien ket noi vao ESP32-Node-1 (192.168.4.1)
-  hoac ESP32-Node-2 (192.168.5.1) --> sync ngay lap tuc
+- Neu phat hien ket noi vao Phantom-1 (192.168.4.1)
+  hoac Phantom-2 (192.168.5.1) --> sync ngay lap tuc
 - Sau khi sync xong, doi 30s roi kiem tra lai
   (tranh spam request lien tuc)
 - LED ESP32 tu dong nhay 3 cai khi co file moi duoc download
@@ -39,11 +39,11 @@ if sys.platform == "win32":
 
 # ── Cau hinh (dung dict de tranh loi global trong Python) ────────────────────
 CFG = {
-    "node_a_ip"      : "192.168.4.1",  # ESP32-Node-1
-    "node_b_ip"      : "192.168.5.1",  # ESP32-Node-2
+    "node_a_ip"      : "192.168.4.1",  # Phantom-1
+    "node_b_ip"      : "192.168.5.1",  # Phantom-2
     # Ten SSID ESP32 (dung de detect bang netsh)
-    "node_a_ssid"    : "ESP32-Node-1",
-    "node_b_ssid"    : "ESP32-Node-2",
+    "node_a_ssid"    : "Phantom-1",
+    "node_b_ssid"    : "Phantom-2",
     "probe_timeout"  : 1,              # timeout kiem tra node (giay) — giam xuong 1s
     "dl_timeout"     : 20,             # timeout download file (giay)
     "check_interval" : 1,              # giay giua cac lan kiem tra WiFi — giam xuong 1s
@@ -275,7 +275,7 @@ def run_daemon(once: bool = False):
 
             if once:
                 print("")
-                log_warn("Khong ket noi duoc node nao -- hay bat WiFi ESP32-Node-1/2")
+                log_warn("Khong ket noi duoc node nao -- hay bat WiFi Phantom-1/2")
                 return
 
             time.sleep(interval)

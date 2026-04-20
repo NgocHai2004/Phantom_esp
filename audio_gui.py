@@ -480,7 +480,7 @@ class App(ctk.CTk):
         self.after(600, self._auto_refresh)
         threading.Thread(target=self._poll_detect, daemon=True).start()
         self.bind("<FocusIn>", lambda e: None)
-        self._start_auto_sync()
+        # Auto-sync bootstrap disabled: keep manual lifecycle methods available.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ─────────────────────────────────────────────────────────────────────────

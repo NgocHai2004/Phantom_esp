@@ -13,8 +13,8 @@ Logic:
   4. In ket qua ra man hinh
 
 Vi du:
-  - Bat WiFi ESP32-Node-1 -> chay script -> file ve dongbo/
-  - Doi sang WiFi ESP32-Node-2 -> chay lai  -> them file moi (neu co)
+  - Bat WiFi Phantom-1 -> chay script -> file ve dongbo/
+  - Doi sang WiFi Phantom-2 -> chay lai  -> them file moi (neu co)
 =============================================================================
 """
 
@@ -38,8 +38,8 @@ if sys.platform == "win32":
         pass
 
 # ── Cau hinh ──────────────────────────────────────────────────────────────────
-NODE_A_IP       = "192.168.4.1"   # ESP32-Node-1
-NODE_B_IP       = "192.168.5.1"   # ESP32-Node-2
+NODE_A_IP       = "192.168.4.1"   # Phantom-1
+NODE_B_IP       = "192.168.5.1"   # Phantom-2
 HTTP_PORT       = 80
 TIMEOUT_S       = 5               # timeout ket noi HTTP (giay)
 WATCH_INTERVAL  = 15              # giay giua cac lan sync (--watch)
@@ -189,7 +189,7 @@ def detect_and_sync() -> int:
 
     if not status_a and not status_b:
         log_err("Khong ket noi duoc ca 2 node!")
-        log_err("  -> Hay bat WiFi: ESP32-Node-1 hoac ESP32-Node-2 (mat khau: 12345678)")
+        log_err("  -> Hay bat WiFi: Phantom-1 hoac Phantom-2 (mat khau: 12345678)")
 
     return total
 
@@ -265,7 +265,7 @@ def _run_sync(node: str) -> int:
         log_info(f"Chi sync tu Node-A ({NODE_A_IP})...")
         status = probe_node(NODE_A_IP)
         if not status:
-            log_err(f"Node-A ({NODE_A_IP}) offline -- hay bat WiFi ESP32-Node-1")
+            log_err(f"Node-A ({NODE_A_IP}) offline -- hay bat WiFi Phantom-1")
             return 0
         log_ok(f"Node-A: {status.get('ap_ssid','?')}  heap={status.get('free_heap',0)//1024}KB")
         n = sync_from_node(NODE_A_IP, "nodeA")
@@ -275,7 +275,7 @@ def _run_sync(node: str) -> int:
         log_info(f"Chi sync tu Node-B ({NODE_B_IP})...")
         status = probe_node(NODE_B_IP)
         if not status:
-            log_err(f"Node-B ({NODE_B_IP}) offline -- hay bat WiFi ESP32-Node-2")
+            log_err(f"Node-B ({NODE_B_IP}) offline -- hay bat WiFi Phantom-2")
             return 0
         log_ok(f"Node-B: {status.get('ap_ssid','?')}  heap={status.get('free_heap',0)//1024}KB")
         n = sync_from_node(NODE_B_IP, "nodeB")
