@@ -64,7 +64,7 @@
 #define MY_AP_IP_STR       "192.168.4.1"
 
 // ── Sync interval ─────────────────────────────────────────────
-#define SYNC_INTERVAL_MS   30000UL   // đồng bộ mỗi 30 giây
+#define SYNC_INTERVAL_MS   15000UL    // đồng bộ mỗi 15 giây
 
 WebServer  server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);

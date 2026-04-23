@@ -126,6 +126,50 @@ def scan_phantoms(known=_KNOWN_IPS, timeout=2):
     for t in threads: t.join()
     return found
 
+
+def _battery_percent_from_status(status: dict):
+    """Parse battery percent from /status with safe fallbacks.
+
+    Priority:
+      1) battery_percent
+      2) battery_voltage_norm (0..1 or 0..100)
+      3) battery_voltage / battery_pin_voltage / battery_voltage_raw (3.0V..4.2V linear)
+    """
+    if not isinstance(status, dict):
+        return None
+
+    def _as_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    def _clamp_pct(v):
+        if v is None:
+            return None
+        try:
+            return max(0, min(100, int(round(float(v)))))
+        except Exception:
+            return None
+
+    pct = _clamp_pct(status.get("battery_percent"))
+    if pct is not None:
+        return pct
+
+    norm = _as_float(status.get("battery_voltage_norm"))
+    if norm is not None:
+        if norm <= 1.0:
+            return _clamp_pct(norm * 100.0)
+        if norm <= 100.0:
+            return _clamp_pct(norm)
+
+    for key in ("battery_voltage", "battery_pin_voltage", "battery_voltage_raw"):
+        v = _as_float(status.get(key))
+        if v is not None and 2.5 <= v <= 5.5:
+            return _clamp_pct((v - 3.0) * (100.0 / 1.2))
+
+    return None
+
 # ── Telegram White Theme ──────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -155,6 +199,24 @@ C_VIOLET    = "#AF52DE"    # ChaCha20 / purple layer accent
 
 # Section header
 C_SEC_HDR   = "#8E8E93"
+
+def _battery_icon_and_color(batt_pct):
+    """Return battery icon + color by threshold.
+
+    Thresholds:
+      - > 80%   -> green
+      - 20..80% -> white
+      - <= 20%  -> red
+      - None    -> placeholder color (graceful missing battery)
+    """
+    icon = "🔋"
+    if batt_pct is None:
+        return icon, C_TEXT3
+    if batt_pct > 80:
+        return icon, C_GREEN
+    if batt_pct > 20:
+        return icon, C_WHITE
+    return icon, C_RED
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 def _font(size=13, weight="normal"):
@@ -402,6 +464,7 @@ class EncryptPage(ctk.CTkFrame):
         self._spinning   = False
         self._active_ip  = ""
         self._active_name = ""
+        self._active_battery_pct = None
 
         self._build_ui()
         self.after(400, self._start_spinner)
@@ -1126,10 +1189,13 @@ class EncryptPage(ctk.CTkFrame):
         prev: set = set()
         while True:
             results = scan_phantoms()
-            cur = {r[0] for r in results}
-            if cur != prev: prev = cur; self.after(0, self._on_scan_result, results)
+            cur = {(r[0], _battery_percent_from_status(r[3])) for r in results}
+            if cur != prev:
+                prev = cur
+                self.after(0, self._on_scan_result, results)
             if not results and self._active_ip:
-                self._active_ip = ""; self.after(0, self._on_scan_result, [])
+                self._active_ip = ""
+                self.after(0, self._on_scan_result, [])
             time.sleep(4)
 
     def _on_scan_result(self, results):
@@ -1138,20 +1204,54 @@ class EncryptPage(ctk.CTkFrame):
             except: pass
             try: self._app._conn_dot.configure(text_color=C_TEXT3)
             except: pass
-            try: self._ip_lbl.configure(text="Connect to Phantom WiFi")
+            try: self._app._conn_batt_icon.configure(text="", text_color=C_TEXT3)
             except: pass
-            self._active_ip = ""; self._active_name = ""; return
-        ip, nm, l4, _ = results[0]
-        self._active_ip = ip; self._active_name = nm
-        try: self._app._conn_lbl.configure(text=f"{nm}  ONLINE", text_color=C_GREEN)
+            try: self._ip_lbl.configure(text="Connect to Phantom WiFi  ·  Battery: --")
+            except: pass
+            self._active_ip = ""
+            self._active_name = ""
+            self._active_battery_pct = None
+            return
+
+        ip, nm, l4, status = results[0]
+        prev_sig = (self._active_ip, self._active_name, self._active_battery_pct)
+        batt_pct = _battery_percent_from_status(status)
+
+        self._active_ip = ip
+        self._active_name = nm
+        self._active_battery_pct = batt_pct
+
+        batt_text = f"{batt_pct}%" if batt_pct is not None else "--"
+        batt_icon, batt_color = _battery_icon_and_color(batt_pct)
+
+        if nm == "Phantom-1":
+            conn_text = f"{nm}  ONLINE  ·  BAT {batt_text}"
+            ip_text = f"{ip}  ·  KEY …{l4}  ·  Battery: {batt_icon} {batt_text}"
+            try: self._app._conn_batt_icon.configure(text=batt_icon, text_color=batt_color)
+            except: pass
+        elif nm == "Phantom-2":
+            # Phantom-2 hiển thị y hệt Phantom-1 (icon pin + BAT xx%)
+            conn_text = f"{nm}  ONLINE  ·  BAT {batt_text}"
+            ip_text = f"{ip}  ·  KEY …{l4}  ·  Battery: {batt_icon} {batt_text}"
+            try: self._app._conn_batt_icon.configure(text=batt_icon, text_color=batt_color)
+            except: pass
+        else:
+            conn_text = f"{nm}  ONLINE"
+            ip_text = f"{ip}  ·  KEY …{l4}  ·  Battery: {batt_text}"
+            try: self._app._conn_batt_icon.configure(text="", text_color=C_TEXT3)
+            except: pass
+
+        try: self._app._conn_lbl.configure(text=conn_text, text_color=C_GREEN)
         except: pass
         try: self._app._conn_dot.configure(text_color=C_GREEN)
         except: pass
-        try: self._ip_lbl.configure(text=f"{ip}  ·  KEY …{l4}")
+        try: self._ip_lbl.configure(text=ip_text)
         except: pass
         try: self._app._conn_spinner.configure(text="▼", text_color=C_TEXT3)
         except: pass
-        self._log(f"Detected: {nm}")
+
+        if prev_sig[0] != ip or prev_sig[1] != nm:
+            self._log(f"Detected: {nm}")
 
     # ── SAVE ──────────────────────────────────────────────────────────────────
     def _save_bin(self):
@@ -2294,6 +2394,8 @@ class App(ctk.CTk):
         self._conn_dot.pack(side="left", padx=(0, 4))
         self._conn_lbl = ctk.CTkLabel(cr, text="NO SIGNAL", font=_font(11), text_color=C_TEXT3)
         self._conn_lbl.pack(side="left")
+        self._conn_batt_icon = ctk.CTkLabel(cr, text="", font=_font(11), text_color=C_TEXT3)
+        self._conn_batt_icon.pack(side="left", padx=(4, 0))
         self._conn_spinner = ctk.CTkLabel(cr, text="\u25bc", font=_font(10), text_color=C_TEXT3)
         self._conn_spinner.pack(side="left", padx=(4, 0))
 

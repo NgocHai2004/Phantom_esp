@@ -59,6 +59,14 @@
 // IP của AP Node-2
 #define MY_AP_IP_STR       "192.168.5.1"
 
+// ── Battery (ADC) ─────────────────────────────────────────────
+// GPIO34 = ADC1_CH6, input-only, an toàn dùng với WiFi
+// Voltage divider 2 điện trở bằng nhau (100kΩ/100kΩ) → hệ số nhân 2.0
+#define BATTERY_ADC_PIN   34
+#define BATTERY_DIVIDER   2.0f
+#define BATTERY_V_MIN     3.0f
+#define BATTERY_V_MAX     4.2f
+
 WebServer  server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);
 WiFiServer uploadServer(UPLOAD_PORT);
@@ -613,9 +621,31 @@ bool syncFromNode1() {
   return (downloaded > 0 || SPIFFS.usedBytes() > 0);
 }
 
+// ── Battery helpers ───────────────────────────────────────────
+float readBatteryVoltage() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogRead(BATTERY_ADC_PIN); delayMicroseconds(200); }
+  float raw = sum / 16.0f;
+  float vAdc = (raw / 4095.0f) * 3.3f;
+  return vAdc * BATTERY_DIVIDER;
+}
+int batteryPercent(float v) {
+  if (v <= BATTERY_V_MIN) return 0;
+  if (v >= BATTERY_V_MAX) return 100;
+  return (int)(((v - BATTERY_V_MIN) / (BATTERY_V_MAX - BATTERY_V_MIN)) * 100.0f + 0.5f);
+}
+int readBatteryRaw() {
+  uint32_t sum = 0;
+  for (int i = 0; i < 16; i++) { sum += analogRead(BATTERY_ADC_PIN); delayMicroseconds(200); }
+  return (int)(sum / 16);
+}
+
 // ── HTTP Handlers ─────────────────────────────────────────────
 
 void handleStatus() {
+  float _bv = readBatteryVoltage();
+  int   _bp = batteryPercent(_bv);
+  int   _br = readBatteryRaw();
   server.send(200,"application/json",
     String("{\"node\":2") +
     ",\"ap_ssid\":\""        + MY_AP_SSID   + "\"" +
@@ -629,7 +659,10 @@ void handleStatus() {
     ",\"ram_ready\":"        + (ramReady?"true":"false") +
     ",\"ram_size\":"         + String(ramSize) +
     ",\"node_enabled\":"     + (nodeEnabled?"true":"false") +
-    ",\"builtin_wav_size\":" + String(TEST_WAV_SIZE) + "}");
+    ",\"builtin_wav_size\":" + String(TEST_WAV_SIZE) +
+    ",\"battery_voltage\":"     + String(_bv, 2) +
+    ",\"battery_voltage_raw\":" + String(_br) +
+    ",\"battery_percent\":"     + String(_bp) + "}");
 }
 
 void handleFileInfo() {
@@ -1107,7 +1140,7 @@ void handleRawTCP(WiFiClient& client) {
 }
 
 // ── Khai báo trước setup() ────────────────────────────────────
-#define SYNC_INTERVAL_MS 30000UL   // đồng bộ mỗi 30 giây
+#define SYNC_INTERVAL_MS 15000UL    // đồng bộ mỗi 15 giây
 
 int countSpiffsFiles() {
   int n = 0;
@@ -1127,6 +1160,27 @@ void setup() {
   Serial.begin(115200); delay(500);
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   pinMode(BOOT_PIN, INPUT_PULLUP);
+
+  // ── FLASH-SAFE MODE ──
+  // Nếu nút BOOT được giữ trong 5 giây đầu khi boot → KHÔNG khởi tạo WiFi/SPIFFS.
+  // Nhờ đó lần flash kế tiếp sẽ dễ: giữ BOOT lúc cắm USB → ESP idle → esptool bắt tay được.
+  // LED nháy nhanh để báo đang ở safe mode.
+  Serial.println("\n[BOOT] Hold BOOT button to enter flash-safe mode (5s)...");
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000) {
+    if (digitalRead(BOOT_PIN) == LOW) {
+      Serial.println("[BOOT] BOOT held → entering FLASH-SAFE MODE (no WiFi). Reset to exit.");
+      while (true) {
+        digitalWrite(LED_PIN, HIGH); delay(100);
+        digitalWrite(LED_PIN, LOW);  delay(100);
+      }
+    }
+    delay(50);
+  }
+
+  // ── Battery ADC (GPIO34 = ADC1_CH6, an toàn với WiFi) ──
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
 
   Serial.println("\n══════════════════════════════");
   Serial.println(" ESP32 NODE-2  (APSTA + SPIFFS)");
