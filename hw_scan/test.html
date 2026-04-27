@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>ESP32 Thinker UI</title>
+<style>
+body {
+  margin: 0;
+  font-family: "Segoe UI", monospace;
+  background: radial-gradient(circle at top, #0f172a, #020617);
+  color: #e2e8f0;
+}
+
+.container {
+  max-width: 1100px;
+  margin: auto;
+  padding: 20px;
+}
+
+.title {
+  font-size: 28px;
+  margin-bottom: 10px;
+}
+
+.sub {
+  color: #94a3b8;
+  margin-bottom: 20px;
+}
+
+.panel {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(0,255,255,0.1);
+  border-radius: 16px;
+  padding: 15px;
+  margin-bottom: 20px;
+}
+
+input {
+  width: 100%;
+  padding: 8px;
+  border-radius: 10px;
+  border: none;
+  background: rgba(0,0,0,0.4);
+  color: white;
+}
+
+button {
+  padding: 10px 15px;
+  border-radius: 10px;
+  border: none;
+  background: cyan;
+  color: black;
+  cursor: pointer;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px,1fr));
+  gap: 15px;
+}
+
+.card {
+  background: rgba(255,255,255,0.05);
+  border-radius: 16px;
+  padding: 15px;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.badge {
+  background: cyan;
+  color: black;
+  padding: 3px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+}
+
+.small {
+  font-size: 12px;
+  color: #94a3b8;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+  <div class="title">ESP32 Thinker Dashboard</div>
+  <div class="sub">Theo dõi file ghi âm realtime</div>
+
+  <div class="panel">
+    API: <input id="api" value="http://192.168.4.1/sd/list"><br><br>
+    Base: <input id="base" value="http://192.168.4.1/rec"><br><br>
+    <button onclick="loadData()">Tải lại</button>
+  </div>
+
+  <div class="panel">
+    <div>Số file: <b id="count">0</b></div>
+    <div>Dung lượng: <b id="size">0</b></div>
+    <div>File mới: <b id="last">-</b></div>
+  </div>
+
+  <div class="grid" id="list"></div>
+
+</div>
+
+<script>
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + " KB";
+  return (bytes/1024/1024).toFixed(2) + " MB";
+}
+
+async function loadData() {
+  const api = document.getElementById("api").value;
+  const base = document.getElementById("base").value;
+
+  const res = await fetch(api);
+  const data = await res.json();
+
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+
+  let total = 0;
+
+  data.files.forEach(f => {
+    total += f.size;
+
+    const url = base + "/" + f.name;
+
+    const card = document.createElement("div");
+    card.className = "card";
+
+    card.innerHTML = `
+      <div><b>${f.name}</b></div>
+      <div class="small">${formatBytes(f.size)}</div>
+      <br>
+      <a href="${url}" target="_blank"><button>Mở</button></a>
+      <a href="${url}" download><button>Tải</button></a>
+      ${data.last === f.name ? "<div class='badge'>Mới</div>" : ""}
+    `;
+
+    list.appendChild(card);
+  });
+
+  document.getElementById("count").innerText = data.files.length;
+  document.getElementById("size").innerText = formatBytes(total);
+  document.getElementById("last").innerText = data.last || "-";
+}
+
+loadData();
+
+</script>
+
+</body>
+</html>

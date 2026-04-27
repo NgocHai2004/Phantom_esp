@@ -1,28 +1,44 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
+#include <SPIFFS.h>
 #include <FS.h>
-#include <SD.h>
-#include <SPI.h>
-#include "mbedtls/base64.h"
 
 #define I2S_WS 25
 #define I2S_SD 22
 #define I2S_SCK 26
+
 #define I2S_PORT I2S_NUM_0
 
 #define SAMPLE_RATE 16000
 #define SAMPLE_BITS 16
 #define RECORD_TIME_SEC 5
+#define WAV_FILE "/record.wav"
 #define I2S_READ_LEN 1024
-#define LED_PIN 2
 
-// SD card pins
-#define SD_CS 5
-#define SD_SCK 18
-#define SD_MISO 19
-#define SD_MOSI 23
+static const char b64_alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-String currentWavFile = "/record.wav";
+void base64EncodeAndPrint(Stream &out, const uint8_t *data, size_t len)
+{
+  char encoded[5];
+  encoded[4] = '\0';
+
+  for (size_t i = 0; i < len; i += 3)
+  {
+    uint32_t octet_a = i < len ? data[i] : 0;
+    uint32_t octet_b = (i + 1) < len ? data[i + 1] : 0;
+    uint32_t octet_c = (i + 2) < len ? data[i + 2] : 0;
+
+    uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+    encoded[0] = b64_alphabet[(triple >> 18) & 0x3F];
+    encoded[1] = b64_alphabet[(triple >> 12) & 0x3F];
+    encoded[2] = ((i + 1) < len) ? b64_alphabet[(triple >> 6) & 0x3F] : '=';
+    encoded[3] = ((i + 2) < len) ? b64_alphabet[triple & 0x3F] : '=';
+
+    out.print(encoded);
+  }
+}
 
 void writeWavHeader(File file, uint32_t dataSize, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels)
 {
@@ -33,22 +49,22 @@ void writeWavHeader(File file, uint32_t dataSize, uint32_t sampleRate, uint16_t 
   file.seek(0);
 
   file.write((const uint8_t *)"RIFF", 4);
-  file.write((const uint8_t *)&chunkSize, 4);
+  file.write((uint8_t *)&chunkSize, 4);
   file.write((const uint8_t *)"WAVE", 4);
 
   file.write((const uint8_t *)"fmt ", 4);
   uint32_t subchunk1Size = 16;
   uint16_t audioFormat = 1;
-  file.write((const uint8_t *)&subchunk1Size, 4);
-  file.write((const uint8_t *)&audioFormat, 2);
-  file.write((const uint8_t *)&channels, 2);
-  file.write((const uint8_t *)&sampleRate, 4);
-  file.write((const uint8_t *)&byteRate, 4);
-  file.write((const uint8_t *)&blockAlign, 2);
-  file.write((const uint8_t *)&bitsPerSample, 2);
+  file.write((uint8_t *)&subchunk1Size, 4);
+  file.write((uint8_t *)&audioFormat, 2);
+  file.write((uint8_t *)&channels, 2);
+  file.write((uint8_t *)&sampleRate, 4);
+  file.write((uint8_t *)&byteRate, 4);
+  file.write((uint8_t *)&blockAlign, 2);
+  file.write((uint8_t *)&bitsPerSample, 2);
 
   file.write((const uint8_t *)"data", 4);
-  file.write((const uint8_t *)&dataSize, 4);
+  file.write((uint8_t *)&dataSize, 4);
 }
 
 void setupI2S()
@@ -72,80 +88,39 @@ void setupI2S()
       .data_out_num = I2S_PIN_NO_CHANGE,
       .data_in_num = I2S_SD};
 
-  esp_err_t e1 = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  esp_err_t e2 = i2s_set_pin(I2S_PORT, &pin_config);
-
-  if (e1 != ESP_OK || e2 != ESP_OK)
-  {
-    Serial.printf("[ERR] I2S init fail install=%d setpin=%d\n", e1, e2);
-    while (1)
-      delay(1000);
-  }
-
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
   i2s_zero_dma_buffer(I2S_PORT);
 }
 
-bool setupSD()
+void listFiles()
 {
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-
-  if (!SD.begin(SD_CS, SPI))
-  {
-    Serial.println("[SD] Mount fail");
-    return false;
-  }
-
-  uint8_t cardType = SD.cardType();
-  if (cardType == CARD_NONE)
-  {
-    Serial.println("[SD] No card");
-    return false;
-  }
-
-  uint64_t sizeMB = SD.cardSize() / (1024 * 1024);
-  Serial.printf("[SD] OK, size=%llu MB\n", sizeMB);
-  return true;
-}
-
-void printHelp()
-{
-  Serial.println("CMD: help | sdinfo | ls | rec | dump <file>");
-}
-
-void listFiles(fs::FS &fs, const char *dirname)
-{
-  File root = fs.open(dirname);
-  if (!root || !root.isDirectory())
-  {
-    Serial.println("[LS] Open dir fail");
-    return;
-  }
-
-  Serial.println("[LS_BEGIN]");
+  File root = SPIFFS.open("/");
   File file = root.openNextFile();
+
+  Serial.println("Danh sach file:");
   while (file)
   {
-    if (!file.isDirectory())
-    {
-      Serial.printf("%s\t%u\n", file.name(), (unsigned)file.size());
-    }
+    Serial.print(" - ");
+    Serial.print(file.name());
+    Serial.print(" (");
+    Serial.print(file.size());
+    Serial.println(" bytes)");
     file = root.openNextFile();
   }
-  Serial.println("[LS_END]");
-  Serial.flush();
 }
 
-void recordWavToSD(const char *path)
+void recordWav()
 {
-  if (SD.exists(path))
+  if (SPIFFS.exists(WAV_FILE))
   {
-    SD.remove(path);
+    SPIFFS.remove(WAV_FILE);
   }
 
-  File audioFile = SD.open(path, FILE_WRITE);
+  File audioFile = SPIFFS.open(WAV_FILE, FILE_WRITE);
   if (!audioFile)
   {
-    Serial.println("[REC] Cannot open file");
+    Serial.println("Khong mo duoc file de ghi");
     return;
   }
 
@@ -158,44 +133,28 @@ void recordWavToSD(const char *path)
   uint32_t totalSamplesNeeded = SAMPLE_RATE * RECORD_TIME_SEC;
   uint32_t samplesRecorded = 0;
 
-  int32_t pcmMin = 32767;
-  int32_t pcmMax = -32768;
-
-  Serial.println("[REC_BEGIN]");
-  Serial.flush();
-  digitalWrite(LED_PIN, HIGH);
+  Serial.println("REC_START");
+  Serial.println("Noi vao mic trong 5 giay...");
 
   while (samplesRecorded < totalSamplesNeeded)
   {
     if (i2s_read(I2S_PORT, (void *)i2sData, I2S_READ_LEN, &bytesRead, portMAX_DELAY) != ESP_OK)
     {
-      Serial.println("[REC] i2s_read fail");
+      Serial.println("Loi i2s_read");
       break;
     }
 
     int32_t *samples32 = (int32_t *)i2sData;
     int sampleCount = bytesRead / 4;
 
-    int64_t sum = 0;
-    for (int i = 0; i < sampleCount; i++)
-    {
-      sum += samples32[i];
-    }
-    int32_t dc = sampleCount ? (int32_t)(sum / sampleCount) : 0;
-
     for (int i = 0; i < sampleCount && samplesRecorded < totalSamplesNeeded; i++)
     {
-      int32_t s32 = (samples32[i] - dc) >> 13;
+      int32_t s32 = samples32[i] >> 14; // tang gain vua phai
       if (s32 > 32767)
         s32 = 32767;
       if (s32 < -32768)
         s32 = -32768;
-
       int16_t s16 = (int16_t)s32;
-      if (s16 < pcmMin)
-        pcmMin = s16;
-      if (s16 > pcmMax)
-        pcmMax = s16;
 
       audioFile.write((uint8_t *)&s16, sizeof(s16));
       totalDataBytes += sizeof(s16);
@@ -204,125 +163,99 @@ void recordWavToSD(const char *path)
   }
 
   writeWavHeader(audioFile, totalDataBytes, SAMPLE_RATE, SAMPLE_BITS, 1);
-  audioFile.flush();
   audioFile.close();
 
-  digitalWrite(LED_PIN, LOW);
-  Serial.printf("[REC_DONE] %s size=%u min=%ld max=%ld\n",
-                path, (unsigned)(totalDataBytes + 44), (long)pcmMin, (long)pcmMax);
-  Serial.flush();
+  File f = SPIFFS.open(WAV_FILE, FILE_READ);
+  if (f)
+  {
+    Serial.print("REC_DONE size=");
+    Serial.println(f.size());
+    f.close();
+  }
+  else
+  {
+    Serial.println("REC_DONE but cannot reopen file");
+  }
 }
 
-void dumpFileBase64(const char *path)
+void dumpWavBase64()
 {
-  File f = SD.open(path, FILE_READ);
+  File f = SPIFFS.open(WAV_FILE, FILE_READ);
   if (!f)
   {
-    Serial.printf("[ERR] File not found: %s\n", path);
-    Serial.flush();
+    Serial.println("Khong tim thay /record.wav");
     return;
   }
 
-  uint32_t fileSize = (uint32_t)f.size();
-  Serial.printf("[DUMP] %s size=%u\n", path, fileSize);
-  Serial.printf("WAV_BEGIN %u\n", fileSize);
-  Serial.flush();
+  Serial.println("WAV_BASE64_BEGIN");
 
   const size_t bufSize = 384;
   uint8_t buf[bufSize];
-  unsigned char outB64[600];
-  size_t outLen = 0;
 
   while (f.available())
   {
     size_t n = f.read(buf, bufSize);
-    if (n == 0)
-      break;
-
-    int rc = mbedtls_base64_encode(outB64, sizeof(outB64), &outLen, buf, n);
-    if (rc != 0)
-    {
-      Serial.printf("[ERR] base64 encode fail rc=%d\n", rc);
-      break;
-    }
-
-    Serial.write(outB64, outLen);
-    Serial.write('\n');
-    Serial.flush();
+    base64EncodeAndPrint(Serial, buf, n);
+    Serial.println();
     delay(2);
   }
 
-  Serial.println("WAV_END");
-  Serial.flush();
+  Serial.println("WAV_BASE64_END");
   f.close();
 }
 
-void processCommand(String cmd)
+void printHelp()
 {
-  cmd.trim();
-  if (!cmd.length())
-    return;
-
-  if (cmd == "help")
-  {
-    printHelp();
-    Serial.flush();
-    return;
-  }
-
-  if (cmd == "sdinfo")
-  {
-    setupSD();
-    Serial.flush();
-    return;
-  }
-
-  if (cmd == "ls")
-  {
-    listFiles(SD, "/");
-    return;
-  }
-
-  if (cmd == "rec")
-  {
-    currentWavFile = "/record_" + String((uint32_t)millis()) + ".wav";
-    recordWavToSD(currentWavFile.c_str());
-    return;
-  }
-
-  if (cmd.startsWith("dump "))
-  {
-    String path = cmd.substring(5);
-    path.trim();
-    if (!path.startsWith("/"))
-      path = "/" + path;
-    dumpFileBase64(path.c_str());
-    return;
-  }
-
-  Serial.printf("[ERR] Unknown cmd: %s\n", cmd.c_str());
-  Serial.flush();
+  Serial.println();
+  Serial.println("Lenh:");
+  Serial.println("  r : ghi 5 giay vao /record.wav");
+  Serial.println("  d : dump /record.wav dang base64");
+  Serial.println("  l : liet ke file");
+  Serial.println("  h : help");
+  Serial.println();
 }
 
 void setup()
 {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
   delay(1500);
 
-  Serial.println("\nESP32 MIC + SD TEST");
+  Serial.println();
+  Serial.println("INMP441 WAV Recorder + Dump");
+
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("Mount SPIFFS that bai");
+    while (1)
+      delay(1000);
+  }
+
   setupI2S();
-  setupSD();
   printHelp();
-  Serial.flush();
+  listFiles();
 }
 
 void loop()
 {
   if (Serial.available())
   {
-    String cmd = Serial.readStringUntil('\n');
-    processCommand(cmd);
+    char c = Serial.read();
+
+    if (c == 'r' || c == 'R')
+    {
+      recordWav();
+    }
+    else if (c == 'd' || c == 'D')
+    {
+      dumpWavBase64();
+    }
+    else if (c == 'l' || c == 'L')
+    {
+      listFiles();
+    }
+    else if (c == 'h' || c == 'H')
+    {
+      printHelp();
+    }
   }
 }

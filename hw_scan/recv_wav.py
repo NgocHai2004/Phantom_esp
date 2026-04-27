@@ -5,7 +5,7 @@ import os
 import time
 import subprocess
 
-PORT = "COM7"
+PORT = "COM12"
 BAUD = 115200
 OUT_FILE = "record.wav"
 
