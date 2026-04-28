@@ -58,7 +58,7 @@
 #define AUDIO_WAV_PATH "/audio.wav"
 #define MAX_FILE_SIZE 50000000 // 50 MB for SD
 #define MY_AP_IP_STR "192.168.5.1"
-#define SYNC_INTERVAL_MS 60000UL
+#define SYNC_INTERVAL_MS 60000UL // disabled: handleAutoSync() is not called
 
 // ── I2S MIC ───────────────────────────────────────────────────
 #define I2S_WS 25
@@ -142,8 +142,13 @@ int countSdFiles();
 String formatUptime(uint32_t ms);
 bool syncFromNode1();
 bool isPeerBusy();
+void restorePhantom2AP();
+String httpGetFromNode1(const char *path, int timeoutMs);
 void handleBusy();
 void handleAutoSync();
+void markLocalFileChanged(const String &reason);
+void handlePrioritySync();
+bool requestPeerPullSync();
 // ── State ─────────────────────────────────────────────────────
 bool nodeEnabled = true; // Luon bat, da bo chuc nang nut BOOT bat/tat node
 
@@ -155,13 +160,19 @@ bool recordingInProgress = false;
 uint32_t micFileCounter = 0;
 String lastMicWavFile = "none";
 unsigned long lastMicTriggerMs = 0;
+unsigned long lastRecordLoudMs = 0; // dung ghi am sau 30s khong con am lon
 
 // ── Sync state ────────────────────────────────────────────────
 bool syncDone = false;
 bool syncFailed = false;
 String syncMsg = "not started";
 bool syncInProgress = false;
+bool syncPending = false;               // Co file local moi/cap nhat can dong bo sang Phantom-1
+bool peerSyncRequestInProgress = false; // Dang yeu cau Phantom-1 keo file ve
+String syncPendingReason = "none";
 unsigned long lastAutoSyncMs = 0;
+unsigned long lastPrioritySyncAttemptMs = 0;
+uint8_t prioritySyncFailCount = 0;
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -547,20 +558,33 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_
   size_t bytesRead = 0;
   uint32_t totalDataBytes = 0;
   uint32_t samplesRecorded = 0;
-  uint32_t totalSamplesNeeded = (MIC_SAMPLE_RATE * durationMs) / 1000UL;
+  uint32_t maxSamplesAllowed = ((MAX_FILE_SIZE - 44UL) / 2UL); // chong file qua lon
 
   int recPeak14 = 0;
   int recPeak15 = 0;
   unsigned long lastRecLogMs = millis();
+  lastRecordLoudMs = millis();
 
   digitalWrite(LED_PIN, HIGH);
-  Serial.printf("[MIC] REC START: %s\n", path);
+  Serial.printf("[MIC] REC START: %s (stop after %lu ms silence)\n", path, (unsigned long)durationMs);
 
-  while (samplesRecorded < totalSamplesNeeded)
+  while (true)
   {
     server.handleClient();
     if (!nodeEnabled)
       break;
+
+    if (millis() - lastRecordLoudMs >= durationMs)
+    {
+      Serial.println("[MIC] Silence timeout -> stop recording");
+      break;
+    }
+
+    if (samplesRecorded >= maxSamplesAllowed)
+    {
+      Serial.println("[MIC] Max file size reached -> stop recording");
+      break;
+    }
 
     if (i2s_read(I2S_PORT, (void *)i2sData, MIC_I2S_READ_LEN, &bytesRead, portMAX_DELAY) != ESP_OK)
     {
@@ -571,9 +595,12 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_
     int32_t *samples32 = (int32_t *)i2sData;
     int sampleCount = bytesRead / 4;
 
+    int64_t frameSumSq15 = 0;
+    int framePeak15 = 0;
+
     // Kieu ghi am giong code test: 32-bit I2S -> shift >> 14 -> int16 WAV
-    // Đồng thời log peak khi đang ghi để biết file ghi có biên độ bao nhiêu.
-    for (int i = 0; i < sampleCount && samplesRecorded < totalSamplesNeeded; i++)
+    // Trong khi ghi, neu frame van co am lon thi reset bo dem im lang.
+    for (int i = 0; i < sampleCount && samplesRecorded < maxSamplesAllowed; i++)
     {
       int32_t raw = samples32[i];
 
@@ -595,6 +622,9 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_
         recPeak14 = a14;
       if (a15 > recPeak15)
         recPeak15 = a15;
+      if (a15 > framePeak15)
+        framePeak15 = a15;
+      frameSumSq15 += (int64_t)s15 * (int64_t)s15;
 
       int16_t s16 = (int16_t)s14;
       audioFile.write((uint8_t *)&s16, sizeof(s16));
@@ -603,12 +633,18 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_
       samplesRecorded++;
     }
 
+    int frameRms15 = (sampleCount > 0) ? (int)sqrt((float)frameSumSq15 / (float)sampleCount) : 0;
+    if (frameRms15 >= MIC_TRIGGER_RMS_LEVEL || framePeak15 >= (MIC_TRIGGER_RMS_LEVEL * 2))
+    {
+      lastRecordLoudMs = millis();
+    }
+
     if (millis() - lastRecLogMs >= REC_LOG_INTERVAL_MS)
     {
-      Serial.printf("[MIC] REC LOG peak14=%d peak15=%d samples=%lu/%lu\n",
-                    recPeak14, recPeak15,
-                    (unsigned long)samplesRecorded,
-                    (unsigned long)totalSamplesNeeded);
+      Serial.printf("[MIC] REC LOG peak14=%d peak15=%d rms15=%d silence_ms=%lu samples=%lu\n",
+                    recPeak14, recPeak15, frameRms15,
+                    (unsigned long)(millis() - lastRecordLoudMs),
+                    (unsigned long)samplesRecorded);
       recPeak14 = 0;
       recPeak15 = 0;
       lastRecLogMs = millis();
@@ -654,6 +690,10 @@ void handleAutoMicRecord()
   if (!micReady || !sdReady || recordingInProgress || !micArmed)
     return;
 
+  // Sync duoc uu tien hon ghi am
+  if (syncPending || syncInProgress || peerSyncRequestInProgress)
+    return;
+
   if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS)
     return;
 
@@ -691,18 +731,12 @@ void handleAutoMicRecord()
     Serial.printf("[FLOW] Human-like voice trigger peak13=%d peak15=%d rms15=%d zcr=%d\n",
                   st.peak13, st.peak15, st.rms15, st.zcr);
 
-    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS);
+    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS); // 30s im lang thi dung
 
     if (ok)
     {
-      Serial.println("[FLOW] Record done -> sync Phantom-1 once");
-      syncDone = syncFromNode1();
-      syncFailed = !syncDone;
-
-      if (syncDone)
-        Serial.println("[FLOW] Sync Phantom-1 OK");
-      else
-        Serial.println("[FLOW] Phantom-1 not found or sync failed -> skip");
+      Serial.println("[FLOW] Record done -> priority peer sync");
+      markLocalFileChanged("mic record " + path);
     }
     else
     {
@@ -711,10 +745,192 @@ void handleAutoMicRecord()
   }
 }
 
+// ── Priority sync: khi SD co file local moi/cap nhat thi bao Phantom-1 keo ve ──
+void markLocalFileChanged(const String &reason)
+{
+  if (!sdReady)
+    return;
+
+  syncPending = true;
+  syncPendingReason = reason;
+  prioritySyncFailCount = 0;
+  syncMsg = "pending peer sync: " + reason;
+
+  // Uu tien dong bo: khoa trigger ghi am cho den khi dong bo xong
+  micArmed = false;
+
+  Serial.println("[PrioritySync] Pending -> " + reason);
+}
+
+bool requestPeerPullSync()
+{
+  if (!sdReady || recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+    return false;
+
+  peerSyncRequestInProgress = true;
+  syncMsg = "priority: ask Phantom-1 to pull files";
+
+  Serial.println("[PrioritySync] Connect Phantom-1 and POST /sync");
+
+  WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  {
+    unsigned long tw = millis();
+    while (millis() - tw < 300)
+    {
+      server.handleClient();
+      delay(5);
+    }
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("\n[PrioritySync] Phantom-1 not found");
+    syncMsg = "pending: Phantom-1 not found";
+    WiFi.disconnect(false);
+    restorePhantom2AP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  // Neu peer dang ban thi giu pending va thu lai sau
+  String busyBody = httpGetFromNode1("/busy", 3000);
+  if (busyBody.indexOf("\"busy\":true") >= 0 ||
+      busyBody.indexOf("\"recording\":true") >= 0 ||
+      busyBody.indexOf("\"sync_in_progress\":true") >= 0)
+  {
+    Serial.println("[PrioritySync] Phantom-1 busy -> retry later");
+    syncMsg = "pending: Phantom-1 busy";
+    WiFi.disconnect(false);
+    restorePhantom2AP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  WiFiClient c;
+  bool ok = false;
+  if (c.connect(NODE1_IP, NODE1_HTTP_PORT))
+  {
+    c.printf("POST /sync HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", NODE1_IP);
+
+    unsigned long t = millis();
+    String resp = "";
+    while ((c.connected() || c.available()) && (millis() - t) < 15000)
+    {
+      server.handleClient(); // cho Phantom-1 co the keo /file/list va /file/download tu node nay
+      if (c.available())
+      {
+        char ch = (char)c.read();
+        resp += ch;
+        t = millis();
+        if (resp.indexOf("\r\n\r\n") >= 0 && resp.indexOf("\"status\":\"ok\"") >= 0)
+        {
+          ok = true;
+          break;
+        }
+      }
+      else
+      {
+        delay(5);
+      }
+    }
+    c.stop();
+  }
+
+  if (!ok)
+  {
+    Serial.println("[PrioritySync] POST /sync failed or timeout");
+    syncMsg = "pending: trigger Phantom-1 sync failed";
+    WiFi.disconnect(false);
+    restorePhantom2AP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  // Doi Phantom-1 sync xong. Trong luc doi van handleClient de peer tai file.
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 70000UL)
+  {
+    server.handleClient();
+    String b = httpGetFromNode1("/busy", 2500);
+    if (b.length() > 0 &&
+        b.indexOf("\"busy\":true") < 0 &&
+        b.indexOf("\"sync_in_progress\":true") < 0)
+    {
+      ok = true;
+      break;
+    }
+    delay(250);
+  }
+
+  WiFi.disconnect(false);
+  restorePhantom2AP();
+
+  peerSyncRequestInProgress = false;
+
+  if (ok)
+  {
+    syncPending = false;
+    syncDone = true;
+    syncFailed = false;
+    syncMsg = "ok: peer pulled latest local files";
+    syncPendingReason = "none";
+    prioritySyncFailCount = 0;
+    Serial.println("[PrioritySync] Done -> recording can run again");
+    return true;
+  }
+
+  syncMsg = "pending: wait Phantom-1 sync timeout";
+  syncFailed = true;
+  return false;
+}
+
+void handlePrioritySync()
+{
+  if (!syncPending)
+    return;
+
+  // Uu tien dong bo hon ghi am: khi pending thi khong cho mic arm
+  micArmed = false;
+
+  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+    return;
+
+  // Chong retry qua day neu peer khong tim thay/ban
+  if (millis() - lastPrioritySyncAttemptMs < 3000UL)
+    return;
+  lastPrioritySyncAttemptMs = millis();
+
+  bool ok = requestPeerPullSync();
+  if (!ok)
+  {
+    prioritySyncFailCount++;
+    Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+
+    if (prioritySyncFailCount >= 3)
+    {
+      Serial.println("[PrioritySync] Peer not reachable after 3 tries -> cancel pending sync and allow recording");
+      syncPending = false;
+      peerSyncRequestInProgress = false;
+      syncFailed = true;
+      syncDone = false;
+      syncPendingReason = "none";
+      syncMsg = "cancelled: Phantom-1 not reachable after 3 tries";
+      prioritySyncFailCount = 0;
+      micArmed = true;
+      lastMicTriggerMs = millis();
+      restorePhantom2AP();
+    }
+  }
+}
+
 void handleBusy()
 {
-  bool busy = recordingInProgress || syncInProgress;
-  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : "idle");
+  bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress;
+  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle"));
   String j = "{\"node\":2";
   j += ",\"busy\":" + String(busy ? "true" : "false");
   j += ",\"recording\":" + String(recordingInProgress ? "true" : "false");
@@ -1840,6 +2056,9 @@ void handleFileUpload()
     }
   }
 
+  if (saved)
+    markLocalFileChanged("HTTP upload " + saveAs);
+
   Serial.printf("[Upload] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
   blinkLED(saved ? 5 : 2, 80);
 
@@ -2083,6 +2302,9 @@ void handleRawUpload(WiFiClient &cli)
     }
   }
 
+  if (saved)
+    markLocalFileChanged("TCP8081 upload " + saveAs);
+
   blinkLED(saved ? 5 : 2, 80);
   Serial.printf("[Upload8081] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
 
@@ -2206,6 +2428,9 @@ void handleRawTCP(WiFiClient &client)
       if (saveAs.length() == 0)
         saveAs = genAutoFilename();
       bool sv = sdSaveAs(buf, rx, "/" + saveAs);
+      if (sv)
+        markLocalFileChanged("TCP8080 upload " + saveAs);
+
       if (sv && saveAs == "audio.wav")
       {
         if (ramBuf)
@@ -2326,7 +2551,7 @@ void setup()
   Serial.printf("[SD] Danh sach hien co: %d file. Khong sync khi khoi dong.\n", fc);
   syncDone = false;
   syncFailed = false;
-  syncMsg = "ready: auto sync every 60s + sync after each recording";
+  syncMsg = "ready: priority sync after any local file write";
 
   Serial.println("\n[Sẵn sàng] Node-2 (Thiết bị B) — Endpoints:");
   Serial.printf("  Kết nối WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
@@ -2336,7 +2561,7 @@ void setup()
   Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
   Serial.printf("  POST http://%s/sync\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
-  Serial.println("  Auto record: sound trigger -> record 30s -> sync Phantom-1 once");
+  Serial.println("  Priority sync: any local file write -> ask Phantom-1 to pull; recording waits until sync done");
   Serial.println("  BOOT button toggle: DISABLED");
 }
 
@@ -2344,10 +2569,14 @@ void setup()
 void loop()
 {
   server.handleClient();
-  handleAutoMicRecord();
-  handleAutoSync();
 
-  if (!micArmed && !recordingInProgress)
+  // Priority sync chay truoc mic va auto-sync dinh ky
+  handlePrioritySync();
+  handleAutoMicRecord();
+  // AutoSync disabled: only sync when upload or recording marks syncPending.
+  // handleAutoSync();
+
+  if (!micArmed && !recordingInProgress && !syncPending && !syncInProgress && !peerSyncRequestInProgress)
   {
     MicVoiceStats st = readMicVoiceStats();
     if (st.rms15 < MIC_REARM_RMS_LEVEL)

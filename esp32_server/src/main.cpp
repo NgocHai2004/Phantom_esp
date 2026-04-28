@@ -65,7 +65,7 @@
 #define AUDIO_WAV_PATH "/audio.wav"
 #define MAX_FILE_SIZE 50000000
 #define MY_AP_IP_STR "192.168.4.1"
-#define AUTO_SYNC_INTERVAL_MS 60000UL
+#define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: handleAutoSync() is not called
 
 // ── SD card ───────────────────────────────────────────────────
 #define SD_CS 5
@@ -97,7 +97,12 @@ bool syncDone = false;
 bool syncFailed = false;
 String syncMsg = "not started";
 bool syncInProgress = false;
+bool syncPending = false;               // Co file local moi/cap nhat can dong bo sang Phantom-2
+bool peerSyncRequestInProgress = false; // Dang yeu cau Phantom-2 keo file ve
+String syncPendingReason = "none";
 unsigned long lastAutoSyncMs = 0;
+unsigned long lastPrioritySyncAttemptMs = 0;
+uint8_t prioritySyncFailCount = 0;
 
 // ── Function prototypes ───────────────────────────────────────
 bool setupSDCard();
@@ -105,9 +110,13 @@ int countSdFiles();
 String formatUptime(uint32_t ms);
 bool syncFromPeer();
 void restoreMyAP();
+String httpGetFromPeer(const char *path, int timeoutMs);
 bool isPeerBusy();
 void handleBusy();
 void handleAutoSync();
+void markLocalFileChanged(const String &reason);
+void handlePrioritySync();
+bool requestPeerPullSync();
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -1409,6 +1418,9 @@ void handleFileUpload()
     }
   }
 
+  if (saved)
+    markLocalFileChanged("HTTP upload " + saveAs);
+
   Serial.printf("[Upload] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
   blinkLED(saved ? 5 : 2, 80);
 
@@ -1536,13 +1548,186 @@ void handleSync()
 
 void handleBusy()
 {
+  bool busy = syncInProgress || peerSyncRequestInProgress;
   String j = "{\"node\":1";
-  j += ",\"busy\":" + String(syncInProgress ? "true" : "false");
+  j += ",\"busy\":" + String(busy ? "true" : "false");
   j += ",\"recording\":false";
   j += ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false");
-  j += ",\"reason\":\"" + String(syncInProgress ? "syncing" : "idle") + "\"";
+  j += ",\"peer_sync_request_in_progress\":" + String(peerSyncRequestInProgress ? "true" : "false");
+  j += ",\"reason\":\"" + String(syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle")) + "\"";
   j += ",\"sync_msg\":\"" + syncMsg + "\"}";
   server.send(syncInProgress ? 423 : 200, "application/json", j);
+}
+
+// ── Priority sync: khi SD co file local moi/cap nhat thi bao Phantom-2 keo ve ──
+void markLocalFileChanged(const String &reason)
+{
+  if (!sdReady)
+    return;
+
+  syncPending = true;
+  syncPendingReason = reason;
+  prioritySyncFailCount = 0;
+  syncMsg = "pending peer sync: " + reason;
+  Serial.println("[PrioritySync] Pending -> " + reason);
+}
+
+bool requestPeerPullSync()
+{
+  if (!sdReady || syncInProgress || peerSyncRequestInProgress)
+    return false;
+
+  peerSyncRequestInProgress = true;
+  syncMsg = "priority: ask Phantom-2 to pull files";
+
+  Serial.println("[PrioritySync] Connect Phantom-2 and POST /sync");
+
+  WiFi.begin(PEER_SSID, PEER_PASSWORD);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  {
+    unsigned long tw = millis();
+    while (millis() - tw < 300)
+    {
+      server.handleClient();
+      delay(5);
+    }
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("\n[PrioritySync] Phantom-2 not found");
+    syncMsg = "pending: Phantom-2 not found";
+    WiFi.disconnect(false);
+    restoreMyAP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  String busyBody = httpGetFromPeer("/busy", 3000);
+  if (busyBody.indexOf("\"busy\":true") >= 0 ||
+      busyBody.indexOf("\"recording\":true") >= 0 ||
+      busyBody.indexOf("\"sync_in_progress\":true") >= 0)
+  {
+    Serial.println("[PrioritySync] Phantom-2 busy -> retry later");
+    syncMsg = "pending: Phantom-2 busy";
+    WiFi.disconnect(false);
+    restoreMyAP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  WiFiClient c;
+  bool ok = false;
+  if (c.connect(PEER_IP, PEER_HTTP_PORT))
+  {
+    c.printf("POST /sync HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", PEER_IP);
+
+    unsigned long t = millis();
+    String resp = "";
+    while ((c.connected() || c.available()) && (millis() - t) < 15000)
+    {
+      server.handleClient(); // cho Phantom-2 co the keo /file/list va /file/download tu node nay
+      if (c.available())
+      {
+        char ch = (char)c.read();
+        resp += ch;
+        t = millis();
+        if (resp.indexOf("\r\n\r\n") >= 0 && resp.indexOf("\"status\":\"ok\"") >= 0)
+        {
+          ok = true;
+          break;
+        }
+      }
+      else
+      {
+        delay(5);
+      }
+    }
+    c.stop();
+  }
+
+  if (!ok)
+  {
+    Serial.println("[PrioritySync] POST /sync failed or timeout");
+    syncMsg = "pending: trigger Phantom-2 sync failed";
+    WiFi.disconnect(false);
+    restoreMyAP();
+    peerSyncRequestInProgress = false;
+    return false;
+  }
+
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 70000UL)
+  {
+    server.handleClient();
+    String b = httpGetFromPeer("/busy", 2500);
+    if (b.length() > 0 &&
+        b.indexOf("\"busy\":true") < 0 &&
+        b.indexOf("\"sync_in_progress\":true") < 0 &&
+        b.indexOf("\"recording\":true") < 0)
+    {
+      ok = true;
+      break;
+    }
+    delay(250);
+  }
+
+  WiFi.disconnect(false);
+  restoreMyAP();
+
+  peerSyncRequestInProgress = false;
+
+  if (ok)
+  {
+    syncPending = false;
+    syncDone = true;
+    syncFailed = false;
+    syncMsg = "ok: peer pulled latest local files";
+    syncPendingReason = "none";
+    prioritySyncFailCount = 0;
+    Serial.println("[PrioritySync] Done");
+    return true;
+  }
+
+  syncMsg = "pending: wait Phantom-2 sync timeout";
+  syncFailed = true;
+  return false;
+}
+
+void handlePrioritySync()
+{
+  if (!syncPending)
+    return;
+
+  if (syncInProgress || peerSyncRequestInProgress)
+    return;
+
+  if (millis() - lastPrioritySyncAttemptMs < 3000UL)
+    return;
+  lastPrioritySyncAttemptMs = millis();
+
+  bool ok = requestPeerPullSync();
+  if (!ok)
+  {
+    prioritySyncFailCount++;
+    Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+
+    if (prioritySyncFailCount >= 3)
+    {
+      Serial.println("[PrioritySync] Peer not reachable after 3 tries -> cancel pending sync");
+      syncPending = false;
+      peerSyncRequestInProgress = false;
+      syncFailed = true;
+      syncDone = false;
+      syncPendingReason = "none";
+      syncMsg = "cancelled: Phantom-2 not reachable after 3 tries";
+      prioritySyncFailCount = 0;
+      restoreMyAP();
+    }
+  }
 }
 
 void handleAutoSync()
@@ -1772,6 +1957,9 @@ void handleRawUpload(WiFiClient &cli)
     }
   }
 
+  if (saved)
+    markLocalFileChanged("TCP8081 upload " + saveAs);
+
   blinkLED(saved ? 5 : 2, 80);
   Serial.printf("[Upload8081] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
 
@@ -1911,6 +2099,9 @@ void handleRawTCP(WiFiClient &client)
 
       bool sv = sdSaveAs(buf, rx, "/" + saveAs);
 
+      if (sv)
+        markLocalFileChanged("TCP8080 upload " + saveAs);
+
       if (sv && saveAs == "audio.wav")
       {
         if (ramBuf)
@@ -2014,7 +2205,7 @@ void setup()
 
   syncDone = false;
   syncFailed = false;
-  syncMsg = "ready: auto sync every 60s + manual POST /sync";
+  syncMsg = "ready: priority sync after any local file write";
 
   Serial.println("\n[Ready] Phantom-1 endpoints:");
   Serial.printf("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
@@ -2031,7 +2222,11 @@ void setup()
 void loop()
 {
   server.handleClient();
-  handleAutoSync();
+
+  // Priority sync chay truoc auto-sync dinh ky
+  handlePrioritySync();
+  // AutoSync disabled: only sync when upload or recording marks syncPending.
+  // handleAutoSync();
 
   WiFiClient c = audioServer.accept();
   if (c)
