@@ -117,6 +117,7 @@ void handleAutoSync();
 void markLocalFileChanged(const String &reason);
 void handlePrioritySync();
 bool requestPeerPullSync();
+void debugScanPeerNetworks(const char *targetSsid);
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -437,6 +438,7 @@ int countSdFiles()
 void restoreMyAP()
 {
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
 
   IPAddress apIP(192, 168, 4, 1);
   IPAddress gw(192, 168, 4, 1);
@@ -449,7 +451,36 @@ void restoreMyAP()
   audioServer.begin();
   uploadServer.begin();
 
-  Serial.println("[WiFi] Phantom-1 AP restored");
+  Serial.printf("[WiFi] Phantom-1 AP restored max_clients=%d clients=%d\n",
+                MY_AP_MAX_CON, WiFi.softAPgetStationNum());
+}
+
+// ── Debug WiFi scan trước khi connect peer ─────────────────────
+void debugScanPeerNetworks(const char *targetSsid)
+{
+  Serial.println("[WiFi] Scan before peer connect...");
+  int n = WiFi.scanNetworks(false, true);
+  bool found = false;
+  if (n <= 0)
+  {
+    Serial.println("[WiFi] Scan result: no network found");
+  }
+  else
+  {
+    for (int i = 0; i < n; i++)
+    {
+      String ssid = WiFi.SSID(i);
+      Serial.printf("  SSID[%d]=%s RSSI=%d CH=%d\n",
+                    i,
+                    ssid.c_str(),
+                    WiFi.RSSI(i),
+                    WiFi.channel(i));
+      if (ssid == String(targetSsid))
+        found = true;
+    }
+  }
+  WiFi.scanDelete();
+  Serial.printf("[WiFi] Target '%s': %s\n", targetSsid, found ? "FOUND" : "NOT FOUND");
 }
 
 // ── HTTP GET text tu Phantom-2 ────────────────────────────────
@@ -760,10 +791,16 @@ bool syncFromPeer()
   Serial.println("\n[Sync] == Bat dau ket noi Phantom-2 ==");
   syncMsg = "connecting Phantom-2";
 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false);
+  delay(200);
+  debugScanPeerNetworks(PEER_SSID);
+  Serial.printf("[WiFi] Connecting to %s ...\n", PEER_SSID);
   WiFi.begin(PEER_SSID, PEER_PASSWORD);
 
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  while (WiFi.status() != WL_CONNECTED && retries < 30)
   {
     unsigned long tw = millis();
     while (millis() - tw < 300)
@@ -789,13 +826,12 @@ bool syncFromPeer()
                 WiFi.localIP().toString().c_str());
   delay(100);
 
-  if (isPeerBusy())
-  {
-    WiFi.disconnect(false);
-    restoreMyAP();
-    syncInProgress = false;
-    return false;
-  }
+  // IMPORTANT FIX:
+  // Do NOT call isPeerBusy() here. When Phantom-2 has just finished recording,
+  // it may report busy because it is waiting for Phantom-1 to pull the new file.
+  // If Phantom-1 skips here, Phantom-2 can falsely think sync is done.
+  // The real protection is on Phantom-2's POST /sync handler: it rejects sync
+  // while recordingInProgress or syncInProgress is true.
 
   String listJson = "";
   for (int attempt = 0; attempt < 3; attempt++)
@@ -987,6 +1023,7 @@ void handleStatus()
               String("{\"node\":1") +
                   ",\"ap_ssid\":\"" + MY_AP_SSID + "\"" +
                   ",\"ap_ip\":\"" + MY_AP_IP_STR + "\"" +
+                  ",\"ap_clients\":" + String(WiFi.softAPgetStationNum()) +
                   ",\"peer_ssid\":\"" + PEER_SSID + "\"" +
                   ",\"peer_ip\":\"" + PEER_IP + "\"" +
                   ",\"uptime\":\"" + formatUptime(millis()) + "\"" +
@@ -1582,9 +1619,15 @@ bool requestPeerPullSync()
 
   Serial.println("[PrioritySync] Connect Phantom-2 and POST /sync");
 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false);
+  delay(200);
+  debugScanPeerNetworks(PEER_SSID);
+  Serial.printf("[WiFi] Connecting to %s ...\n", PEER_SSID);
   WiFi.begin(PEER_SSID, PEER_PASSWORD);
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  while (WiFi.status() != WL_CONNECTED && retries < 30)
   {
     unsigned long tw = millis();
     while (millis() - tw < 300)
@@ -2155,6 +2198,7 @@ void setup()
   sdReady = setupSDCard();
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
 
   IPAddress apIP(192, 168, 4, 1);
   IPAddress gw(192, 168, 4, 1);
@@ -2164,7 +2208,7 @@ void setup()
   WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
 
   delay(200);
-  Serial.printf("[AP] SSID: %s  IP: %s\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("[AP] SSID: %s  IP: %s  max_clients=%d\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str(), MY_AP_MAX_CON);
   digitalWrite(LED_PIN, HIGH);
 
   const char *collectHeaders[] = {"X-Filename", "Content-Length", "Content-Type"};
