@@ -14,7 +14,7 @@
  *   GET  /file/info           ← thông tin file (audio.wav)
  *   GET  /file/list           ← danh sách tất cả file
  *   GET  /file/download?name= ← download file theo tên (mọi định dạng)
- *   POST /file/upload         ← upload file (X-Filename header + raw body)
+ *   POST /file/upload         ← upload multipart/form-data (-F file=@...)
  *   POST /file/clear          ← xóa audio.wav
  *   POST /file/delete?name=   ← xóa file theo tên
  *   GET  /ram/info            ← RAM buffer info
@@ -83,11 +83,11 @@
 // I2S 32-bit -> center DC -> shift về int16 để phân tích.
 // peak13 chỉ để xem log so sánh với code cũ; trigger chính dùng rms15.
 #define MIC_ANALYZE_SHIFT 15
-#define MIC_TRIGGER_RMS_LEVEL 1200    // tăng lên 1800-2500 nếu vẫn tự ghi
-#define MIC_REARM_RMS_LEVEL 700       // phải nhỏ hơn trigger
+#define MIC_TRIGGER_RMS_LEVEL 400     // tăng lên 1800-2500 nếu vẫn tự ghi
+#define MIC_REARM_RMS_LEVEL 200       // phải nhỏ hơn trigger
 #define MIC_MIN_ZCR 3                 // zero-crossing thấp quá thường là ù/rung DC
 #define MIC_MAX_ZCR 90                // cao quá thường là hiss/nhiễu cao tần
-#define MIC_VOICE_FRAMES_TO_TRIGGER 8 // ~8 frame liên tục mới ghi
+#define MIC_VOICE_FRAMES_TO_TRIGGER 4 // ~8 frame liên tục mới ghi
 #define MIC_COOLDOWN_MS 2000UL
 #define MIC_LOG_INTERVAL_MS 500UL
 #define REC_LOG_INTERVAL_MS 1000UL
@@ -133,6 +133,15 @@ bool setupSDCard()
 WebServer server(HTTP_PORT);
 WiFiServer audioServer(AUDIO_PORT);
 WiFiServer uploadServer(UPLOAD_PORT);
+
+// ── HTTP multipart upload state (/file/upload) ────────────────
+File httpUploadFile;
+String httpUploadPath = "";
+String httpUploadName = "";
+size_t httpUploadBytes = 0;
+bool httpUploadOk = false;
+String httpUploadError = "";
+
 // ── RAM buffer ────────────────────────────────────────────────
 uint8_t *ramBuf = nullptr;
 size_t ramSize = 0;
@@ -146,9 +155,13 @@ void restorePhantom2AP();
 String httpGetFromNode1(const char *path, int timeoutMs);
 void handleBusy();
 void handleAutoSync();
+void handleFileUploadDone();
+void handleFileUploadStream();
 void markLocalFileChanged(const String &reason);
 void handlePrioritySync();
 bool requestPeerPullSync();
+void debugScanPeerNetworks(const char *targetSsid);
+bool verifyNode1HasLocalFile(const String &localPath);
 // ── State ─────────────────────────────────────────────────────
 bool nodeEnabled = true; // Luon bat, da bo chuc nang nut BOOT bat/tat node
 
@@ -772,9 +785,15 @@ bool requestPeerPullSync()
 
   Serial.println("[PrioritySync] Connect Phantom-1 and POST /sync");
 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false);
+  delay(200);
+  debugScanPeerNetworks(NODE1_SSID);
+  Serial.printf("[WiFi] Connecting to %s ...\n", NODE1_SSID);
   WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  while (WiFi.status() != WL_CONNECTED && retries < 30)
   {
     unsigned long tw = millis();
     while (millis() - tw < 300)
@@ -850,20 +869,30 @@ bool requestPeerPullSync()
     return false;
   }
 
-  // Doi Phantom-1 sync xong. Trong luc doi van handleClient de peer tai file.
+  // Doi Phantom-1 sync xong va VERIFY file da co tren Phantom-1.
+  // Khong duoc chi dua vao /busy, vi Phantom-1 co the idle neu da skip sync.
+  ok = false;
+  bool verified = false;
   unsigned long waitStart = millis();
-  while (millis() - waitStart < 70000UL)
+  while (millis() - waitStart < 90000UL)
   {
-    server.handleClient();
+    server.handleClient(); // cho Phantom-1 keo /file/list va /file/download tu node nay
+
     String b = httpGetFromNode1("/busy", 2500);
-    if (b.length() > 0 &&
-        b.indexOf("\"busy\":true") < 0 &&
-        b.indexOf("\"sync_in_progress\":true") < 0)
+    bool peerIdle = (b.length() > 0 &&
+                     b.indexOf("\"busy\":true") < 0 &&
+                     b.indexOf("\"sync_in_progress\":true") < 0);
+
+    if (peerIdle)
     {
-      ok = true;
-      break;
+      verified = verifyNode1HasLocalFile(lastMicWavFile);
+      if (verified)
+      {
+        ok = true;
+        break;
+      }
     }
-    delay(250);
+    delay(500);
   }
 
   WiFi.disconnect(false);
@@ -871,20 +900,24 @@ bool requestPeerPullSync()
 
   peerSyncRequestInProgress = false;
 
-  if (ok)
+  if (ok && verified)
   {
     syncPending = false;
     syncDone = true;
     syncFailed = false;
-    syncMsg = "ok: peer pulled latest local files";
+    syncMsg = "ok: Phantom-1 verified latest local file";
     syncPendingReason = "none";
     prioritySyncFailCount = 0;
-    Serial.println("[PrioritySync] Done -> recording can run again");
+    micArmed = true;
+    lastMicTriggerMs = millis();
+    Serial.println("[PrioritySync] Done + verified -> recording can run again");
     return true;
   }
 
-  syncMsg = "pending: wait Phantom-1 sync timeout";
+  syncMsg = "pending: wait/verify Phantom-1 sync timeout";
   syncFailed = true;
+  micArmed = false; // tiep tuc khoa mic, handlePrioritySync se retry
+  Serial.println("[PrioritySync] Verify failed -> keep mic locked and retry");
   return false;
 }
 
@@ -912,16 +945,15 @@ void handlePrioritySync()
 
     if (prioritySyncFailCount >= 3)
     {
-      Serial.println("[PrioritySync] Peer not reachable after 3 tries -> cancel pending sync and allow recording");
-      syncPending = false;
-      peerSyncRequestInProgress = false;
+      // STRICT GATE: do not allow new recording until Phantom-1 sync is verified.
+      // Keep syncPending=true and micArmed=false; just slow down retries.
+      Serial.println("[PrioritySync] Peer not verified after 3 tries -> keep mic locked, retry later");
       syncFailed = true;
       syncDone = false;
-      syncPendingReason = "none";
-      syncMsg = "cancelled: Phantom-1 not reachable after 3 tries";
+      syncMsg = "pending: Phantom-1 sync not verified; mic locked";
       prioritySyncFailCount = 0;
-      micArmed = true;
-      lastMicTriggerMs = millis();
+      micArmed = false;
+      lastPrioritySyncAttemptMs = millis() + 12000UL;
       restorePhantom2AP();
     }
   }
@@ -1320,6 +1352,87 @@ int32_t getRemoteFileSize(const String &listJson, const String &fname)
   }
   return -1;
 }
+
+// ── Debug WiFi scan trước khi connect peer ─────────────────────
+void debugScanPeerNetworks(const char *targetSsid)
+{
+  Serial.println("[WiFi] Scan before peer connect...");
+  int n = WiFi.scanNetworks(false, true);
+  bool found = false;
+  if (n <= 0)
+  {
+    Serial.println("[WiFi] Scan result: no network found");
+  }
+  else
+  {
+    for (int i = 0; i < n; i++)
+    {
+      String ssid = WiFi.SSID(i);
+      Serial.printf("  SSID[%d]=%s RSSI=%d CH=%d\n",
+                    i,
+                    ssid.c_str(),
+                    WiFi.RSSI(i),
+                    WiFi.channel(i));
+      if (ssid == String(targetSsid))
+        found = true;
+    }
+  }
+  WiFi.scanDelete();
+  Serial.printf("[WiFi] Target '%s': %s\n", targetSsid, found ? "FOUND" : "NOT FOUND");
+}
+
+// ── Verify Phantom-1 has pulled a local file ───────────────────
+bool verifyNode1HasLocalFile(const String &localPath)
+{
+  if (!sdReady || localPath.length() == 0)
+    return false;
+
+  String base = localPath;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0)
+    base = base.substring(slash + 1);
+  if (base.length() == 0)
+    return false;
+
+  String displayRec = "rec/" + base;
+  size_t localSize = 0;
+  if (SD.exists(localPath))
+  {
+    File f = SD.open(localPath, "r");
+    if (f)
+    {
+      localSize = f.size();
+      f.close();
+    }
+  }
+
+  String listJson = httpGetFromNode1("/file/list", 5000);
+  if (listJson.length() == 0)
+  {
+    Serial.println("[PrioritySync] Verify: Phantom-1 /file/list empty");
+    return false;
+  }
+
+  bool hasName = (listJson.indexOf("\"name\":\"" + displayRec + "\"") >= 0) ||
+                 (listJson.indexOf("\"name\":\"" + base + "\"") >= 0) ||
+                 (listJson.indexOf(displayRec) >= 0) ||
+                 (listJson.indexOf(base) >= 0);
+
+  bool sizeOk = true;
+  if (localSize > 0)
+  {
+    sizeOk = (listJson.indexOf("\"size\":" + String((uint32_t)localSize)) >= 0);
+  }
+
+  Serial.printf("[PrioritySync] Verify Node-1 has '%s': name=%s size=%s localSize=%lu\n",
+                displayRec.c_str(),
+                hasName ? "yes" : "no",
+                sizeOk ? "yes" : "no",
+                (unsigned long)localSize);
+
+  return hasName && sizeOk;
+}
+
 void restorePhantom2AP()
 {
   WiFi.mode(WIFI_AP_STA);
@@ -1385,9 +1498,15 @@ bool syncFromNode1()
   Serial.println("\n[Sync] ══ Bắt đầu kết nối Thiết bị A (Node-1) ══");
   syncMsg = "connecting Phantom-1";
 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false);
+  delay(200);
+  debugScanPeerNetworks(NODE1_SSID);
+  Serial.printf("[WiFi] Connecting to %s ...\n", NODE1_SSID);
   WiFi.begin(NODE1_SSID, NODE1_PASSWORD);
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 12)
+  while (WiFi.status() != WL_CONNECTED && retries < 30)
   {
     unsigned long tw = millis();
     while (millis() - tw < 300)
@@ -1628,6 +1747,7 @@ void handleStatus()
               String("{\"node\":2") +
                   ",\"ap_ssid\":\"" + MY_AP_SSID + "\"" +
                   ",\"ap_ip\":\"" + MY_AP_IP_STR + "\"" +
+                  ",\"ap_clients\":" + String(WiFi.softAPgetStationNum()) +
                   ",\"uptime\":\"" + formatUptime(millis()) + "\"" +
                   ",\"free_heap\":" + String(ESP.getFreeHeap()) +
                   ",\"sync_done\":" + (syncDone ? "true" : "false") +
@@ -1944,88 +2064,49 @@ void handleFileDownload()
   server.send(404, "application/json", "{\"error\":\"file not found\",\"name\":\"" + dlName + "\"}");
 }
 
-void handleFileUpload()
+void handleFileUploadDone()
 {
-  String xFilename = server.header("X-Filename");
-  if (xFilename.length() == 0)
-    xFilename = server.arg("name");
-  xFilename.trim();
-
-  String saveAs = sanitizeFilename(xFilename);
-  if (saveAs.length() == 0)
-    saveAs = genAutoFilename();
-
-  int clen = 0;
-  String clHeader = server.header("Content-Length");
-  if (clHeader.length() > 0)
-    clen = clHeader.toInt();
-
-  if (clen <= 0)
+  if (!sdReady)
   {
-    server.send(400, "application/json", "{\"error\":\"missing Content-Length\"}");
-    return;
-  }
-  if (clen > (int)MAX_FILE_SIZE)
-  {
-    server.send(413, "application/json", "{\"error\":\"file too large\"}");
+    server.send(500, "application/json", "{\"error\":\"sd not ready\"}");
     return;
   }
 
-  // Mở file SD để ghi stream
-  String path = "/" + saveAs;
-  if (SD.exists(path))
-    SD.remove(path);
-  File sdFile = SD.open(path, "w");
-  if (!sdFile)
+  if (!httpUploadOk)
   {
-    server.send(500, "application/json", "{\"error\":\"sd open failed\"}");
+    String err = httpUploadError.length() ? httpUploadError : "upload failed";
+    String resp = "{\"status\":\"fail\",\"error\":\"" + err +
+                  "\",\"filename\":\"" + httpUploadName +
+                  "\",\"size\":" + String((uint32_t)httpUploadBytes) +
+                  ",\"sd_saved\":false}";
+    server.send(500, "application/json", resp);
     return;
   }
 
-  // Đọc từ raw TCP client và ghi thang vao SD (không cần buffer toàn bộ trong RAM)
-  WiFiClient cli = server.client();
-  size_t rx = 0;
-  uint8_t chunk[512];
-  unsigned long t = millis();
-  while (rx < (size_t)clen && cli.connected() && (millis() - t) < 30000)
+  bool saved = false;
+  if (httpUploadBytes > 0 && SD.exists(httpUploadPath))
   {
-    size_t av = cli.available();
-    if (av > 0)
-    {
-      size_t want = min(av, min((size_t)512, (size_t)(clen - rx)));
-      size_t rd = cli.readBytes(chunk, want);
-      if (rd > 0)
-      {
-        sdFile.write(chunk, rd);
-        rx += rd;
-        t = millis();
-      }
-    }
-    else
-    {
-      delay(1);
-    }
-  }
-  sdFile.close();
-
-  Serial.printf("[Upload] '%s' rx=%d/%d bytes\n", saveAs.c_str(), rx, clen);
-
-  bool saved = (rx > 0 && SD.exists(path));
-  // Verify kích thước
-  if (saved)
-  {
-    File chk = SD.open(path, "r");
+    File chk = SD.open(httpUploadPath, "r");
     if (chk)
     {
-      saved = (chk.size() == rx);
+      saved = (chk.size() == httpUploadBytes);
       chk.close();
     }
   }
-  if (!saved)
-    SD.remove(path);
 
-  // Nếu là audio.wav → load vào RAM
-  if (saved && saveAs == "audio.wav")
+  if (!saved)
+  {
+    if (httpUploadPath.length() && SD.exists(httpUploadPath))
+      SD.remove(httpUploadPath);
+
+    String resp = "{\"status\":\"fail\",\"error\":\"verify failed\",\"filename\":\"" +
+                  httpUploadName + "\",\"size\":" + String((uint32_t)httpUploadBytes) +
+                  ",\"sd_saved\":false}";
+    server.send(500, "application/json", resp);
+    return;
+  }
+
+  if (httpUploadName == "audio.wav")
   {
     if (ramBuf)
     {
@@ -2034,41 +2115,127 @@ void handleFileUpload()
       ramSize = 0;
       ramReady = false;
     }
-    File f = SD.open(path, "r");
-    if (f)
+
+    if (httpUploadBytes <= 2000000)
     {
-      size_t sz = f.size();
-      if (sz <= 2000000)
+      File f = SD.open(httpUploadPath, "r");
+      if (f)
       {
-        ramBuf = (uint8_t *)malloc(sz);
+        ramBuf = (uint8_t *)malloc(httpUploadBytes);
         if (ramBuf)
         {
-          size_t rd = f.read(ramBuf, sz);
-          f.close();
+          size_t rd = f.read(ramBuf, httpUploadBytes);
           ramSize = rd;
           ramReady = (rd >= 44);
         }
-        else
-          f.close();
-      }
-      else
         f.close();
+      }
     }
   }
 
-  if (saved)
-    markLocalFileChanged("HTTP upload " + saveAs);
+  markLocalFileChanged("HTTP multipart upload " + httpUploadPath);
+  blinkLED(5, 80);
 
-  Serial.printf("[Upload] '%s' %d bytes → %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
-  blinkLED(saved ? 5 : 2, 80);
+  String displayName = httpUploadPath;
+  if (displayName.startsWith("/"))
+    displayName = displayName.substring(1);
 
-  String resp = "{\"status\":\"" + String(saved ? "ok" : "fail") + "\""
-                                                                   ",\"filename\":\"" +
-                saveAs + "\""
-                         ",\"size\":" +
-                String(rx) +
-                ",\"sd_saved\":" + String(saved ? "true" : "false") + "}";
-  server.send(saved ? 200 : 500, "application/json", resp);
+  String resp = "{\"status\":\"ok\",\"filename\":\"" + displayName +
+                "\",\"size\":" + String((uint32_t)httpUploadBytes) +
+                ",\"sd_saved\":true}";
+  server.send(200, "application/json", resp);
+}
+
+void handleFileUploadStream()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    httpUploadBytes = 0;
+    httpUploadOk = false;
+    httpUploadError = "";
+    httpUploadPath = "";
+
+    String xFilename = server.header("X-Filename");
+    String incoming = upload.filename;
+    if (incoming.length() == 0)
+      incoming = xFilename;
+    if (incoming.length() == 0)
+      incoming = server.arg("name");
+
+    httpUploadName = sanitizeFilename(incoming);
+    if (httpUploadName.length() == 0)
+      httpUploadName = genAutoFilename();
+
+    if (!SD.exists("/rec"))
+    {
+      if (!SD.mkdir("/rec"))
+      {
+        httpUploadError = "cannot create /rec";
+        return;
+      }
+    }
+
+    httpUploadPath = "/rec/" + httpUploadName;
+    if (SD.exists(httpUploadPath))
+      SD.remove(httpUploadPath);
+
+    httpUploadFile = SD.open(httpUploadPath, FILE_WRITE);
+    if (!httpUploadFile)
+    {
+      httpUploadError = "sd open failed";
+      return;
+    }
+
+    Serial.printf("[UploadHTTP] START '%s' -> '%s'\n", incoming.c_str(), httpUploadPath.c_str());
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (!httpUploadFile)
+      return;
+
+    if (httpUploadBytes + upload.currentSize > (size_t)MAX_FILE_SIZE)
+    {
+      httpUploadError = "file too large";
+      httpUploadFile.close();
+      if (httpUploadPath.length())
+        SD.remove(httpUploadPath);
+      return;
+    }
+
+    size_t wr = httpUploadFile.write(upload.buf, upload.currentSize);
+    httpUploadBytes += wr;
+    if (wr != upload.currentSize)
+    {
+      httpUploadError = "sd write failed";
+      httpUploadFile.close();
+      if (httpUploadPath.length())
+        SD.remove(httpUploadPath);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    if (httpUploadFile)
+      httpUploadFile.close();
+
+    httpUploadOk = (httpUploadError.length() == 0 && httpUploadBytes == upload.totalSize && httpUploadBytes > 0);
+    Serial.printf("[UploadHTTP] END '%s' rx=%u total=%u -> %s\n",
+                  httpUploadName.c_str(),
+                  (unsigned int)httpUploadBytes,
+                  (unsigned int)upload.totalSize,
+                  httpUploadOk ? "OK" : "FAIL");
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    if (httpUploadFile)
+      httpUploadFile.close();
+    if (httpUploadPath.length())
+      SD.remove(httpUploadPath);
+    httpUploadError = "upload aborted";
+    httpUploadOk = false;
+    Serial.println("[UploadHTTP] ABORTED");
+  }
 }
 
 void handleFileClear()
@@ -2506,6 +2673,7 @@ void setup()
   sdReady = setupSDCard();
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
   IPAddress apIP(192, 168, 5, 1);
   IPAddress gw(192, 168, 5, 1);
   IPAddress sn(255, 255, 255, 0);
@@ -2523,7 +2691,7 @@ void setup()
   server.on("/file/info", HTTP_GET, handleFileInfo);
   server.on("/file/list", HTTP_GET, handleFileList);
   server.on("/file/download", HTTP_GET, handleFileDownload);
-  server.on("/file/upload", HTTP_POST, handleFileUpload);
+  server.on("/file/upload", HTTP_POST, handleFileUploadDone, handleFileUploadStream);
   server.on("/file/clear", HTTP_POST, handleFileClear);
   server.on("/file/delete", HTTP_POST, handleFileDelete);
   server.on("/ram/info", HTTP_GET, handleRamInfo);
@@ -2558,7 +2726,7 @@ void setup()
   Serial.printf("  GET  http://%s/status\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/list\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
-  Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
+  Serial.printf("  POST http://%s/file/upload  multipart -F file=@myfile.txt\n", MY_AP_IP_STR);
   Serial.printf("  POST http://%s/sync\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
   Serial.println("  Priority sync: any local file write -> ask Phantom-1 to pull; recording waits until sync done");

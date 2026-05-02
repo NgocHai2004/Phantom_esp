@@ -13,7 +13,7 @@
  *   GET  /file/info
  *   GET  /file/list
  *   GET  /file/download?name=<filename>
- *   POST /file/upload        (X-Filename header + raw body)
+ *   POST /file/upload        (multipart/form-data file upload -> saves to /rec)
  *   POST /file/clear
  *   POST /file/delete?name=<filename>
  *   GET  /ram/info
@@ -104,6 +104,14 @@ unsigned long lastAutoSyncMs = 0;
 unsigned long lastPrioritySyncAttemptMs = 0;
 uint8_t prioritySyncFailCount = 0;
 
+// HTTP multipart upload state for /file/upload
+File httpUploadFile;
+String httpUploadFilename = "";
+String httpUploadPath = "";
+size_t httpUploadSize = 0;
+bool httpUploadOk = false;
+String httpUploadError = "none";
+
 // ── Function prototypes ───────────────────────────────────────
 bool setupSDCard();
 int countSdFiles();
@@ -114,6 +122,8 @@ String httpGetFromPeer(const char *path, int timeoutMs);
 bool isPeerBusy();
 void handleBusy();
 void handleAutoSync();
+void handleFileUploadDone();
+void handleFileUploadStream();
 void markLocalFileChanged(const String &reason);
 void handlePrioritySync();
 bool requestPeerPullSync();
@@ -1342,132 +1352,173 @@ void handleFileDownload()
   server.send(404, "application/json", "{\"error\":\"file not found\",\"name\":\"" + dlName + "\"}");
 }
 
-void handleFileUpload()
+void handleFileUploadDone()
 {
-  String xFilename = server.header("X-Filename");
-  if (xFilename.length() == 0)
-    xFilename = server.arg("name");
-  xFilename.trim();
-
-  String saveAs = sanitizeFilename(xFilename);
-  if (saveAs.length() == 0)
-    saveAs = genAutoFilename();
-
-  int clen = 0;
-  String clHeader = server.header("Content-Length");
-  if (clHeader.length() > 0)
-    clen = clHeader.toInt();
-
-  if (clen <= 0)
+  if (httpUploadOk)
   {
-    server.send(400, "application/json", "{\"error\":\"missing Content-Length\"}");
-    return;
+    markLocalFileChanged("HTTP upload " + httpUploadFilename);
+
+    String resp = "{\"status\":\"ok\"";
+    resp += ",\"filename\":\"" + httpUploadFilename + "\"";
+    resp += ",\"path\":\"" + httpUploadPath + "\"";
+    resp += ",\"size\":" + String(httpUploadSize);
+    resp += ",\"sd_saved\":true}";
+    server.send(200, "application/json", resp);
+  }
+  else
+  {
+    String resp = "{\"status\":\"fail\"";
+    resp += ",\"filename\":\"" + httpUploadFilename + "\"";
+    resp += ",\"path\":\"" + httpUploadPath + "\"";
+    resp += ",\"size\":" + String(httpUploadSize);
+    resp += ",\"sd_saved\":false";
+    resp += ",\"error\":\"" + httpUploadError + "\"}";
+    server.send(500, "application/json", resp);
   }
 
-  if (clen > (int)MAX_FILE_SIZE)
+  Serial.printf("[UploadHTTP] done file='%s' size=%d ok=%s err=%s\n",
+                httpUploadFilename.c_str(),
+                (int)httpUploadSize,
+                httpUploadOk ? "true" : "false",
+                httpUploadError.c_str());
+}
+
+void handleFileUploadStream()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
   {
-    server.send(413, "application/json", "{\"error\":\"file too large\"}");
-    return;
-  }
+    httpUploadSize = 0;
+    httpUploadOk = false;
+    httpUploadError = "none";
+    httpUploadFilename = "";
+    httpUploadPath = "";
 
-  String path = "/" + saveAs;
-  if (SD.exists(path))
-    SD.remove(path);
-
-  File sdFile = SD.open(path, "w");
-  if (!sdFile)
-  {
-    server.send(500, "application/json", "{\"error\":\"sd open failed\"}");
-    return;
-  }
-
-  WiFiClient cli = server.client();
-  size_t rx = 0;
-  uint8_t chunk[512];
-  unsigned long t = millis();
-
-  while (rx < (size_t)clen && cli.connected() && (millis() - t) < 30000)
-  {
-    size_t av = cli.available();
-    if (av > 0)
+    if (!sdReady)
     {
-      size_t want = min(av, min((size_t)512, (size_t)(clen - rx)));
-      size_t rd = cli.readBytes(chunk, want);
-      if (rd > 0)
+      httpUploadError = "sd not ready";
+      return;
+    }
+
+    String xFilename = server.header("X-Filename");
+    xFilename.trim();
+
+    String rawName = xFilename.length() > 0 ? xFilename : upload.filename;
+    rawName.trim();
+
+    String saveAs = sanitizeFilename(rawName);
+    if (saveAs.length() == 0)
+      saveAs = genAutoFilename();
+
+    if (!SD.exists("/rec"))
+    {
+      if (!SD.mkdir("/rec"))
       {
-        sdFile.write(chunk, rd);
-        rx += rd;
-        t = millis();
+        httpUploadError = "cannot create /rec";
+        return;
       }
     }
-    else
+
+    httpUploadFilename = "rec/" + saveAs;
+    httpUploadPath = "/rec/" + saveAs;
+
+    if (SD.exists(httpUploadPath))
+      SD.remove(httpUploadPath);
+
+    httpUploadFile = SD.open(httpUploadPath, "w");
+    if (!httpUploadFile)
     {
-      delay(1);
+      httpUploadError = "sd open failed";
+      return;
     }
+
+    Serial.printf("[UploadHTTP] start '%s' -> '%s'\n",
+                  rawName.c_str(), httpUploadPath.c_str());
   }
-
-  sdFile.close();
-
-  Serial.printf("[Upload] '%s' rx=%d/%d bytes\n", saveAs.c_str(), rx, clen);
-
-  bool saved = (rx > 0 && SD.exists(path));
-  if (saved)
+  else if (upload.status == UPLOAD_FILE_WRITE)
   {
-    File chk = SD.open(path, "r");
-    if (chk)
+    if (!httpUploadFile)
     {
-      saved = (chk.size() == rx);
-      chk.close();
+      if (httpUploadError == "none")
+        httpUploadError = "file not open";
+      return;
+    }
+
+    size_t wr = httpUploadFile.write(upload.buf, upload.currentSize);
+    httpUploadSize += wr;
+
+    if (wr != upload.currentSize)
+    {
+      httpUploadError = "sd write failed";
     }
   }
-  if (!saved)
-    SD.remove(path);
-
-  if (saved && saveAs == "audio.wav")
+  else if (upload.status == UPLOAD_FILE_END)
   {
-    if (ramBuf)
+    if (httpUploadFile)
+      httpUploadFile.close();
+
+    if (httpUploadError != "none")
     {
-      free(ramBuf);
-      ramBuf = nullptr;
-      ramSize = 0;
-      ramReady = false;
+      if (httpUploadPath.length() > 0)
+        SD.remove(httpUploadPath);
+      httpUploadOk = false;
+      return;
     }
 
-    File f = SD.open(path, "r");
-    if (f)
+    if (httpUploadSize == 0)
     {
-      size_t sz = f.size();
-      if (sz <= 2000000)
-      {
-        ramBuf = (uint8_t *)malloc(sz);
-        if (ramBuf)
-        {
-          size_t rd = f.read(ramBuf, sz);
-          f.close();
-          ramSize = rd;
-          ramReady = (rd >= 44);
-        }
-        else
-          f.close();
-      }
-      else
-        f.close();
+      httpUploadError = "empty upload";
+      if (httpUploadPath.length() > 0)
+        SD.remove(httpUploadPath);
+      httpUploadOk = false;
+      return;
     }
+
+    if (httpUploadPath.length() == 0 || !SD.exists(httpUploadPath))
+    {
+      httpUploadError = "file not saved";
+      httpUploadOk = false;
+      return;
+    }
+
+    File chk = SD.open(httpUploadPath, "r");
+    if (!chk)
+    {
+      httpUploadError = "verify open failed";
+      httpUploadOk = false;
+      return;
+    }
+
+    size_t realSize = chk.size();
+    chk.close();
+
+    if (realSize != httpUploadSize)
+    {
+      httpUploadError = "verify size mismatch";
+      SD.remove(httpUploadPath);
+      httpUploadOk = false;
+      return;
+    }
+
+    httpUploadOk = true;
+    blinkLED(5, 80);
+
+    Serial.printf("[UploadHTTP] saved '%s' %d bytes\n",
+                  httpUploadPath.c_str(), (int)httpUploadSize);
   }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    if (httpUploadFile)
+      httpUploadFile.close();
 
-  if (saved)
-    markLocalFileChanged("HTTP upload " + saveAs);
+    if (httpUploadPath.length() > 0)
+      SD.remove(httpUploadPath);
 
-  Serial.printf("[Upload] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
-  blinkLED(saved ? 5 : 2, 80);
-
-  String resp = "{\"status\":\"" + String(saved ? "ok" : "fail") + "\""
-                                                                   ",\"filename\":\"" +
-                saveAs + "\""
-                         ",\"size\":" +
-                String(rx) +
-                ",\"sd_saved\":" + String(saved ? "true" : "false") + "}";
-  server.send(saved ? 200 : 500, "application/json", resp);
+    httpUploadError = "upload aborted";
+    httpUploadOk = false;
+    Serial.println("[UploadHTTP] aborted");
+  }
 }
 
 void handleFileClear()
@@ -1921,7 +1972,10 @@ void handleRawUpload(WiFiClient &cli)
   if (saveAs.length() == 0)
     saveAs = genAutoFilename();
 
-  String path = "/" + saveAs;
+  if (!SD.exists("/rec"))
+    SD.mkdir("/rec");
+
+  String path = "/rec/" + saveAs;
   if (SD.exists(path))
     SD.remove(path);
 
@@ -2218,7 +2272,7 @@ void setup()
   server.on("/file/info", HTTP_GET, handleFileInfo);
   server.on("/file/list", HTTP_GET, handleFileList);
   server.on("/file/download", HTTP_GET, handleFileDownload);
-  server.on("/file/upload", HTTP_POST, handleFileUpload);
+  server.on("/file/upload", HTTP_POST, handleFileUploadDone, handleFileUploadStream);
   server.on("/file/clear", HTTP_POST, handleFileClear);
   server.on("/file/delete", HTTP_POST, handleFileDelete);
 
