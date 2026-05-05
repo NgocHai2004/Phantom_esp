@@ -1,0 +1,2832 @@
+1:/*
+2: * Phantom-1 — APSTA + SD File Relay + sync voi Phantom-2
+3: * Duoc tao tu firmware Phantom-2 cua ban.
+4: *
+5: * Vai tro:
+6: *   - Phat WiFi AP "Phantom-1" tai 192.168.4.1 de laptop truy cap file.
+7: *   - Luu/quan ly file tren SD card.
+8: *   - Dong bo file voi Phantom-2 qua WiFi STA.
+9: *   - Phantom-1 CHUA CO MIC nen khong ghi am, khong auto-trigger record.
+10: *
+11: * Endpoints port 80:
+12: *   GET  /status
+13: *   GET  /file/info
+14: *   GET  /file/list
+15: *   GET  /file/download?name=<filename>
+16: *   POST /file/upload        (multipart/form-data file upload -> saves to /rec)
+17: *   POST /file/clear
+18: *   POST /file/delete?name=<filename>
+19: *   GET  /ram/info
+20: *   POST /sync               (tai file tu Phantom-2 ve SD Phantom-1)
+21: *   GET  /sync/status
+22: *   GET  /sd/list
+23: *   GET  /sd/download?name=<filename>
+24: *   GET  /battery
+25: *
+26: * Port 8080:
+27: *   Raw TCP GET/POST audio.wav / file upload cu
+28: *
+29: * Port 8081:
+30: *   Raw TCP upload file bat ky dinh dang
+31: */
+32:
+33:#include <Arduino.h>
+34:#include <WiFi.h>
+35:#include <WebServer.h>
+36:#include <SD.h>
+37:#include <SPI.h>
+38:#include <FS.h>
+39:#include <driver/i2s.h>
+40:#include <time.h>
+41:#include <vector>
+42:#include "test_wav.h"
+43:
+44:// ── Cau hinh Phantom-1 ────────────────────────────────────────
+45:#define NODE_ID 1
+46:
+47:// AP cua Phantom-1
+48:#define MY_AP_SSID "Phantom-1"
+49:#define MY_AP_PASSWORD "12345678"
+50:#define MY_AP_CHANNEL 1
+51:#define MY_AP_HIDDEN false
+52:#define MY_AP_MAX_CON 4
+53:
+54:// Phantom-2 can ket noi de dong bo
+55:#define PEER_SSID "Phantom-2"
+56:#define PEER_PASSWORD "12345678"
+57:#define PEER_IP "192.168.5.1"
+58:#define PEER_TCP_PORT 8080
+59:#define PEER_HTTP_PORT 80
+60:
+61:#define LED_PIN 2
+62:#define HTTP_PORT 80
+63:#define AUDIO_PORT 8080
+64:#define UPLOAD_PORT 8081
+65:
+66:#define AUDIO_WAV_PATH "/audio.wav"
+67:#define MAX_FILE_SIZE 50000000
+68:#define MY_AP_IP_STR "192.168.4.1"
+69:#define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: handleAutoSync() is not called
+70:
+71:// ── I2S MIC ───────────────────────────────────────────────────
+72:#define I2S_WS 25
+73:#define I2S_SD 22
+74:#define I2S_SCK 26
+75:#define I2S_PORT I2S_NUM_0
+76:
+77:#define MIC_SAMPLE_RATE 16000
+78:#define MIC_SAMPLE_BITS 16
+79:#define MIC_I2S_READ_LEN 1024
+80:
+81:// ── Auto trigger record ───────────────────────────────────────
+82:#define AUTO_RECORD_MS 30000UL
+83:
+84:// ── Human voice trigger tuning ────────────────────────────────
+85:#define MIC_ANALYZE_SHIFT 15
+86:#define MIC_TRIGGER_RMS_LEVEL 400
+87:#define MIC_REARM_RMS_LEVEL 200
+88:#define MIC_MIN_ZCR 3
+89:#define MIC_MAX_ZCR 90
+90:#define MIC_VOICE_FRAMES_TO_TRIGGER 4
+91:#define MIC_COOLDOWN_MS 2000UL
+92:#define MIC_LOG_INTERVAL_MS 500UL
+93:#define REC_LOG_INTERVAL_MS 1000UL
+94:
+95:// Keep legacy defines to avoid accidental references breaking build
+96:#define MIC_TRIGGER_LEVEL 5000
+97:#define MIC_REARM_LEVEL 3000
+98:
+99:// ── SD card ───────────────────────────────────────────────────
+100:#define SD_CS 5
+101:#define SD_SCK 18
+102:#define SD_MISO 19
+103:#define SD_MOSI 23
+104:
+105:// ── Battery ADC ───────────────────────────────────────────────
+106:// GPIO34 = ADC1_CH6. Neu mach cua ban khong co do pin, co the bo qua endpoint /battery.
+107:#define BATTERY_ADC_PIN 34
+108:#define BATTERY_DIVIDER 2.0f
+109:#define BATTERY_V_MIN 3.0f
+110:#define BATTERY_V_MAX 4.2f
+111:
+112:WebServer server(HTTP_PORT);
+113:WiFiServer audioServer(AUDIO_PORT);
+114:WiFiServer uploadServer(UPLOAD_PORT);
+115:
+116:// ── RAM buffer cho audio.wav nho ──────────────────────────────
+117:uint8_t *ramBuf = nullptr;
+118:size_t ramSize = 0;
+119:bool ramReady = false;
+120:
+121:// ── State ─────────────────────────────────────────────────────
+122:bool nodeEnabled = true;
+123:bool sdReady = false;
+124:bool micReady = false;
+125:bool micArmed = true;
+126:bool recordingInProgress = false;
+127:uint32_t micFileCounter = 0;
+128:String lastMicWavFile = "none";
+129:unsigned long lastMicTriggerMs = 0;
+130:unsigned long lastRecordLoudMs = 0;
+131:
+132:bool syncDone = false;
+133:bool syncFailed = false;
+134:String syncMsg = "not started";
+135:bool syncInProgress = false;
+136:bool syncPending = false;               // Co file local moi/cap nhat can dong bo sang Phantom-2
+137:bool peerSyncRequestInProgress = false; // Dang yeu cau Phantom-2 keo file ve
+138:String syncPendingReason = "none";
+139:unsigned long lastAutoSyncMs = 0;
+140:unsigned long lastPrioritySyncAttemptMs = 0;
+141:uint8_t prioritySyncFailCount = 0;
+142:
+143:// HTTP multipart upload state for /file/upload
+144:File httpUploadFile;
+145:String httpUploadFilename = "";
+146:String httpUploadPath = "";
+147:size_t httpUploadSize = 0;
+148:bool httpUploadOk = false;
+149:String httpUploadError = "none";
+150:
+151:// ── Function prototypes ───────────────────────────────────────
+152:bool setupSDCard();
+153:int countSdFiles();
+154:String formatUptime(uint32_t ms);
+155:bool syncFromPeer();
+156:void restoreMyAP();
+157:String httpGetFromPeer(const char *path, int timeoutMs);
+158:bool isPeerBusy();
+159:void handleBusy();
+160:void handleAutoSync();
+161:void handleFileUploadDone();
+162:void handleFileUploadStream();
+163:void markLocalFileChanged(const String &reason);
+164:void handlePrioritySync();
+165:bool requestPeerPullSync();
+166:void debugScanPeerNetworks(const char *targetSsid);
+167:void setupI2SMic();
+168:String genMicFilename();
+169:struct MicVoiceStats;
+170:MicVoiceStats readMicVoiceStats();
+171:bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_MS);
+172:void handleAutoMicRecord();
+173:bool verifyPeerHasLocalFile(const String &localPath);
+174:
+175:// ── LED ───────────────────────────────────────────────────────
+176:void blinkLED(int times, int ms = 100)
+177:{
+178:  for (int i = 0; i < times; i++)
+179:  {
+180:    digitalWrite(LED_PIN, LOW);
+181:    delay(ms);
+182:    digitalWrite(LED_PIN, HIGH);
+183:    delay(ms);
+184:  }
+185:}
+186:
+187:// ── SD init ───────────────────────────────────────────────────
+188:bool setupSDCard()
+189:{
+190:  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+191:  if (!SD.begin(SD_CS, SPI))
+192:  {
+193:    Serial.println("[SD] Initialization FAILED!");
+194:    return false;
+195:  }
+196:
+197:  if (!SD.exists("/rec"))
+198:  {
+199:    if (SD.mkdir("/rec"))
+200:      Serial.println("[SD] Created /rec folder.");
+201:    else
+202:      Serial.println("[SD] WARNING: Cannot create /rec folder.");
+203:  }
+204:
+205:  Serial.println("[SD] Initialization OK.");
+206:  return true;
+207:}
+208:
+209:// ── MIME type lookup ──────────────────────────────────────────
+210:String mimeForExt(const String &ext)
+211:{
+212:  if (ext == ".wav")
+213:    return "audio/wav";
+214:  if (ext == ".mp3")
+215:    return "audio/mpeg";
+216:  if (ext == ".ogg")
+217:    return "audio/ogg";
+218:  if (ext == ".flac")
+219:    return "audio/flac";
+220:  if (ext == ".aac")
+221:    return "audio/aac";
+222:  if (ext == ".png")
+223:    return "image/png";
+224:  if (ext == ".jpg" || ext == ".jpeg")
+225:    return "image/jpeg";
+226:  if (ext == ".gif")
+227:    return "image/gif";
+228:  if (ext == ".bmp")
+229:    return "image/bmp";
+230:  if (ext == ".webp")
+231:    return "image/webp";
+232:  if (ext == ".svg")
+233:    return "image/svg+xml";
+234:  if (ext == ".pdf")
+235:    return "application/pdf";
+236:  if (ext == ".txt")
+237:    return "text/plain";
+238:  if (ext == ".csv")
+239:    return "text/csv";
+240:  if (ext == ".json")
+241:    return "application/json";
+242:  if (ext == ".xml")
+243:    return "application/xml";
+244:  if (ext == ".zip")
+245:    return "application/zip";
+246:  if (ext == ".docx")
+247:    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+248:  if (ext == ".xlsx")
+249:    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+250:  if (ext == ".bin")
+251:    return "application/octet-stream";
+252:  return "application/octet-stream";
+253:}
+254:
+255:// ── Sanitize filename ─────────────────────────────────────────
+256:String sanitizeFilename(const String &nameIn)
+257:{
+258:  String name = nameIn;
+259:  name.trim();
+260:  if (name.length() == 0)
+261:    return "";
+262:
+263:  int dotIdx = name.lastIndexOf('.');
+264:  String base = (dotIdx > 0) ? name.substring(0, dotIdx) : name;
+265:  String extLow = (dotIdx > 0) ? name.substring(dotIdx) : "";
+266:  extLow.toLowerCase();
+267:
+268:  String outBase = "";
+269:  bool lastUnderscore = false;
+270:  for (int i = 0; i < (int)base.length() && (int)outBase.length() < 32; i++)
+271:  {
+272:    char c = base[i];
+273:    if (isAlphaNumeric(c) || c == '-')
+274:    {
+275:      outBase += c;
+276:      lastUnderscore = false;
+277:    }
+278:    else if (c == '_' || c == ' ' || c == '.' || c == '(' || c == ')')
+279:    {
+280:      if (!lastUnderscore && outBase.length() > 0)
+281:      {
+282:        outBase += '_';
+283:        lastUnderscore = true;
+284:      }
+285:    }
+286:  }
+287:  while (outBase.length() > 0 && outBase[outBase.length() - 1] == '_')
+288:    outBase.remove(outBase.length() - 1);
+289:  if (outBase.length() == 0)
+290:    return "";
+291:
+292:  String outExt = "";
+293:  if (extLow.length() > 1)
+294:  {
+295:    outExt = ".";
+296:    for (int i = 1; i < (int)extLow.length() && (int)outExt.length() < 9; i++)
+297:    {
+298:      char c = extLow[i];
+299:      if (isAlphaNumeric(c))
+300:        outExt += c;
+301:    }
+302:    if (outExt.length() <= 1)
+303:      outExt = "";
+304:  }
+305:  if (outExt.length() == 0)
+306:    outExt = ".bin";
+307:
+308:  return outBase + outExt;
+309:}
+310:
+311:static uint16_t _fileCounter = 0;
+312:String genAutoFilename()
+313:{
+314:  _fileCounter++;
+315:  char buf[24];
+316:  snprintf(buf, sizeof(buf), "file_%04d.bin", _fileCounter);
+317:  return String(buf);
+318:}
+319:
+320:// ── SD helpers ────────────────────────────────────────────────
+321:bool sdHasFile(const String &path = AUDIO_WAV_PATH) { return SD.exists(path); }
+322:
+323:size_t sdFileSize(const String &path = AUDIO_WAV_PATH)
+324:{
+325:  if (!sdHasFile(path))
+326:    return 0;
+327:  File f = SD.open(path, "r");
+328:  if (!f)
+329:    return 0;
+330:  size_t sz = f.size();
+331:  f.close();
+332:  return sz;
+333:}
+334:
+335:bool sdSaveAs(const uint8_t *buf, size_t size, const String &path)
+336:{
+337:  File f = SD.open(path, "w");
+338:  if (!f)
+339:  {
+340:    Serial.printf("[SD] Open '%s' FAILED\n", path.c_str());
+341:    return false;
+342:  }
+343:  size_t wr = f.write(buf, size);
+344:  f.close();
+345:  bool ok = (wr == size);
+346:  if (!ok)
+347:  {
+348:    SD.remove(path);
+349:    Serial.printf("[SD] SaveAs '%s' FAILED (%d/%d)\n", path.c_str(), wr, size);
+350:  }
+351:  else
+352:  {
+353:    Serial.printf("[SD] SaveAs '%s' %d/%d -> OK\n", path.c_str(), wr, size);
+354:  }
+355:  return ok;
+356:}
+357:
+358:bool sdLoadToRam()
+359:{
+360:  if (!sdHasFile())
+361:    return false;
+362:  File f = SD.open(AUDIO_WAV_PATH, "r");
+363:  if (!f)
+364:    return false;
+365:
+366:  size_t sz = f.size();
+367:  if (sz == 0 || sz > 2000000)
+368:  {
+369:    f.close();
+370:    return false;
+371:  }
+372:
+373:  if (ramBuf)
+374:  {
+375:    free(ramBuf);
+376:    ramBuf = nullptr;
+377:    ramSize = 0;
+378:  }
+379:
+380:  ramBuf = (uint8_t *)malloc(sz);
+381:  if (!ramBuf)
+382:  {
+383:    f.close();
+384:    Serial.println("[SD] OOM loading to RAM");
+385:    return false;
+386:  }
+387:
+388:  size_t rd = f.read(ramBuf, sz);
+389:  f.close();
+390:  ramSize = rd;
+391:  ramReady = (rd >= 44);
+392:  Serial.printf("[SD] Load %d bytes to RAM -> %s\n", rd, ramReady ? "OK" : "FAIL");
+393:  return ramReady;
+394:}
+395:
+396:// ── I2S Mic Functions ─────────────────────────────────────────
+397:void setupI2SMic()
+398:{
+399:  i2s_config_t i2s_config = {
+400:      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+401:      .sample_rate = MIC_SAMPLE_RATE,
+402:      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+403:      .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+404:      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+405:      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+406:      .dma_buf_count = 8,
+407:      .dma_buf_len = 256,
+408:      .use_apll = false,
+409:      .tx_desc_auto_clear = false,
+410:      .fixed_mclk = 0};
+411:  i2s_pin_config_t pin_config = {
+412:      .bck_io_num = I2S_SCK,
+413:      .ws_io_num = I2S_WS,
+414:      .data_out_num = I2S_PIN_NO_CHANGE,
+415:      .data_in_num = I2S_SD};
+416:
+417:  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK)
+418:    return;
+419:  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK)
+420:    return;
+421:
+422:  micReady = true;
+423:  Serial.println("[MIC] I2S initialized.");
+424:}
+425:
+426:String genMicFilename()
+427:{
+428:  struct tm timeinfo;
+429:
+430:  if (getLocalTime(&timeinfo))
+431:  {
+432:    char buf[64];
+433:    strftime(buf, sizeof(buf), "/rec/rec_%Y%m%d_%H%M%S.wav", &timeinfo);
+434:    return String(buf);
+435:  }
+436:
+437:  micFileCounter++;
+438:  char buf[64];
+439:  snprintf(buf, sizeof(buf), "/rec/rec_no_time_%06lu.wav", (unsigned long)micFileCounter);
+440:  return String(buf);
+441:}
+442:
+443:struct MicVoiceStats
+444:{
+445:  int peak13;
+446:  int peak15;
+447:  int rms15;
+448:  int zcr;
+449:  bool voiceLike;
+450:};
+451:
+452:MicVoiceStats readMicVoiceStats()
+453:{
+454:  MicVoiceStats st = {0, 0, 0, 0, false};
+455:
+456:  if (!micReady || recordingInProgress)
+457:    return st;
+458:
+459:  uint8_t i2sData[MIC_I2S_READ_LEN];
+460:  size_t bytesRead = 0;
+461:
+462:  if (i2s_read(I2S_PORT, (void *)i2sData, MIC_I2S_READ_LEN, &bytesRead, 20 / portTICK_PERIOD_MS) != ESP_OK)
+463:    return st;
+464:  if (bytesRead == 0)
+465:    return st;
+466:
+467:  int32_t *samples32 = (int32_t *)i2sData;
+468:  int sampleCount = bytesRead / 4;
+469:  if (sampleCount <= 0)
+470:    return st;
+471:
+472:  int64_t sum = 0;
+473:  for (int i = 0; i < sampleCount; i++)
+474:    sum += samples32[i];
+475:  int32_t dc = (int32_t)(sum / sampleCount);
+476:
+477:  int64_t sumSq15 = 0;
+478:  int prevSign = 0;
+479:  int zcr = 0;
+480:
+481:  for (int i = 0; i < sampleCount; i++)
+482:  {
+483:    int32_t centered = samples32[i] - dc;
+484:
+485:    int32_t s13 = centered >> 13;
+486:    if (s13 > 32767)
+487:      s13 = 32767;
+488:    if (s13 < -32768)
+489:      s13 = -32768;
+490:    int a13 = abs((int)s13);
+491:    if (a13 > st.peak13)
+492:      st.peak13 = a13;
+493:
+494:    int32_t s15 = centered >> MIC_ANALYZE_SHIFT;
+495:    if (s15 > 32767)
+496:      s15 = 32767;
+497:    if (s15 < -32768)
+498:      s15 = -32768;
+499:
+500:    int a15 = abs((int)s15);
+501:    if (a15 > st.peak15)
+502:      st.peak15 = a15;
+503:
+504:    sumSq15 += (int64_t)s15 * (int64_t)s15;
+505:
+506:    int sign = 0;
+507:    if (s15 > 100)
+508:      sign = 1;
+509:    else if (s15 < -100)
+510:      sign = -1;
+511:
+512:    if (sign != 0)
+513:    {
+514:      if (prevSign != 0 && sign != prevSign)
+515:        zcr++;
+516:      prevSign = sign;
+517:    }
+518:  }
+519:
+520:  st.rms15 = (int)sqrt((float)sumSq15 / (float)sampleCount);
+521:  st.zcr = zcr;
+522:
+523:  st.voiceLike = (st.rms15 >= MIC_TRIGGER_RMS_LEVEL &&
+524:                  st.zcr >= MIC_MIN_ZCR &&
+525:                  st.zcr <= MIC_MAX_ZCR);
+526:
+527:  return st;
+528:}
+529:
+530:bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
+531:{
+532:  if (!sdReady || !micReady || recordingInProgress)
+533:    return false;
+534:
+535:  recordingInProgress = true;
+536:
+537:  if (!SD.exists("/rec"))
+538:    SD.mkdir("/rec");
+539:
+540:  if (SD.exists(path))
+541:    SD.remove(path);
+542:
+543:  File audioFile = SD.open(path, FILE_WRITE);
+544:  if (!audioFile)
+545:  {
+546:    recordingInProgress = false;
+547:    Serial.printf("[MIC] Cannot open file for recording: %s\n", path);
+548:    return false;
+549:  }
+550:
+551:  uint8_t emptyHeader[44] = {0};
+552:  audioFile.write(emptyHeader, 44);
+553:
+554:  i2s_zero_dma_buffer(I2S_PORT);
+555:  delay(50);
+556:
+557:  uint8_t i2sData[MIC_I2S_READ_LEN];
+558:  size_t bytesRead = 0;
+559:  uint32_t totalDataBytes = 0;
+560:  uint32_t samplesRecorded = 0;
+561:  uint32_t maxSamplesAllowed = ((MAX_FILE_SIZE - 44UL) / 2UL);
+562:
+563:  int recPeak14 = 0;
+564:  int recPeak15 = 0;
+565:  unsigned long lastRecLogMs = millis();
+566:  lastRecordLoudMs = millis();
+567:
+568:  digitalWrite(LED_PIN, HIGH);
+569:  Serial.printf("[MIC] REC START: %s (stop after %lu ms silence)\n", path, (unsigned long)durationMs);
+570:
+571:  while (true)
+572:  {
+573:    server.handleClient();
+574:    if (!nodeEnabled)
+575:      break;
+576:
+577:    if (millis() - lastRecordLoudMs >= durationMs)
+578:    {
+579:      Serial.println("[MIC] Silence timeout -> stop recording");
+580:      break;
+581:    }
+582:
+583:    if (samplesRecorded >= maxSamplesAllowed)
+584:    {
+585:      Serial.println("[MIC] Max file size reached -> stop recording");
+586:      break;
+587:    }
+588:
+589:    if (i2s_read(I2S_PORT, (void *)i2sData, MIC_I2S_READ_LEN, &bytesRead, portMAX_DELAY) != ESP_OK)
+590:    {
+591:      Serial.println("[MIC] i2s_read failed");
+592:      break;
+593:    }
+594:
+595:    int32_t *samples32 = (int32_t *)i2sData;
+596:    int sampleCount = bytesRead / 4;
+597:
+598:    int64_t frameSumSq15 = 0;
+599:    int framePeak15 = 0;
+600:
+601:    for (int i = 0; i < sampleCount && samplesRecorded < maxSamplesAllowed; i++)
+602:    {
+603:      int32_t raw = samples32[i];
+604:
+605:      int32_t s14 = raw >> 14;
+606:      if (s14 > 32767)
+607:        s14 = 32767;
+608:      if (s14 < -32768)
+609:        s14 = -32768;
+610:
+611:      int32_t s15 = raw >> 15;
+612:      if (s15 > 32767)
+613:        s15 = 32767;
+614:      if (s15 < -32768)
+615:        s15 = -32768;
+616:
+617:      int a14 = abs((int)s14);
+618:      int a15 = abs((int)s15);
+619:      if (a14 > recPeak14)
+620:        recPeak14 = a14;
+621:      if (a15 > recPeak15)
+622:        recPeak15 = a15;
+623:      if (a15 > framePeak15)
+624:        framePeak15 = a15;
+625:      frameSumSq15 += (int64_t)s15 * (int64_t)s15;
+626:
+627:      int16_t s16 = (int16_t)s14;
+628:      audioFile.write((uint8_t *)&s16, sizeof(s16));
+629:
+630:      totalDataBytes += sizeof(s16);
+631:      samplesRecorded++;
+632:    }
+633:
+634:    int frameRms15 = (sampleCount > 0) ? (int)sqrt((float)frameSumSq15 / (float)sampleCount) : 0;
+635:    if (frameRms15 >= MIC_TRIGGER_RMS_LEVEL || framePeak15 >= (MIC_TRIGGER_RMS_LEVEL * 2))
+636:    {
+637:      lastRecordLoudMs = millis();
+638:    }
+639:
+640:    if (millis() - lastRecLogMs >= REC_LOG_INTERVAL_MS)
+641:    {
+642:      Serial.printf("[MIC] REC LOG peak14=%d peak15=%d rms15=%d silence_ms=%lu samples=%lu\n",
+643:                    recPeak14, recPeak15, frameRms15,
+644:                    (unsigned long)(millis() - lastRecordLoudMs),
+645:                    (unsigned long)samplesRecorded);
+646:      recPeak14 = 0;
+647:      recPeak15 = 0;
+648:      lastRecLogMs = millis();
+649:    }
+650:  }
+651:
+652:  uint32_t chunkSize = 36 + totalDataBytes;
+653:  uint32_t subchunk1Size = 16;
+654:  uint16_t audioFormat = 1;
+655:  uint16_t channels = 1;
+656:  uint32_t sampleRate = MIC_SAMPLE_RATE;
+657:  uint16_t bitsPerSample = MIC_SAMPLE_BITS;
+658:  uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+659:  uint16_t blockAlign = channels * bitsPerSample / 8;
+660:
+661:  audioFile.seek(0);
+662:  audioFile.write((const uint8_t *)"RIFF", 4);
+663:  audioFile.write((uint8_t *)&chunkSize, 4);
+664:  audioFile.write((const uint8_t *)"WAVE", 4);
+665:  audioFile.write((const uint8_t *)"fmt ", 4);
+666:  audioFile.write((uint8_t *)&subchunk1Size, 4);
+667:  audioFile.write((uint8_t *)&audioFormat, 2);
+668:  audioFile.write((uint8_t *)&channels, 2);
+669:  audioFile.write((uint8_t *)&sampleRate, 4);
+670:  audioFile.write((uint8_t *)&byteRate, 4);
+671:  audioFile.write((uint8_t *)&blockAlign, 2);
+672:  audioFile.write((uint8_t *)&bitsPerSample, 2);
+673:  audioFile.write((const uint8_t *)"data", 4);
+674:  audioFile.write((uint8_t *)&totalDataBytes, 4);
+675:
+676:  audioFile.close();
+677:  digitalWrite(LED_PIN, LOW);
+678:
+679:  recordingInProgress = false;
+680:
+681:  Serial.printf("[MIC] REC DONE: %s (%lu bytes audio)\n", path, (unsigned long)totalDataBytes);
+682:  return totalDataBytes > 0;
+683:}
+684:
+685:void handleAutoMicRecord()
+686:{
+687:  if (!micReady || !sdReady || recordingInProgress || !micArmed)
+688:    return;
+689:
+690:  if (syncPending || syncInProgress || peerSyncRequestInProgress)
+691:    return;
+692:
+693:  if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS)
+694:    return;
+695:
+696:  static int voiceFrames = 0;
+697:  static unsigned long lastLogMs = 0;
+698:
+699:  MicVoiceStats st = readMicVoiceStats();
+700:
+701:  if (millis() - lastLogMs >= MIC_LOG_INTERVAL_MS)
+702:  {
+703:    Serial.printf("[MIC] peak13=%d peak15=%d rms15=%d zcr=%d voice=%s frames=%d/%d\n",
+704:                  st.peak13, st.peak15, st.rms15, st.zcr,
+705:                  st.voiceLike ? "yes" : "no",
+706:                  voiceFrames, MIC_VOICE_FRAMES_TO_TRIGGER);
+707:    lastLogMs = millis();
+708:  }
+709:
+710:  if (st.voiceLike)
+711:    voiceFrames++;
+712:  else
+713:    voiceFrames = 0;
+714:
+715:  if (voiceFrames >= MIC_VOICE_FRAMES_TO_TRIGGER)
+716:  {
+717:    String path = genMicFilename();
+718:    lastMicWavFile = path;
+719:    lastMicTriggerMs = millis();
+720:    micArmed = false;
+721:    voiceFrames = 0;
+722:
+723:    Serial.printf("[FLOW] Human-like voice trigger peak13=%d peak15=%d rms15=%d zcr=%d\n",
+724:                  st.peak13, st.peak15, st.rms15, st.zcr);
+725:
+726:    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS);
+727:
+728:    if (ok)
+729:    {
+730:      Serial.println("[FLOW] Record done -> priority peer sync");
+731:      markLocalFileChanged("mic record " + path);
+732:    }
+733:    else
+734:    {
+735:      Serial.println("[FLOW] Record failed -> skip sync");
+736:    }
+737:  }
+738:}
+739:
+740:bool verifyPeerHasLocalFile(const String &localPath)
+741:{
+742:  if (!sdReady || localPath.length() == 0)
+743:    return false;
+744:
+745:  String base = localPath;
+746:  int slash = base.lastIndexOf('/');
+747:  if (slash >= 0)
+748:    base = base.substring(slash + 1);
+749:  if (base.length() == 0)
+750:    return false;
+751:
+752:  String displayRec = "rec/" + base;
+753:  size_t localSize = 0;
+754:  if (SD.exists(localPath))
+755:  {
+756:    File f = SD.open(localPath, "r");
+757:    if (f)
+758:    {
+759:      localSize = f.size();
+760:      f.close();
+761:    }
+762:  }
+763:
+764:  String listJson = httpGetFromPeer("/file/list", 5000);
+765:  if (listJson.length() == 0)
+766:  {
+767:    Serial.println("[PrioritySync] Verify: Phantom-2 /file/list empty");
+768:    return false;
+769:  }
+770:
+771:  bool hasName = (listJson.indexOf("\"name\":\"" + displayRec + "\"") >= 0) ||
+772:                 (listJson.indexOf("\"name\":\"" + base + "\"") >= 0) ||
+773:                 (listJson.indexOf(displayRec) >= 0) ||
+774:                 (listJson.indexOf(base) >= 0);
+775:
+776:  bool sizeOk = true;
+777:  if (localSize > 0)
+778:    sizeOk = (listJson.indexOf("\"size\":" + String((uint32_t)localSize)) >= 0);
+779:
+780:  Serial.printf("[PrioritySync] Verify Phantom-2 has '%s': name=%s size=%s localSize=%lu\n",
+781:                displayRec.c_str(),
+782:                hasName ? "yes" : "no",
+783:                sizeOk ? "yes" : "no",
+784:                (unsigned long)localSize);
+785:
+786:  return hasName && sizeOk;
+787:}
+788:
+789:// ── JSON WAV info ─────────────────────────────────────────────
+790:String wavInfoJson(const uint8_t *buf, size_t size)
+791:{
+792:  if (!buf || size < 44)
+793:    return "{}";
+794:  if (buf[0] != 'R' || buf[1] != 'I' || buf[2] != 'F' || buf[3] != 'F')
+795:    return "{\"is_wav\":false}";
+796:  if (buf[8] != 'W' || buf[9] != 'A' || buf[10] != 'V' || buf[11] != 'E')
+797:    return "{\"is_wav\":false}";
+798:
+799:  uint16_t fmt = buf[20] | (buf[21] << 8);
+800:  uint16_t ch = buf[22] | (buf[23] << 8);
+801:  uint32_t sr = buf[24] | (buf[25] << 8) | (buf[26] << 16) | (buf[27] << 24);
+802:  uint16_t bps = buf[34] | (buf[35] << 8);
+803:  uint32_t dsz = buf[40] | (buf[41] << 8) | (buf[42] << 16) | (buf[43] << 24);
+804:  float dur = (sr > 0 && ch > 0 && bps > 0) ? (float)dsz / (sr * ch * (bps / 8)) : 0.0f;
+805:
+806:  String j = "{\"is_wav\":true";
+807:  j += ",\"format\":\"" + String(fmt == 1 ? "PCM" : fmt == 3 ? "FLOAT"
+808:                                                             : "OTHER") +
+809:       "\"";
+810:  j += ",\"channels\":" + String(ch);
+811:  j += ",\"sample_rate\":" + String(sr);
+812:  j += ",\"bits_per_sample\":" + String(bps);
+813:  j += ",\"data_size\":" + String(dsz);
+814:  j += ",\"duration_sec\":" + String(dur, 2) + "}";
+815:  return j;
+816:}
+817:
+818:// ── Battery helpers ───────────────────────────────────────────
+819:float readBatteryVoltage()
+820:{
+821:  uint32_t sum = 0;
+822:  for (int i = 0; i < 16; i++)
+823:  {
+824:    sum += analogRead(BATTERY_ADC_PIN);
+825:    delayMicroseconds(200);
+826:  }
+827:  float raw = sum / 16.0f;
+828:  float vAdc = (raw / 4095.0f) * 3.3f;
+829:  return vAdc * BATTERY_DIVIDER;
+830:}
+831:
+832:int batteryPercent(float v)
+833:{
+834:  if (v <= BATTERY_V_MIN)
+835:    return 0;
+836:  if (v >= BATTERY_V_MAX)
+837:    return 100;
+838:  return (int)(((v - BATTERY_V_MIN) / (BATTERY_V_MAX - BATTERY_V_MIN)) * 100.0f + 0.5f);
+839:}
+840:
+841:int readBatteryRaw()
+842:{
+843:  uint32_t sum = 0;
+844:  for (int i = 0; i < 16; i++)
+845:  {
+846:    sum += analogRead(BATTERY_ADC_PIN);
+847:    delayMicroseconds(200);
+848:  }
+849:  return (int)(sum / 16);
+850:}
+851:
+852:// ── Uptime / count ────────────────────────────────────────────
+853:String formatUptime(uint32_t ms)
+854:{
+855:  uint32_t s = ms / 1000;
+856:  uint32_t m = s / 60;
+857:  s %= 60;
+858:  uint32_t h = m / 60;
+859:  m %= 60;
+860:  char b[32];
+861:  snprintf(b, sizeof(b), "%02d:%02d:%02d", h, m, s);
+862:  return String(b);
+863:}
+864:
+865:int countSdFiles()
+866:{
+867:  if (!sdReady)
+868:    return 0;
+869:  int n = 0;
+870:  File root = SD.open("/");
+871:  File fi = root.openNextFile();
+872:  while (fi)
+873:  {
+874:    if (!fi.isDirectory())
+875:      n++;
+876:    fi.close();
+877:    fi = root.openNextFile();
+878:  }
+879:  root.close();
+880:  return n;
+881:}
+882:
+883:// ── AP restore ────────────────────────────────────────────────
+884:void restoreMyAP()
+885:{
+886:  WiFi.mode(WIFI_AP_STA);
+887:  WiFi.setSleep(false);
+888:
+889:  IPAddress apIP(192, 168, 4, 1);
+890:  IPAddress gw(192, 168, 4, 1);
+891:  IPAddress sn(255, 255, 255, 0);
+892:
+893:  WiFi.softAPConfig(apIP, gw, sn);
+894:  WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
+895:
+896:  server.begin();
+897:  audioServer.begin();
+898:  uploadServer.begin();
+899:
+900:  Serial.printf("[WiFi] Phantom-1 AP restored max_clients=%d clients=%d\n",
+901:                MY_AP_MAX_CON, WiFi.softAPgetStationNum());
+902:}
+903:
+904:// ── Debug WiFi scan trước khi connect peer ─────────────────────
+905:void debugScanPeerNetworks(const char *targetSsid)
+906:{
+907:  Serial.println("[WiFi] Scan before peer connect...");
+908:  int n = WiFi.scanNetworks(false, true);
+909:  bool found = false;
+910:  if (n <= 0)
+911:  {
+912:    Serial.println("[WiFi] Scan result: no network found");
+913:  }
+914:  else
+915:  {
+916:    for (int i = 0; i < n; i++)
+917:    {
+918:      String ssid = WiFi.SSID(i);
+919:      Serial.printf("  SSID[%d]=%s RSSI=%d CH=%d\n",
+920:                    i,
+921:                    ssid.c_str(),
+922:                    WiFi.RSSI(i),
+923:                    WiFi.channel(i));
+924:      if (ssid == String(targetSsid))
+925:        found = true;
+926:    }
+927:  }
+928:  WiFi.scanDelete();
+929:  Serial.printf("[WiFi] Target '%s': %s\n", targetSsid, found ? "FOUND" : "NOT FOUND");
+930:}
+931:
+932:// ── HTTP GET text tu Phantom-2 ────────────────────────────────
+933:String httpGetFromPeer(const char *path, int timeoutMs = 6000)
+934:{
+935:  WiFiClient c;
+936:  if (!c.connect(PEER_IP, PEER_HTTP_PORT))
+937:    return "";
+938:
+939:  c.printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, PEER_IP);
+940:
+941:  int contentLength = -1;
+942:  unsigned long t = millis();
+943:
+944:  while (c.connected() && (millis() - t) < (unsigned long)timeoutMs)
+945:  {
+946:    if (!c.available())
+947:    {
+948:      delay(1);
+949:      continue;
+950:    }
+951:
+952:    String line = c.readStringUntil('\n');
+953:    line.trim();
+954:    if (line.length() == 0)
+955:      break;
+956:
+957:    String lo = line;
+958:    lo.toLowerCase();
+959:    if (lo.startsWith("content-length:"))
+960:    {
+961:      String val = line.substring(line.indexOf(':') + 1);
+962:      val.trim();
+963:      contentLength = val.toInt();
+964:    }
+965:    t = millis();
+966:  }
+967:
+968:  String body = "";
+969:  uint8_t buf[1024];
+970:  if (contentLength > 0)
+971:    body.reserve(contentLength + 4);
+972:  t = millis();
+973:
+974:  while ((c.connected() || c.available()) && (millis() - t) < (unsigned long)timeoutMs)
+975:  {
+976:    size_t av = c.available();
+977:    if (av > 0)
+978:    {
+979:      size_t rd = c.read(buf, min(av, (size_t)1024));
+980:      body.concat((const char *)buf, rd);
+981:      t = millis();
+982:      if (contentLength > 0 && (int)body.length() >= contentLength)
+983:        break;
+984:    }
+985:    else
+986:    {
+987:      delay(1);
+988:    }
+989:  }
+990:
+991:  c.stop();
+992:  return body;
+993:}
+994:
+995:// ── Lay size tu JSON list cua peer ────────────────────────────
+996:int32_t getRemoteFileSize(const String &listJson, const String &fname)
+997:{
+998:  int pos = 0;
+999:  while (true)
+1000:  {
+1001:    int ni = listJson.indexOf("\"name\":\"", pos);
+1002:    if (ni < 0)
+1003:      break;
+1004:    ni += 8;
+1005:
+1006:    int ne = listJson.indexOf("\"", ni);
+1007:    if (ne < 0)
+1008:      break;
+1009:
+1010:    String n = listJson.substring(ni, ne);
+1011:    if (n == fname)
+1012:    {
+1013:      int si = listJson.indexOf("\"size\":", ne);
+1014:      if (si < 0)
+1015:        return -1;
+1016:      si += 7;
+1017:      while (si < (int)listJson.length() && listJson[si] == ' ')
+1018:        si++;
+1019:
+1020:      String numStr = "";
+1021:      while (si < (int)listJson.length() && isDigit(listJson[si]))
+1022:      {
+1023:        numStr += listJson[si];
+1024:        si++;
+1025:      }
+1026:      return numStr.toInt();
+1027:    }
+1028:    pos = ne + 1;
+1029:  }
+1030:  return -1;
+1031:}
+1032:
+1033:// ── Download 1 file tu Phantom-2 ──────────────────────────────
+1034:bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist = nullptr)
+1035:{
+1036:  String path = "/file/download?name=" + filename;
+1037:
+1038:  WiFiClient _own;
+1039:  WiFiClient *c = persist ? persist : &_own;
+1040:
+1041:  if (!persist)
+1042:  {
+1043:    if (!c->connect(PEER_IP, PEER_HTTP_PORT))
+1044:    {
+1045:      Serial.printf("[Sync] HTTP connect FAILED for '%s'\n", filename.c_str());
+1046:      return false;
+1047:    }
+1048:  }
+1049:  else if (!c->connected())
+1050:  {
+1051:    c->stop();
+1052:    if (!c->connect(PEER_IP, PEER_HTTP_PORT))
+1053:    {
+1054:      Serial.printf("[Sync] HTTP reconnect FAILED for '%s'\n", filename.c_str());
+1055:      return false;
+1056:    }
+1057:  }
+1058:
+1059:  c->printf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
+1060:            path.c_str(), PEER_IP);
+1061:
+1062:  int contentLength = 0;
+1063:  bool is200 = false;
+1064:  unsigned long t = millis();
+1065:
+1066:  while (c->connected() && (millis() - t) < 8000)
+1067:  {
+1068:    if (!c->available())
+1069:    {
+1070:      delay(1);
+1071:      continue;
+1072:    }
+1073:
+1074:    String line = c->readStringUntil('\n');
+1075:    line.trim();
+1076:    if (line.length() == 0)
+1077:      break;
+1078:
+1079:    String lo = line;
+1080:    lo.toLowerCase();
+1081:
+1082:    if (lo.startsWith("http/"))
+1083:    {
+1084:      is200 = (lo.indexOf(" 200") >= 0);
+1085:      if (!is200)
+1086:      {
+1087:        if (!persist)
+1088:          c->stop();
+1089:        Serial.printf("[Sync] Non-200 for '%s': %s\n", filename.c_str(), line.c_str());
+1090:        return false;
+1091:      }
+1092:    }
+1093:
+1094:    if (lo.startsWith("content-length:"))
+1095:      contentLength = line.substring(line.indexOf(':') + 1).toInt();
+1096:
+1097:    t = millis();
+1098:  }
+1099:
+1100:  if (contentLength <= 0 || contentLength > (int)MAX_FILE_SIZE)
+1101:  {
+1102:    if (!persist)
+1103:      c->stop();
+1104:    Serial.printf("[Sync] Bad CL=%d for '%s'\n", contentLength, filename.c_str());
+1105:    return false;
+1106:  }
+1107:
+1108:  String sdPath = "/" + filename;
+1109:  if (SD.exists(sdPath))
+1110:    SD.remove(sdPath);
+1111:
+1112:  File f = SD.open(sdPath, "w");
+1113:  if (!f)
+1114:  {
+1115:    if (!persist)
+1116:      c->stop();
+1117:    Serial.printf("[Sync] SD open FAILED for '%s'\n", filename.c_str());
+1118:    return false;
+1119:  }
+1120:
+1121:  uint8_t chunk[4096];
+1122:  size_t rx = 0;
+1123:  t = millis();
+1124:
+1125:  while (rx < (size_t)contentLength && (c->connected() || c->available()) && (millis() - t) < 45000)
+1126:  {
+1127:    size_t av = c->available();
+1128:    if (av > 0)
+1129:    {
+1130:      size_t want = min(av, min((size_t)4096, (size_t)(contentLength - rx)));
+1131:      size_t rd = c->readBytes(chunk, want);
+1132:      if (rd > 0)
+1133:      {
+1134:        f.write(chunk, rd);
+1135:        rx += rd;
+1136:        t = millis();
+1137:      }
+1138:    }
+1139:    else
+1140:    {
+1141:      delay(1);
+1142:    }
+1143:  }
+1144:
+1145:  f.close();
+1146:  if (!persist)
+1147:    c->stop();
+1148:
+1149:  Serial.printf("[Sync] '%s' rx=%d/%d bytes\n", filename.c_str(), rx, contentLength);
+1150:
+1151:  bool saved = false;
+1152:  if (rx > 0 && SD.exists(sdPath))
+1153:  {
+1154:    File chk = SD.open(sdPath, "r");
+1155:    if (chk)
+1156:    {
+1157:      saved = ((size_t)chk.size() == rx);
+1158:      chk.close();
+1159:    }
+1160:  }
+1161:
+1162:  if (!saved)
+1163:  {
+1164:    SD.remove(sdPath);
+1165:    Serial.printf("[Sync] '%s' verify FAIL -> delete\n", filename.c_str());
+1166:    return false;
+1167:  }
+1168:
+1169:  if (filename == "audio.wav" && rx <= 2000000)
+1170:  {
+1171:    if (ESP.getFreeHeap() > (int)rx + 32768)
+1172:    {
+1173:      if (ramBuf)
+1174:      {
+1175:        free(ramBuf);
+1176:        ramBuf = nullptr;
+1177:        ramSize = 0;
+1178:        ramReady = false;
+1179:      }
+1180:
+1181:      File fw = SD.open(sdPath, "r");
+1182:      if (fw)
+1183:      {
+1184:        ramBuf = (uint8_t *)malloc(rx);
+1185:        if (ramBuf)
+1186:        {
+1187:          size_t rd = fw.read(ramBuf, rx);
+1188:          fw.close();
+1189:          ramSize = rd;
+1190:          ramReady = (rd >= 44);
+1191:        }
+1192:        else
+1193:          fw.close();
+1194:      }
+1195:    }
+1196:  }
+1197:
+1198:  Serial.printf("[Sync] '%s' %d bytes -> OK heap=%d\n",
+1199:                filename.c_str(), rx, ESP.getFreeHeap());
+1200:  return true;
+1201:}
+1202:
+1203:// ── Check peer busy before sync ───────────────────────────────
+1204:// Phantom-2 se bao busy=true khi dang ghi am hoac dang sync.
+1205:bool isPeerBusy()
+1206:{
+1207:  String body = httpGetFromPeer("/busy", 3000);
+1208:  if (body.length() == 0)
+1209:  {
+1210:    // Firmware cu chua co /busy: fallback check /status recording=true
+1211:    body = httpGetFromPeer("/status", 3000);
+1212:  }
+1213:
+1214:  if (body.indexOf("\"busy\":true") >= 0 ||
+1215:      body.indexOf("\"recording\":true") >= 0 ||
+1216:      body.indexOf("\"sync_in_progress\":true") >= 0)
+1217:  {
+1218:    Serial.println("[Sync] Peer is BUSY -> skip this sync");
+1219:    syncMsg = "skip: Phantom-2 busy";
+1220:    return true;
+1221:  }
+1222:
+1223:  return false;
+1224:}
+1225:
+1226:// ── Dong bo tat ca file tu Phantom-2 ve Phantom-1 ─────────────
+1227:bool syncFromPeer()
+1228:{
+1229:  if (syncInProgress)
+1230:  {
+1231:    syncMsg = "busy: Phantom-1 already syncing";
+1232:    Serial.println("[Sync] Local busy -> skip");
+1233:    return false;
+1234:  }
+1235:
+1236:  syncInProgress = true;
+1237:  Serial.println("\n[Sync] == Bat dau ket noi Phantom-2 ==");
+1238:  syncMsg = "connecting Phantom-2";
+1239:
+1240:  WiFi.mode(WIFI_AP_STA);
+1241:  WiFi.setSleep(false);
+1242:  WiFi.disconnect(false);
+1243:  delay(200);
+1244:  debugScanPeerNetworks(PEER_SSID);
+1245:  Serial.printf("[WiFi] Connecting to %s ...\n", PEER_SSID);
+1246:  WiFi.begin(PEER_SSID, PEER_PASSWORD);
+1247:
+1248:  int retries = 0;
+1249:  while (WiFi.status() != WL_CONNECTED && retries < 30)
+1250:  {
+1251:    unsigned long tw = millis();
+1252:    while (millis() - tw < 300)
+1253:    {
+1254:      server.handleClient();
+1255:      delay(5);
+1256:    }
+1257:    Serial.print(".");
+1258:    retries++;
+1259:  }
+1260:
+1261:  if (WiFi.status() != WL_CONNECTED)
+1262:  {
+1263:    Serial.println("\n[Sync] FAILED: Phantom-2 not found");
+1264:    syncMsg = "failed: Phantom-2 not found";
+1265:    WiFi.disconnect(false);
+1266:    restoreMyAP();
+1267:    syncInProgress = false;
+1268:    return false;
+1269:  }
+1270:
+1271:  Serial.printf("\n[Sync] Connected Phantom-2. STA IP: %s\n",
+1272:                WiFi.localIP().toString().c_str());
+1273:  delay(100);
+1274:
+1275:  // IMPORTANT FIX:
+1276:  // Do NOT call isPeerBusy() here. When Phantom-2 has just finished recording,
+1277:  // it may report busy because it is waiting for Phantom-1 to pull the new file.
+1278:  // If Phantom-1 skips here, Phantom-2 can falsely think sync is done.
+1279:  // The real protection is on Phantom-2's POST /sync handler: it rejects sync
+1280:  // while recordingInProgress or syncInProgress is true.
+1281:
+1282:  String listJson = "";
+1283:  for (int attempt = 0; attempt < 3; attempt++)
+1284:  {
+1285:    listJson = httpGetFromPeer("/file/list", 4000);
+1286:    if (listJson.length() > 10 && listJson.indexOf("\"name\"") >= 0)
+1287:      break;
+1288:
+1289:    Serial.printf("[Sync] /file/list empty attempt %d/3\n", attempt + 1);
+1290:    unsigned long tw = millis();
+1291:    while (millis() - tw < 300)
+1292:    {
+1293:      server.handleClient();
+1294:      delay(5);
+1295:    }
+1296:  }
+1297:
+1298:  int peerCount = 0;
+1299:  {
+1300:    int p = 0;
+1301:    while (listJson.indexOf("\"name\":\"", p) >= 0)
+1302:    {
+1303:      int ni = listJson.indexOf("\"name\":\"", p) + 8;
+1304:      int ne = listJson.indexOf("\"", ni);
+1305:      if (ne < 0)
+1306:        break;
+1307:      peerCount++;
+1308:      p = ne + 1;
+1309:    }
+1310:  }
+1311:
+1312:  Serial.printf("[Sync] Peer list: %d file(s)\n", peerCount);
+1313:
+1314:  if (listJson.indexOf("\"count\":0") >= 0 || listJson.indexOf("\"files\":[]") >= 0 || peerCount == 0)
+1315:  {
+1316:    Serial.println("[Sync] Phantom-2 has no file");
+1317:    WiFi.disconnect(false);
+1318:    restoreMyAP();
+1319:    syncMsg = "ok: Phantom-2 empty";
+1320:    syncInProgress = false;
+1321:    return false;
+1322:  }
+1323:
+1324:  std::vector<String> remoteFiles;
+1325:  int pos = 0;
+1326:  while (true)
+1327:  {
+1328:    int ni = listJson.indexOf("\"name\":\"", pos);
+1329:    if (ni < 0)
+1330:      break;
+1331:    ni += 8;
+1332:
+1333:    int ne = listJson.indexOf("\"", ni);
+1334:    if (ne < 0)
+1335:      break;
+1336:
+1337:    String fname = listJson.substring(ni, ne);
+1338:    if (fname.length() > 0)
+1339:      remoteFiles.push_back(fname);
+1340:
+1341:    pos = ne + 1;
+1342:  }
+1343:
+1344:  int downloaded = 0;
+1345:  int skipped = 0;
+1346:  int updated = 0;
+1347:
+1348:  WiFiClient keepAlive;
+1349:  if (!keepAlive.connect(PEER_IP, PEER_HTTP_PORT))
+1350:  {
+1351:    Serial.println("[Sync] Keep-alive connect FAILED - fallback per-file");
+1352:    keepAlive.stop();
+1353:  }
+1354:
+1355:  bool useKeepAlive = keepAlive.connected();
+1356:  Serial.printf("[Sync] Keep-alive: %s\n", useKeepAlive ? "ON" : "OFF");
+1357:
+1358:  for (auto &fname : remoteFiles)
+1359:  {
+1360:    String path = "/" + fname;
+1361:    int32_t remoteSize = getRemoteFileSize(listJson, fname);
+1362:
+1363:    if (SD.exists(path))
+1364:    {
+1365:      File f = SD.open(path, "r");
+1366:      size_t localSize = f ? f.size() : 0;
+1367:      if (f)
+1368:        f.close();
+1369:
+1370:      if (remoteSize > 0 && (int32_t)localSize == remoteSize)
+1371:      {
+1372:        Serial.printf("[Sync] Skip '%s' - already exists (%d bytes)\n",
+1373:                      fname.c_str(), (int)localSize);
+1374:        skipped++;
+1375:        continue;
+1376:      }
+1377:
+1378:      Serial.printf("[Sync] Update '%s' local=%d remote=%d\n",
+1379:                    fname.c_str(), (int)localSize, (int)remoteSize);
+1380:      SD.remove(path);
+1381:
+1382:      bool ok = httpDownloadFileFromPeer(fname, useKeepAlive ? &keepAlive : nullptr);
+1383:      if (ok)
+1384:      {
+1385:        downloaded++;
+1386:        updated++;
+1387:      }
+1388:    }
+1389:    else
+1390:    {
+1391:      Serial.printf("[Sync] Download new '%s' (%d bytes)\n", fname.c_str(), remoteSize);
+1392:      bool ok = httpDownloadFileFromPeer(fname, useKeepAlive ? &keepAlive : nullptr);
+1393:      if (ok)
+1394:        downloaded++;
+1395:    }
+1396:  }
+1397:
+1398:  if (useKeepAlive)
+1399:    keepAlive.stop();
+1400:
+1401:  if (downloaded > 0)
+1402:    blinkLED(5, 100);
+1403:
+1404:  WiFi.disconnect(false);
+1405:  delay(100);
+1406:  restoreMyAP();
+1407:
+1408:  Serial.printf("[Sync] Result: downloaded=%d updated=%d skipped=%d total=%d\n",
+1409:                downloaded, updated, skipped, (int)remoteFiles.size());
+1410:
+1411:  if (!ramReady && !remoteFiles.empty())
+1412:  {
+1413:    for (auto &fname : remoteFiles)
+1414:    {
+1415:      String fl = fname;
+1416:      fl.toLowerCase();
+1417:      if (!fl.endsWith(".wav"))
+1418:        continue;
+1419:
+1420:      String firstFile = "/" + fname;
+1421:      if (SD.exists(firstFile))
+1422:      {
+1423:        File f = SD.open(firstFile, "r");
+1424:        if (f)
+1425:        {
+1426:          size_t sz = f.size();
+1427:          if (sz <= 2000000)
+1428:          {
+1429:            if (ramBuf)
+1430:            {
+1431:              free(ramBuf);
+1432:              ramBuf = nullptr;
+1433:            }
+1434:
+1435:            ramBuf = (uint8_t *)malloc(sz);
+1436:            if (ramBuf)
+1437:            {
+1438:              size_t rd = f.read(ramBuf, sz);
+1439:              f.close();
+1440:              ramSize = rd;
+1441:              ramReady = (rd >= 44);
+1442:            }
+1443:            else
+1444:              f.close();
+1445:          }
+1446:          else
+1447:            f.close();
+1448:
+1449:          if (ramReady)
+1450:            break;
+1451:        }
+1452:      }
+1453:    }
+1454:  }
+1455:
+1456:  syncMsg = "ok: synced " + String(downloaded) + "/" + String(remoteFiles.size()) + " files from Phantom-2";
+1457:  syncInProgress = false;
+1458:  return (downloaded > 0);
+1459:}
+1460:
+1461:// ── HTTP Handlers ─────────────────────────────────────────────
+1462:void handleStatus()
+1463:{
+1464:  float _bv = readBatteryVoltage();
+1465:  int _bp = batteryPercent(_bv);
+1466:  int _br = readBatteryRaw();
+1467:
+1468:  server.send(200, "application/json",
+1469:              String("{\"node\":1") +
+1470:                  ",\"ap_ssid\":\"" + MY_AP_SSID + "\"" +
+1471:                  ",\"ap_ip\":\"" + MY_AP_IP_STR + "\"" +
+1472:                  ",\"ap_clients\":" + String(WiFi.softAPgetStationNum()) +
+1473:                  ",\"peer_ssid\":\"" + PEER_SSID + "\"" +
+1474:                  ",\"peer_ip\":\"" + PEER_IP + "\"" +
+1475:                  ",\"uptime\":\"" + formatUptime(millis()) + "\"" +
+1476:                  ",\"free_heap\":" + String(ESP.getFreeHeap()) +
+1477:                  ",\"sync_done\":" + (syncDone ? "true" : "false") +
+1478:                  ",\"sync_failed\":" + (syncFailed ? "true" : "false") +
+1479:                  ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false") +
+1480:                  ",\"busy\":" + String((recordingInProgress || syncInProgress || peerSyncRequestInProgress) ? "true" : "false") +
+1481:                  ",\"sync_msg\":\"" + syncMsg + "\"" +
+1482:                  ",\"sd_has_file\":" + (sdHasFile() ? "true" : "false") +
+1483:                  ",\"sd_ready\":" + String(sdReady ? "true" : "false") +
+1484:                  ",\"mic_ready\":" + String(micReady ? "true" : "false") +
+1485:                  ",\"recording\":" + String(recordingInProgress ? "true" : "false") +
+1486:                  ",\"last_mic_file\":\"" + lastMicWavFile + "\"" +
+1487:                  ",\"sd_total\":" + String(sdReady ? (uint32_t)(SD.totalBytes() / 1024) : 0) + " KB" +
+1488:                  ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0) + " KB" +
+1489:                  ",\"ram_ready\":" + (ramReady ? "true" : "false") +
+1490:                  ",\"ram_size\":" + String(ramSize) +
+1491:                  ",\"node_enabled\":" + (nodeEnabled ? "true" : "false") +
+1492:                  ",\"builtin_wav_size\":" + String(TEST_WAV_SIZE) +
+1493:                  ",\"battery_voltage\":" + String(_bv, 2) +
+1494:                  ",\"battery_voltage_raw\":" + String(_br) +
+1495:                  ",\"battery_percent\":" + String(_bp) + "}");
+1496:}
+1497:
+1498:void handleBattery()
+1499:{
+1500:  float v = readBatteryVoltage();
+1501:  int p = batteryPercent(v);
+1502:  int r = readBatteryRaw();
+1503:
+1504:  String j = "{\"voltage\":" + String(v, 2) +
+1505:             ",\"voltage_raw\":" + String(r) +
+1506:             ",\"percent\":" + String(p) +
+1507:             ",\"v_min\":" + String(BATTERY_V_MIN, 1) +
+1508:             ",\"v_max\":" + String(BATTERY_V_MAX, 1) +
+1509:             ",\"adc_pin\":" + String(BATTERY_ADC_PIN) +
+1510:             ",\"divider\":" + String(BATTERY_DIVIDER, 1) + "}";
+1511:  server.send(200, "application/json", j);
+1512:}
+1513:
+1514:void handleFileInfo()
+1515:{
+1516:  bool has = sdHasFile();
+1517:  size_t sz = sdFileSize();
+1518:
+1519:  String j = "{\"has_file\":" + String(has ? "true" : "false");
+1520:  j += ",\"path\":\"" + String(AUDIO_WAV_PATH) + "\"";
+1521:  j += ",\"size\":" + String(sz);
+1522:  j += ",\"size_kb\":" + String(sz / 1024.0f, 1);
+1523:  if (has && ramReady && ramBuf)
+1524:    j += ",\"wav_info\":" + wavInfoJson(ramBuf, ramSize);
+1525:  j += ",\"sync_done\":\"" + String(syncDone ? "true" : "false") + "\"";
+1526:  j += ",\"sync_msg\":\"" + syncMsg + "\"";
+1527:  j += ",\"free_heap\":" + String(ESP.getFreeHeap()) + "}";
+1528:  server.send(200, "application/json", j);
+1529:}
+1530:
+1531:void handleFileList()
+1532:{
+1533:  if (!sdReady)
+1534:  {
+1535:    server.send(500, "application/json", "{\"error\":\"sd not ready\"}");
+1536:    return;
+1537:  }
+1538:
+1539:  String j = "{\"files\":[";
+1540:  int count = 0;
+1541:
+1542:  auto appendFileJson = [&](const String &path, const String &displayName)
+1543:  {
+1544:    File f2 = SD.open(path, "r");
+1545:    if (!f2 || f2.isDirectory())
+1546:    {
+1547:      if (f2)
+1548:        f2.close();
+1549:      return;
+1550:    }
+1551:
+1552:    size_t sz = f2.size();
+1553:    String extChk = displayName;
+1554:    extChk.toLowerCase();
+1555:    bool isWav = extChk.endsWith(".wav");
+1556:    float dur = 0.0f;
+1557:
+1558:    if (isWav && sz >= 44)
+1559:    {
+1560:      uint8_t hdr[44];
+1561:      f2.seek(0);
+1562:      if (f2.read(hdr, 44) == 44)
+1563:      {
+1564:        uint16_t ch = hdr[22] | (hdr[23] << 8);
+1565:        uint32_t sr = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
+1566:        uint16_t bps = hdr[34] | (hdr[35] << 8);
+1567:        uint32_t dsz = hdr[40] | (hdr[41] << 8) | (hdr[42] << 16) | (hdr[43] << 24);
+1568:        if (sr > 0 && ch > 0 && bps > 0)
+1569:          dur = (float)dsz / (sr * ch * (bps / 8));
+1570:      }
+1571:    }
+1572:    f2.close();
+1573:
+1574:    int di = displayName.lastIndexOf('.');
+1575:    String extStr = (di >= 0) ? displayName.substring(di) : "";
+1576:    extStr.toLowerCase();
+1577:    String mime = mimeForExt(extStr);
+1578:
+1579:    if (count > 0)
+1580:      j += ",";
+1581:
+1582:    char sz_kb[16];
+1583:    snprintf(sz_kb, sizeof(sz_kb), "%.1f KB", sz / 1024.0f);
+1584:
+1585:    j += "{\"name\":\"" + displayName + "\"";
+1586:    j += ",\"path\":\"" + path + "\"";
+1587:    j += ",\"size\":" + String(sz);
+1588:    j += ",\"size_kb\":\"" + String(sz_kb) + "\"";
+1589:    j += ",\"mime\":\"" + mime + "\"";
+1590:    if (isWav)
+1591:      j += ",\"duration_sec\":" + String(dur, 2);
+1592:    j += "}";
+1593:    count++;
+1594:  };
+1595:
+1596:  File root = SD.open("/");
+1597:  if (root)
+1598:  {
+1599:    File fi = root.openNextFile();
+1600:    while (fi)
+1601:    {
+1602:      if (!fi.isDirectory())
+1603:      {
+1604:        String path = String(fi.name());
+1605:        if (!path.startsWith("/"))
+1606:          path = "/" + path;
+1607:        String displayName = path.startsWith("/") ? path.substring(1) : path;
+1608:        fi.close();
+1609:        appendFileJson(path, displayName);
+1610:      }
+1611:      else
+1612:      {
+1613:        fi.close();
+1614:      }
+1615:      fi = root.openNextFile();
+1616:    }
+1617:    root.close();
+1618:  }
+1619:
+1620:  File recRoot = SD.open("/rec");
+1621:  if (recRoot && recRoot.isDirectory())
+1622:  {
+1623:    File rf = recRoot.openNextFile();
+1624:    while (rf)
+1625:    {
+1626:      if (!rf.isDirectory())
+1627:      {
+1628:        String raw = String(rf.name());
+1629:        String base = raw;
+1630:        int slash = base.lastIndexOf('/');
+1631:        if (slash >= 0)
+1632:          base = base.substring(slash + 1);
+1633:        String path = "/rec/" + base;
+1634:        String displayName = "rec/" + base;
+1635:        rf.close();
+1636:        appendFileJson(path, displayName);
+1637:      }
+1638:      else
+1639:      {
+1640:        rf.close();
+1641:      }
+1642:      rf = recRoot.openNextFile();
+1643:    }
+1644:    recRoot.close();
+1645:  }
+1646:
+1647:  j += "],\"count\":" + String(count);
+1648:  j += ",\"sd_total\":" + String(sdReady ? (uint32_t)(SD.totalBytes() / 1024) : 0);
+1649:  j += ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0) + "}";
+1650:  server.send(200, "application/json", j);
+1651:}
+1652:
+1653:void handleFileDownload()
+1654:{
+1655:  String name = server.arg("name");
+1656:  name.trim();
+1657:
+1658:  String filePath, dlName;
+1659:  if (name.length() == 0)
+1660:  {
+1661:    filePath = AUDIO_WAV_PATH;
+1662:    dlName = "audio.wav";
+1663:  }
+1664:  else
+1665:  {
+1666:    String pathRaw = name.startsWith("/") ? name : ("/" + name);
+1667:    if (SD.exists(pathRaw))
+1668:    {
+1669:      filePath = pathRaw;
+1670:      dlName = name.startsWith("/") ? name.substring(1) : name;
+1671:    }
+1672:    else
+1673:    {
+1674:      String baseOnly = name;
+1675:      int slash = baseOnly.lastIndexOf('/');
+1676:      if (slash >= 0)
+1677:        baseOnly = baseOnly.substring(slash + 1);
+1678:
+1679:      String recPath = "/rec/" + baseOnly;
+1680:      if (SD.exists(recPath))
+1681:      {
+1682:        filePath = recPath;
+1683:        dlName = "rec/" + baseOnly;
+1684:      }
+1685:      else
+1686:      {
+1687:        String safe = sanitizeFilename(baseOnly);
+1688:        if (safe.length() == 0)
+1689:        {
+1690:          server.send(400, "application/json", "{\"error\":\"invalid filename\"}");
+1691:          return;
+1692:        }
+1693:
+1694:        String rootSafe = "/" + safe;
+1695:        String recSafe = "/rec/" + safe;
+1696:        if (SD.exists(rootSafe))
+1697:        {
+1698:          filePath = rootSafe;
+1699:          dlName = safe;
+1700:        }
+1701:        else if (SD.exists(recSafe))
+1702:        {
+1703:          filePath = recSafe;
+1704:          dlName = "rec/" + safe;
+1705:        }
+1706:        else
+1707:        {
+1708:          filePath = rootSafe;
+1709:          dlName = safe;
+1710:        }
+1711:      }
+1712:    }
+1713:  }
+1714:
+1715:  int di = dlName.lastIndexOf('.');
+1716:  String ext = (di >= 0) ? dlName.substring(di) : "";
+1717:  ext.toLowerCase();
+1718:  String mime = mimeForExt(ext);
+1719:
+1720:  if (SD.exists(filePath))
+1721:  {
+1722:    File f = SD.open(filePath, "r");
+1723:    if (f)
+1724:    {
+1725:      size_t sz = f.size();
+1726:      WiFiClient cli = server.client();
+1727:      cli.printf("HTTP/1.1 200 OK\r\n"
+1728:                 "Content-Type: %s\r\n"
+1729:                 "Content-Length: %d\r\n"
+1730:                 "Content-Disposition: attachment; filename=\"%s\"\r\n"
+1731:                 "Connection: close\r\n\r\n",
+1732:                 mime.c_str(), sz, dlName.c_str());
+1733:      uint8_t buf[1024];
+1734:      size_t sent = 0;
+1735:      while (sent < sz && cli.connected())
+1736:      {
+1737:        size_t rd = f.read(buf, min((size_t)1024, sz - sent));
+1738:        if (rd == 0)
+1739:          break;
+1740:        cli.write(buf, rd);
+1741:        sent += rd;
+1742:      }
+1743:      cli.flush();
+1744:      f.close();
+1745:      Serial.printf("[Download] '%s' %d/%d bytes MIME=%s\n",
+1746:                    dlName.c_str(), sent, sz, mime.c_str());
+1747:      blinkLED(3, 100);
+1748:      return;
+1749:    }
+1750:  }
+1751:
+1752:  if (name.length() == 0 || dlName == "audio.wav")
+1753:  {
+1754:    const uint8_t *src = nullptr;
+1755:    size_t srcSz = 0;
+1756:    if (ramReady && ramSize > 0)
+1757:    {
+1758:      src = ramBuf;
+1759:      srcSz = ramSize;
+1760:    }
+1761:    else if (TEST_WAV_SIZE > 0)
+1762:    {
+1763:      src = TEST_WAV_DATA;
+1764:      srcSz = TEST_WAV_SIZE;
+1765:    }
+1766:    if (src && srcSz > 0)
+1767:    {
+1768:      WiFiClient cli = server.client();
+1769:      cli.printf("HTTP/1.1 200 OK\r\n"
+1770:                 "Content-Type: audio/wav\r\n"
+1771:                 "Content-Length: %d\r\n"
+1772:                 "Content-Disposition: attachment; filename=\"audio.wav\"\r\n"
+1773:                 "Connection: close\r\n\r\n",
+1774:                 srcSz);
+1775:      size_t sent = 0;
+1776:      while (sent < srcSz && cli.connected())
+1777:      {
+1778:        size_t ch = min((size_t)1024, srcSz - sent);
+1779:        cli.write(src + sent, ch);
+1780:        sent += ch;
+1781:      }
+1782:      cli.flush();
+1783:      blinkLED(3, 100);
+1784:      return;
+1785:    }
+1786:  }
+1787:
+1788:  server.send(404, "application/json", "{\"error\":\"file not found\",\"name\":\"" + dlName + "\"}");
+1789:}
+1790:
+1791:void handleFileUploadDone()
+1792:{
+1793:  if (httpUploadOk)
+1794:  {
+1795:    markLocalFileChanged("HTTP upload " + httpUploadFilename);
+1796:
+1797:    String resp = "{\"status\":\"ok\"";
+1798:    resp += ",\"filename\":\"" + httpUploadFilename + "\"";
+1799:    resp += ",\"path\":\"" + httpUploadPath + "\"";
+1800:    resp += ",\"size\":" + String(httpUploadSize);
+1801:    resp += ",\"sd_saved\":true}";
+1802:    server.send(200, "application/json", resp);
+1803:  }
+1804:  else
+1805:  {
+1806:    String resp = "{\"status\":\"fail\"";
+1807:    resp += ",\"filename\":\"" + httpUploadFilename + "\"";
+1808:    resp += ",\"path\":\"" + httpUploadPath + "\"";
+1809:    resp += ",\"size\":" + String(httpUploadSize);
+1810:    resp += ",\"sd_saved\":false";
+1811:    resp += ",\"error\":\"" + httpUploadError + "\"}";
+1812:    server.send(500, "application/json", resp);
+1813:  }
+1814:
+1815:  Serial.printf("[UploadHTTP] done file='%s' size=%d ok=%s err=%s\n",
+1816:                httpUploadFilename.c_str(),
+1817:                (int)httpUploadSize,
+1818:                httpUploadOk ? "true" : "false",
+1819:                httpUploadError.c_str());
+1820:}
+1821:
+1822:void handleFileUploadStream()
+1823:{
+1824:  HTTPUpload &upload = server.upload();
+1825:
+1826:  if (upload.status == UPLOAD_FILE_START)
+1827:  {
+1828:    httpUploadSize = 0;
+1829:    httpUploadOk = false;
+1830:    httpUploadError = "none";
+1831:    httpUploadFilename = "";
+1832:    httpUploadPath = "";
+1833:
+1834:    if (!sdReady)
+1835:    {
+1836:      httpUploadError = "sd not ready";
+1837:      return;
+1838:    }
+1839:
+1840:    String xFilename = server.header("X-Filename");
+1841:    xFilename.trim();
+1842:
+1843:    String rawName = xFilename.length() > 0 ? xFilename : upload.filename;
+1844:    rawName.trim();
+1845:
+1846:    String saveAs = sanitizeFilename(rawName);
+1847:    if (saveAs.length() == 0)
+1848:      saveAs = genAutoFilename();
+1849:
+1850:    if (!SD.exists("/rec"))
+1851:    {
+1852:      if (!SD.mkdir("/rec"))
+1853:      {
+1854:        httpUploadError = "cannot create /rec";
+1855:        return;
+1856:      }
+1857:    }
+1858:
+1859:    httpUploadFilename = "rec/" + saveAs;
+1860:    httpUploadPath = "/rec/" + saveAs;
+1861:
+1862:    if (SD.exists(httpUploadPath))
+1863:      SD.remove(httpUploadPath);
+1864:
+1865:    httpUploadFile = SD.open(httpUploadPath, "w");
+1866:    if (!httpUploadFile)
+1867:    {
+1868:      httpUploadError = "sd open failed";
+1869:      return;
+1870:    }
+1871:
+1872:    Serial.printf("[UploadHTTP] start '%s' -> '%s'\n",
+1873:                  rawName.c_str(), httpUploadPath.c_str());
+1874:  }
+1875:  else if (upload.status == UPLOAD_FILE_WRITE)
+1876:  {
+1877:    if (!httpUploadFile)
+1878:    {
+1879:      if (httpUploadError == "none")
+1880:        httpUploadError = "file not open";
+1881:      return;
+1882:    }
+1883:
+1884:    size_t wr = httpUploadFile.write(upload.buf, upload.currentSize);
+1885:    httpUploadSize += wr;
+1886:
+1887:    if (wr != upload.currentSize)
+1888:    {
+1889:      httpUploadError = "sd write failed";
+1890:    }
+1891:  }
+1892:  else if (upload.status == UPLOAD_FILE_END)
+1893:  {
+1894:    if (httpUploadFile)
+1895:      httpUploadFile.close();
+1896:
+1897:    if (httpUploadError != "none")
+1898:    {
+1899:      if (httpUploadPath.length() > 0)
+1900:        SD.remove(httpUploadPath);
+1901:      httpUploadOk = false;
+1902:      return;
+1903:    }
+1904:
+1905:    if (httpUploadSize == 0)
+1906:    {
+1907:      httpUploadError = "empty upload";
+1908:      if (httpUploadPath.length() > 0)
+1909:        SD.remove(httpUploadPath);
+1910:      httpUploadOk = false;
+1911:      return;
+1912:    }
+1913:
+1914:    if (httpUploadPath.length() == 0 || !SD.exists(httpUploadPath))
+1915:    {
+1916:      httpUploadError = "file not saved";
+1917:      httpUploadOk = false;
+1918:      return;
+1919:    }
+1920:
+1921:    File chk = SD.open(httpUploadPath, "r");
+1922:    if (!chk)
+1923:    {
+1924:      httpUploadError = "verify open failed";
+1925:      httpUploadOk = false;
+1926:      return;
+1927:    }
+1928:
+1929:    size_t realSize = chk.size();
+1930:    chk.close();
+1931:
+1932:    if (realSize != httpUploadSize)
+1933:    {
+1934:      httpUploadError = "verify size mismatch";
+1935:      SD.remove(httpUploadPath);
+1936:      httpUploadOk = false;
+1937:      return;
+1938:    }
+1939:
+1940:    httpUploadOk = true;
+1941:    blinkLED(5, 80);
+1942:
+1943:    Serial.printf("[UploadHTTP] saved '%s' %d bytes\n",
+1944:                  httpUploadPath.c_str(), (int)httpUploadSize);
+1945:  }
+1946:  else if (upload.status == UPLOAD_FILE_ABORTED)
+1947:  {
+1948:    if (httpUploadFile)
+1949:      httpUploadFile.close();
+1950:
+1951:    if (httpUploadPath.length() > 0)
+1952:      SD.remove(httpUploadPath);
+1953:
+1954:    httpUploadError = "upload aborted";
+1955:    httpUploadOk = false;
+1956:    Serial.println("[UploadHTTP] aborted");
+1957:  }
+1958:}
+1959:
+1960:void handleFileClear()
+1961:{
+1962:  bool ok = SD.remove(AUDIO_WAV_PATH);
+1963:
+1964:  if (ramBuf)
+1965:  {
+1966:    free(ramBuf);
+1967:    ramBuf = nullptr;
+1968:    ramSize = 0;
+1969:    ramReady = false;
+1970:  }
+1971:
+1972:  syncDone = false;
+1973:  syncMsg = "cleared";
+1974:
+1975:  server.send(200, "application/json",
+1976:              ok ? "{\"status\":\"ok\",\"message\":\"File SD da xoa\"}"
+1977:                 : "{\"status\":\"ok\",\"message\":\"Khong co file SD de xoa\"}");
+1978:}
+1979:
+1980:void handleFileDelete()
+1981:{
+1982:  String name = server.arg("name");
+1983:  name.trim();
+1984:
+1985:  if (name.length() == 0)
+1986:  {
+1987:    server.send(400, "application/json", "{\"error\":\"missing name\"}");
+1988:    return;
+1989:  }
+1990:
+1991:  String pathRaw = name.startsWith("/") ? name : ("/" + name);
+1992:  String path = "";
+1993:
+1994:  if (SD.exists(pathRaw))
+1995:  {
+1996:    path = pathRaw;
+1997:  }
+1998:  else
+1999:  {
+2000:    String safe = sanitizeFilename(name);
+2001:    if (safe.length() > 0)
+2002:    {
+2003:      String pathSafe = "/" + safe;
+2004:      if (SD.exists(pathSafe))
+2005:        path = pathSafe;
+2006:    }
+2007:  }
+2008:
+2009:  if (path.length() == 0)
+2010:  {
+2011:    Serial.printf("[SD] Delete '%s' - not found\n", name.c_str());
+2012:    server.send(404, "application/json", "{\"error\":\"file not found\"}");
+2013:    return;
+2014:  }
+2015:
+2016:  bool ok = SD.remove(path);
+2017:
+2018:  if (ok && path == String(AUDIO_WAV_PATH))
+2019:  {
+2020:    if (ramBuf)
+2021:    {
+2022:      free(ramBuf);
+2023:      ramBuf = nullptr;
+2024:      ramSize = 0;
+2025:      ramReady = false;
+2026:    }
+2027:    syncDone = false;
+2028:    syncMsg = "deleted";
+2029:  }
+2030:
+2031:  server.send(ok ? 200 : 500, "application/json",
+2032:              ok ? "{\"status\":\"ok\"}" : "{\"error\":\"delete failed\"}");
+2033:  Serial.printf("[SD] Delete '%s' -> %s\n", path.c_str(), ok ? "OK" : "FAIL");
+2034:}
+2035:
+2036:void handleRamInfo()
+2037:{
+2038:  if (!ramReady || ramSize < 44)
+2039:  {
+2040:    server.send(200, "application/json",
+2041:                String("{\"ram_ready\":false,\"free_heap\":") + String(ESP.getFreeHeap()) +
+2042:                    ",\"sd_has_file\":" + String(sdHasFile() ? "true" : "false") +
+2043:                    ",\"sync_msg\":\"" + syncMsg + "\"}");
+2044:    return;
+2045:  }
+2046:
+2047:  char magic[5] = {0};
+2048:  memcpy(magic, ramBuf, 4);
+2049:
+2050:  String j = "{\"ram_ready\":true,\"size_bytes\":" + String(ramSize);
+2051:  j += ",\"magic\":\"" + String(magic) + "\"";
+2052:  j += ",\"wav_info\":" + wavInfoJson(ramBuf, ramSize);
+2053:  j += ",\"sync_msg\":\"" + syncMsg + "\"";
+2054:  j += ",\"free_heap\":" + String(ESP.getFreeHeap()) + "}";
+2055:  server.send(200, "application/json", j);
+2056:}
+2057:
+2058:void handleSync()
+2059:{
+2060:  if (recordingInProgress || syncInProgress)
+2061:  {
+2062:    server.send(423, "application/json",
+2063:                "{\"status\":\"busy\",\"message\":\"Phantom-1 is recording or syncing\"}");
+2064:    return;
+2065:  }
+2066:
+2067:  server.send(200, "application/json",
+2068:              "{\"status\":\"ok\",\"message\":\"Sync Phantom-2 starting\"}");
+2069:  syncDone = syncFromPeer();
+2070:  syncFailed = !syncDone;
+2071:}
+2072:
+2073:void handleBusy()
+2074:{
+2075:  bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress;
+2076:  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle"));
+2077:  String j = "{\"node\":1";
+2078:  j += ",\"busy\":" + String(busy ? "true" : "false");
+2079:  j += ",\"recording\":" + String(recordingInProgress ? "true" : "false");
+2080:  j += ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false");
+2081:  j += ",\"peer_sync_request_in_progress\":" + String(peerSyncRequestInProgress ? "true" : "false");
+2082:  j += ",\"reason\":\"" + reason + "\"";
+2083:  j += ",\"sync_msg\":\"" + syncMsg + "\"";
+2084:  j += ",\"last_mic_file\":\"" + lastMicWavFile + "\"}";
+2085:  server.send(busy ? 423 : 200, "application/json", j);
+2086:}
+2087:
+2088:// ── Priority sync: khi SD co file local moi/cap nhat thi bao Phantom-2 keo ve ──
+2089:void markLocalFileChanged(const String &reason)
+2090:{
+2091:  if (!sdReady)
+2092:    return;
+2093:
+2094:  syncPending = true;
+2095:  syncPendingReason = reason;
+2096:  prioritySyncFailCount = 0;
+2097:  syncMsg = "pending peer sync: " + reason;
+2098:
+2099:  // Uu tien dong bo: khoa trigger ghi am cho den khi dong bo xong
+2100:  micArmed = false;
+2101:
+2102:  Serial.println("[PrioritySync] Pending -> " + reason);
+2103:}
+2104:
+2105:bool requestPeerPullSync()
+2106:{
+2107:  if (!sdReady || recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+2108:    return false;
+2109:
+2110:  peerSyncRequestInProgress = true;
+2111:  syncMsg = "priority: ask Phantom-2 to pull files";
+2112:
+2113:  Serial.println("[PrioritySync] Connect Phantom-2 and POST /sync");
+2114:
+2115:  WiFi.mode(WIFI_AP_STA);
+2116:  WiFi.setSleep(false);
+2117:  WiFi.disconnect(false);
+2118:  delay(200);
+2119:  debugScanPeerNetworks(PEER_SSID);
+2120:  Serial.printf("[WiFi] Connecting to %s ...\n", PEER_SSID);
+2121:  WiFi.begin(PEER_SSID, PEER_PASSWORD);
+2122:  int retries = 0;
+2123:  while (WiFi.status() != WL_CONNECTED && retries < 30)
+2124:  {
+2125:    unsigned long tw = millis();
+2126:    while (millis() - tw < 300)
+2127:    {
+2128:      server.handleClient();
+2129:      delay(5);
+2130:    }
+2131:    Serial.print(".");
+2132:    retries++;
+2133:  }
+2134:
+2135:  if (WiFi.status() != WL_CONNECTED)
+2136:  {
+2137:    Serial.println("\n[PrioritySync] Phantom-2 not found");
+2138:    syncMsg = "pending: Phantom-2 not found";
+2139:    WiFi.disconnect(false);
+2140:    restoreMyAP();
+2141:    peerSyncRequestInProgress = false;
+2142:    return false;
+2143:  }
+2144:
+2145:  // Neu peer dang ban thi giu pending va thu lai sau
+2146:  String busyBody = httpGetFromPeer("/busy", 3000);
+2147:  if (busyBody.indexOf("\"busy\":true") >= 0 ||
+2148:      busyBody.indexOf("\"recording\":true") >= 0 ||
+2149:      busyBody.indexOf("\"sync_in_progress\":true") >= 0)
+2150:  {
+2151:    Serial.println("[PrioritySync] Phantom-2 busy -> retry later");
+2152:    syncMsg = "pending: Phantom-2 busy";
+2153:    WiFi.disconnect(false);
+2154:    restoreMyAP();
+2155:    peerSyncRequestInProgress = false;
+2156:    return false;
+2157:  }
+2158:
+2159:  WiFiClient c;
+2160:  bool ok = false;
+2161:  if (c.connect(PEER_IP, PEER_HTTP_PORT))
+2162:  {
+2163:    c.printf("POST /sync HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", PEER_IP);
+2164:
+2165:    unsigned long t = millis();
+2166:    String resp = "";
+2167:    while ((c.connected() || c.available()) && (millis() - t) < 15000)
+2168:    {
+2169:      server.handleClient(); // cho Phantom-2 co the keo /file/list va /file/download tu node nay
+2170:      if (c.available())
+2171:      {
+2172:        char ch = (char)c.read();
+2173:        resp += ch;
+2174:        t = millis();
+2175:        if (resp.indexOf("\r\n\r\n") >= 0 && resp.indexOf("\"status\":\"ok\"") >= 0)
+2176:        {
+2177:          ok = true;
+2178:          break;
+2179:        }
+2180:      }
+2181:      else
+2182:      {
+2183:        delay(5);
+2184:      }
+2185:    }
+2186:    c.stop();
+2187:  }
+2188:
+2189:  if (!ok)
+2190:  {
+2191:    Serial.println("[PrioritySync] POST /sync failed or timeout");
+2192:    syncMsg = "pending: trigger Phantom-2 sync failed";
+2193:    WiFi.disconnect(false);
+2194:    restoreMyAP();
+2195:    peerSyncRequestInProgress = false;
+2196:    return false;
+2197:  }
+2198:
+2199:  // Doi Phantom-2 sync xong va VERIFY file da co tren Phantom-2.
+2200:  // Khong duoc chi dua vao /busy, vi peer co the idle neu da skip sync.
+2201:  ok = false;
+2202:  bool verified = false;
+2203:  unsigned long waitStart = millis();
+2204:  while (millis() - waitStart < 90000UL)
+2205:  {
+2206:    server.handleClient(); // cho Phantom-2 keo /file/list va /file/download tu node nay
+2207:
+2208:    String b = httpGetFromPeer("/busy", 2500);
+2209:    bool peerIdle = (b.length() > 0 &&
+2210:                     b.indexOf("\"busy\":true") < 0 &&
+2211:                     b.indexOf("\"sync_in_progress\":true") < 0);
+2212:
+2213:    if (peerIdle)
+2214:    {
+2215:      verified = verifyPeerHasLocalFile(lastMicWavFile);
+2216:      if (verified)
+2217:      {
+2218:        ok = true;
+2219:        break;
+2220:      }
+2221:    }
+2222:    delay(500);
+2223:  }
+2224:
+2225:  WiFi.disconnect(false);
+2226:  restoreMyAP();
+2227:
+2228:  peerSyncRequestInProgress = false;
+2229:
+2230:  if (ok && verified)
+2231:  {
+2232:    syncPending = false;
+2233:    syncDone = true;
+2234:    syncFailed = false;
+2235:    syncMsg = "ok: Phantom-2 verified latest local file";
+2236:    syncPendingReason = "none";
+2237:    prioritySyncFailCount = 0;
+2238:    micArmed = true;
+2239:    lastMicTriggerMs = millis();
+2240:    Serial.println("[PrioritySync] Done + verified -> recording can run again");
+2241:    return true;
+2242:  }
+2243:
+2244:  syncMsg = "pending: wait/verify Phantom-2 sync timeout";
+2245:  syncFailed = true;
+2246:  micArmed = false; // tiep tuc khoa mic, handlePrioritySync se retry
+2247:  Serial.println("[PrioritySync] Verify failed -> keep mic locked and retry");
+2248:  return false;
+2249:}
+2250:
+2251:void handlePrioritySync()
+2252:{
+2253:  if (!syncPending)
+2254:    return;
+2255:
+2256:  // Uu tien dong bo hon ghi am: khi pending thi khong cho mic arm
+2257:  micArmed = false;
+2258:
+2259:  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+2260:    return;
+2261:
+2262:  // Chong retry qua day neu peer khong tim thay/ban
+2263:  if (millis() - lastPrioritySyncAttemptMs < 3000UL)
+2264:    return;
+2265:  lastPrioritySyncAttemptMs = millis();
+2266:
+2267:  bool ok = requestPeerPullSync();
+2268:  if (!ok)
+2269:  {
+2270:    prioritySyncFailCount++;
+2271:    Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+2272:
+2273:    if (prioritySyncFailCount >= 3)
+2274:    {
+2275:      // STRICT GATE: do not allow new recording until Phantom-2 sync is verified.
+2276:      // Keep syncPending=true and micArmed=false; just slow down retries.
+2277:      Serial.println("[PrioritySync] Peer not verified after 3 tries -> keep mic locked, retry later");
+2278:      syncFailed = true;
+2279:      syncDone = false;
+2280:      syncMsg = "pending: Phantom-2 sync not verified; mic locked";
+2281:      prioritySyncFailCount = 0;
+2282:      micArmed = false;
+2283:      lastPrioritySyncAttemptMs = millis() + 12000UL;
+2284:      restoreMyAP();
+2285:    }
+2286:  }
+2287:}
+2288:
+2289:void handleAutoSync()
+2290:{
+2291:  if (millis() - lastAutoSyncMs < AUTO_SYNC_INTERVAL_MS)
+2292:    return;
+2293:
+2294:  lastAutoSyncMs = millis();
+2295:
+2296:  if (!sdReady || recordingInProgress || syncInProgress)
+2297:  {
+2298:    if (recordingInProgress)
+2299:      syncMsg = "skip: recording in progress";
+2300:    return;
+2301:  }
+2302:
+2303:  Serial.println("[AutoSync] 60s tick -> try sync from Phantom-2");
+2304:  syncDone = syncFromPeer();
+2305:  syncFailed = !syncDone;
+2306:}
+2307:
+2308:void handleSyncStatus()
+2309:{
+2310:  int count = countSdFiles();
+2311:
+2312:  String j = "{\"node\":1";
+2313:  j += ",\"peer\":\"Phantom-2\"";
+2314:  j += ",\"file_count\":" + String(count);
+2315:  j += ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0);
+2316:  j += ",\"sd_free\":" + String(sdReady ? (uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1024) : 0);
+2317:  j += ",\"uptime\":\"" + formatUptime(millis()) + "\"";
+2318:  j += ",\"free_heap\":" + String(ESP.getFreeHeap());
+2319:  j += ",\"sync_done\":" + String(syncDone ? "true" : "false");
+2320:  j += ",\"sync_failed\":" + String(syncFailed ? "true" : "false");
+2321:  j += ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false");
+2322:  j += ",\"busy\":" + String(syncInProgress ? "true" : "false");
+2323:  j += ",\"sync_msg\":\"" + syncMsg + "\"}";
+2324:  server.send(200, "application/json", j);
+2325:}
+2326:
+2327:void handleSdList()
+2328:{
+2329:  if (!sdReady)
+2330:  {
+2331:    server.send(500, "application/json", "{\"error\":\"sd not ready\"}");
+2332:    return;
+2333:  }
+2334:
+2335:  File root = SD.open("/rec");
+2336:  if (!root || !root.isDirectory())
+2337:  {
+2338:    server.send(200, "application/json", "{\"files\":[],\"count\":0}");
+2339:    return;
+2340:  }
+2341:
+2342:  String j = "{\"files\":[";
+2343:  int count = 0;
+2344:  File f = root.openNextFile();
+2345:
+2346:  while (f)
+2347:  {
+2348:    if (!f.isDirectory())
+2349:    {
+2350:      if (count > 0)
+2351:        j += ",";
+2352:      j += "{\"name\":\"" + String(f.name()) + "\",\"size\":" + String((uint32_t)f.size()) + "}";
+2353:      count++;
+2354:    }
+2355:    f.close();
+2356:    f = root.openNextFile();
+2357:  }
+2358:
+2359:  j += "],\"count\":" + String(count) + "}";
+2360:  server.send(200, "application/json", j);
+2361:}
+2362:
+2363:void handleSdDownload()
+2364:{
+2365:  String name = server.arg("name");
+2366:  if (!name.startsWith("/"))
+2367:    name = "/rec/" + name;
+2368:
+2369:  if (!SD.exists(name))
+2370:  {
+2371:    server.send(404, "text/plain", "File not found");
+2372:    return;
+2373:  }
+2374:
+2375:  File f = SD.open(name, "r");
+2376:  server.streamFile(f, "audio/wav");
+2377:  f.close();
+2378:}
+2379:
+2380:void handleNotFound()
+2381:{
+2382:  server.send(404, "application/json", "{\"error\":\"not found\"}");
+2383:}
+2384:
+2385:// ── Raw TCP Upload Server port 8081 ───────────────────────────
+2386:void handleRawUpload(WiFiClient &cli)
+2387:{
+2388:  String reqLine = cli.readStringUntil('\n');
+2389:  reqLine.trim();
+2390:  Serial.printf("[Upload8081] %s\n", reqLine.substring(0, 60).c_str());
+2391:
+2392:  String xFilename = "";
+2393:  int clen = 0;
+2394:  unsigned long th = millis();
+2395:
+2396:  while (cli.connected() && (millis() - th) < 5000)
+2397:  {
+2398:    if (!cli.available())
+2399:    {
+2400:      delay(2);
+2401:      continue;
+2402:    }
+2403:
+2404:    String line = cli.readStringUntil('\n');
+2405:    line.trim();
+2406:    if (line.length() == 0)
+2407:      break;
+2408:
+2409:    String lo = line;
+2410:    lo.toLowerCase();
+2411:
+2412:    if (lo.startsWith("content-length:"))
+2413:    {
+2414:      String val = line.substring(line.indexOf(':') + 1);
+2415:      val.trim();
+2416:      clen = val.toInt();
+2417:    }
+2418:
+2419:    if (lo.startsWith("x-filename:"))
+2420:    {
+2421:      xFilename = line.substring(line.indexOf(':') + 1);
+2422:      xFilename.trim();
+2423:    }
+2424:
+2425:    th = millis();
+2426:  }
+2427:
+2428:  Serial.printf("[Upload8081] fname='%s' CL=%d\n", xFilename.c_str(), clen);
+2429:
+2430:  if (clen <= 0 || clen > (int)MAX_FILE_SIZE)
+2431:  {
+2432:    cli.print("HTTP/1.0 400 Bad Request\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"error\":\"bad clen\"}");
+2433:    cli.flush();
+2434:    return;
+2435:  }
+2436:
+2437:  String saveAs = sanitizeFilename(xFilename);
+2438:  if (saveAs.length() == 0)
+2439:    saveAs = genAutoFilename();
+2440:
+2441:  if (!SD.exists("/rec"))
+2442:    SD.mkdir("/rec");
+2443:
+2444:  String path = "/rec/" + saveAs;
+2445:  if (SD.exists(path))
+2446:    SD.remove(path);
+2447:
+2448:  File sdFile = SD.open(path, "w");
+2449:  if (!sdFile)
+2450:  {
+2451:    cli.print("HTTP/1.0 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"error\":\"sd open failed\"}");
+2452:    cli.flush();
+2453:    return;
+2454:  }
+2455:
+2456:  size_t rx = 0;
+2457:  uint8_t chunk[512];
+2458:  unsigned long t = millis();
+2459:
+2460:  while (rx < (size_t)clen && cli.connected() && (millis() - t) < 30000)
+2461:  {
+2462:    size_t av = cli.available();
+2463:    if (av > 0)
+2464:    {
+2465:      size_t want = min(av, min((size_t)512, (size_t)(clen - rx)));
+2466:      size_t rd = cli.readBytes(chunk, want);
+2467:      if (rd > 0)
+2468:      {
+2469:        sdFile.write(chunk, rd);
+2470:        rx += rd;
+2471:        t = millis();
+2472:      }
+2473:    }
+2474:    else
+2475:    {
+2476:      delay(2);
+2477:    }
+2478:  }
+2479:
+2480:  sdFile.close();
+2481:  Serial.printf("[Upload8081] '%s' rx=%d/%d\n", saveAs.c_str(), rx, clen);
+2482:
+2483:  bool saved = (rx > 0 && SD.exists(path));
+2484:  if (saved)
+2485:  {
+2486:    File chk = SD.open(path, "r");
+2487:    if (chk)
+2488:    {
+2489:      saved = (chk.size() == rx);
+2490:      chk.close();
+2491:    }
+2492:  }
+2493:  if (!saved)
+2494:    SD.remove(path);
+2495:
+2496:  if (saved && saveAs == "audio.wav")
+2497:  {
+2498:    if (ramBuf)
+2499:    {
+2500:      free(ramBuf);
+2501:      ramBuf = nullptr;
+2502:      ramSize = 0;
+2503:      ramReady = false;
+2504:    }
+2505:
+2506:    File f = SD.open(path, "r");
+2507:    if (f)
+2508:    {
+2509:      size_t sz = f.size();
+2510:      ramBuf = (uint8_t *)malloc(sz);
+2511:      if (ramBuf)
+2512:      {
+2513:        size_t rd = f.read(ramBuf, sz);
+2514:        f.close();
+2515:        ramSize = rd;
+2516:        ramReady = (rd >= 44);
+2517:      }
+2518:      else
+2519:        f.close();
+2520:    }
+2521:  }
+2522:
+2523:  if (saved)
+2524:    markLocalFileChanged("TCP8081 upload " + saveAs);
+2525:
+2526:  blinkLED(saved ? 5 : 2, 80);
+2527:  Serial.printf("[Upload8081] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
+2528:
+2529:  String resp = "{\"status\":\"" + String(saved ? "ok" : "fail") + "\""
+2530:                                                                   ",\"filename\":\"" +
+2531:                saveAs + "\""
+2532:                         ",\"size\":" +
+2533:                String(rx) +
+2534:                ",\"sd_saved\":" + String(saved ? "true" : "false") + "}";
+2535:
+2536:  cli.printf("HTTP/1.0 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+2537:             saved ? "200 OK" : "500 Internal Server Error",
+2538:             (int)resp.length(), resp.c_str());
+2539:  cli.flush();
+2540:}
+2541:
+2542:// ── Raw TCP port 8080 ─────────────────────────────────────────
+2543:void handleRawTCP(WiFiClient &client)
+2544:{
+2545:  String req = client.readStringUntil('\n');
+2546:  req.trim();
+2547:
+2548:  int clen = 0;
+2549:  String xFilename = "";
+2550:
+2551:  while (client.connected())
+2552:  {
+2553:    String line = client.readStringUntil('\n');
+2554:    line.trim();
+2555:    if (line.length() == 0)
+2556:      break;
+2557:
+2558:    String lo = line;
+2559:    lo.toLowerCase();
+2560:
+2561:    if (lo.startsWith("content-length:"))
+2562:      clen = line.substring(line.indexOf(':') + 1).toInt();
+2563:
+2564:    if (lo.startsWith("x-filename:"))
+2565:    {
+2566:      xFilename = line.substring(line.indexOf(':') + 1);
+2567:      xFilename.trim();
+2568:    }
+2569:  }
+2570:
+2571:  if (req.startsWith("GET"))
+2572:  {
+2573:    if (sdHasFile())
+2574:    {
+2575:      File f = SD.open(AUDIO_WAV_PATH, "r");
+2576:      if (f)
+2577:      {
+2578:        size_t sz = f.size();
+2579:
+2580:        client.printf("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: %d\r\n"
+2581:                      "Content-Disposition: attachment; filename=\"audio.wav\"\r\nConnection: close\r\n\r\n",
+2582:                      (int)sz);
+2583:
+2584:        uint8_t buf[1024];
+2585:        size_t sent = 0;
+2586:
+2587:        while (sent < sz && client.connected())
+2588:        {
+2589:          size_t rd = f.read(buf, min((size_t)1024, sz - sent));
+2590:          client.write(buf, rd);
+2591:          sent += rd;
+2592:        }
+2593:
+2594:        f.close();
+2595:        client.flush();
+2596:        blinkLED(3, 100);
+2597:        return;
+2598:      }
+2599:    }
+2600:
+2601:    const uint8_t *buf = (ramReady && ramSize > 0) ? ramBuf : TEST_WAV_DATA;
+2602:    size_t sz = (ramReady && ramSize > 0) ? ramSize : TEST_WAV_SIZE;
+2603:
+2604:    if (sz == 0)
+2605:    {
+2606:      client.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+2607:      return;
+2608:    }
+2609:
+2610:    client.printf("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: %d\r\n"
+2611:                  "Content-Disposition: attachment; filename=\"audio.wav\"\r\nConnection: close\r\n\r\n",
+2612:                  sz);
+2613:
+2614:    size_t sent = 0;
+2615:    while (sent < sz && client.connected())
+2616:    {
+2617:      size_t ch = min((size_t)1024, sz - sent);
+2618:      client.write(buf + sent, ch);
+2619:      sent += ch;
+2620:    }
+2621:
+2622:    client.flush();
+2623:    blinkLED(3, 100);
+2624:  }
+2625:  else if (req.startsWith("POST"))
+2626:  {
+2627:    if (clen <= 0 || clen > (int)MAX_FILE_SIZE)
+2628:    {
+2629:      client.print("HTTP/1.1 400\r\nConnection: close\r\n\r\n");
+2630:      return;
+2631:    }
+2632:
+2633:    uint8_t *buf = (uint8_t *)malloc(clen);
+2634:    if (!buf)
+2635:    {
+2636:      client.print("HTTP/1.1 507\r\nConnection: close\r\n\r\n");
+2637:      return;
+2638:    }
+2639:
+2640:    size_t rx = 0;
+2641:    unsigned long t = millis();
+2642:
+2643:    while (rx < (size_t)clen && client.connected() && (millis() - t) < 20000)
+2644:    {
+2645:      size_t av = client.available();
+2646:      if (av > 0)
+2647:      {
+2648:        size_t ch = min(av, (size_t)(clen - rx));
+2649:        client.readBytes(buf + rx, ch);
+2650:        rx += ch;
+2651:        t = millis();
+2652:      }
+2653:      else
+2654:        delay(1);
+2655:    }
+2656:
+2657:    if (rx > 0)
+2658:    {
+2659:      String saveAs = sanitizeFilename(xFilename);
+2660:      if (saveAs.length() == 0)
+2661:        saveAs = genAutoFilename();
+2662:
+2663:      bool sv = sdSaveAs(buf, rx, "/" + saveAs);
+2664:
+2665:      if (sv)
+2666:        markLocalFileChanged("TCP8080 upload " + saveAs);
+2667:
+2668:      if (sv && saveAs == "audio.wav")
+2669:      {
+2670:        if (ramBuf)
+2671:        {
+2672:          free(ramBuf);
+2673:          ramBuf = nullptr;
+2674:          ramSize = 0;
+2675:        }
+2676:
+2677:        ramBuf = buf;
+2678:        ramSize = rx;
+2679:        ramReady = true;
+2680:        buf = nullptr;
+2681:      }
+2682:
+2683:      if (buf)
+2684:        free(buf);
+2685:
+2686:      String r = "{\"status\":\"ok\",\"received\":" + String(rx) +
+2687:                 ",\"filename\":\"" + saveAs + "\"" +
+2688:                 ",\"sd_saved\":" + String(sv ? "true" : "false") + "}";
+2689:
+2690:      client.printf("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+2691:                    (int)r.length(), r.c_str());
+2692:      blinkLED(5, 80);
+2693:    }
+2694:    else
+2695:    {
+2696:      free(buf);
+2697:      client.print("HTTP/1.1 400\r\nConnection: close\r\n\r\n{\"error\":\"incomplete\"}");
+2698:    }
+2699:  }
+2700:}
+2701:
+2702:// ── Setup ─────────────────────────────────────────────────────
+2703:void setup()
+2704:{
+2705:  Serial.begin(115200);
+2706:  delay(500);
+2707:
+2708:  pinMode(LED_PIN, OUTPUT);
+2709:  digitalWrite(LED_PIN, LOW);
+2710:
+2711:  analogReadResolution(12);
+2712:  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+2713:
+2714:  Serial.println("\n==============================");
+2715:  Serial.println(" ESP32 PHANTOM-1 (APSTA + SD)");
+2716:  Serial.println("==============================");
+2717:
+2718:  sdReady = setupSDCard();
+2719:
+2720:  WiFi.mode(WIFI_AP_STA);
+2721:  WiFi.setSleep(false);
+2722:
+2723:  IPAddress apIP(192, 168, 4, 1);
+2724:  IPAddress gw(192, 168, 4, 1);
+2725:  IPAddress sn(255, 255, 255, 0);
+2726:
+2727:  WiFi.softAPConfig(apIP, gw, sn);
+2728:  WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
+2729:
+2730:  delay(200);
+2731:  Serial.printf("[AP] SSID: %s  IP: %s  max_clients=%d\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str(), MY_AP_MAX_CON);
+2732:  digitalWrite(LED_PIN, HIGH);
+2733:
+2734:  const char *collectHeaders[] = {"X-Filename", "Content-Length", "Content-Type"};
+2735:  server.collectHeaders(collectHeaders, 3);
+2736:
+2737:  server.on("/status", HTTP_GET, handleStatus);
+2738:  server.on("/file/info", HTTP_GET, handleFileInfo);
+2739:  server.on("/file/list", HTTP_GET, handleFileList);
+2740:  server.on("/file/download", HTTP_GET, handleFileDownload);
+2741:  server.on("/file/upload", HTTP_POST, handleFileUploadDone, handleFileUploadStream);
+2742:  server.on("/file/clear", HTTP_POST, handleFileClear);
+2743:  server.on("/file/delete", HTTP_POST, handleFileDelete);
+2744:
+2745:  server.on("/ram/info", HTTP_GET, handleRamInfo);
+2746:  server.on("/battery", HTTP_GET, handleBattery);
+2747:
+2748:  server.on("/sync", HTTP_POST, handleSync);
+2749:  server.on("/sync/status", HTTP_GET, handleSyncStatus);
+2750:  server.on("/busy", HTTP_GET, handleBusy);
+2751:
+2752:  server.on("/sd/list", HTTP_GET, handleSdList);
+2753:  server.on("/sd/download", HTTP_GET, handleSdDownload);
+2754:
+2755:  server.on("/audio/info", HTTP_GET, handleFileInfo);
+2756:  server.on("/ram/clear", HTTP_POST, handleFileClear);
+2757:
+2758:  server.onNotFound(handleNotFound);
+2759:
+2760:  server.begin();
+2761:  audioServer.begin();
+2762:  uploadServer.begin();
+2763:
+2764:  setupI2SMic();
+2765:
+2766:  // Gio Viet Nam. Neu khong co internet thi khong anh huong dong bo file.
+2767:  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+2768:
+2769:  int fc = countSdFiles();
+2770:  Serial.printf("[SD] Current root files: %d. No startup sync.\n", fc);
+2771:
+2772:  syncDone = false;
+2773:  syncFailed = false;
+2774:  syncMsg = "ready: priority sync after any local file write";
+2775:
+2776:  Serial.println("\n[Ready] Phantom-1 endpoints:");
+2777:  Serial.printf("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
+2778:  Serial.printf("  GET  http://%s/status\n", MY_AP_IP_STR);
+2779:  Serial.printf("  GET  http://%s/file/list\n", MY_AP_IP_STR);
+2780:  Serial.printf("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
+2781:  Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
+2782:  Serial.printf("  POST http://%s/sync  -> sync from Phantom-2\n", MY_AP_IP_STR);
+2783:  Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
+2784:  Serial.println("  Priority sync: any local file write -> ask Phantom-2 to pull; recording waits until sync done");
+2785:}
+2786:
+2787:// ── Loop ──────────────────────────────────────────────────────
+2788:void loop()
+2789:{
+2790:  server.handleClient();
+2791:
+2792:  // Priority sync chay truoc mic va auto-sync dinh ky
+2793:  handlePrioritySync();
+2794:  handleAutoMicRecord();
+2795:  // AutoSync disabled: only sync when upload or recording marks syncPending.
+2796:  // handleAutoSync();
+2797:
+2798:  if (!micArmed && !recordingInProgress && !syncPending && !syncInProgress && !peerSyncRequestInProgress)
+2799:  {
+2800:    MicVoiceStats st = readMicVoiceStats();
+2801:    if (st.rms15 < MIC_REARM_RMS_LEVEL)
+2802:      micArmed = true;
+2803:  }
+2804:
+2805:  WiFiClient c = audioServer.accept();
+2806:  if (c)
+2807:  {
+2808:    unsigned long t = millis();
+2809:    while (!c.available() && c.connected() && (millis() - t) < 3000)
+2810:      delay(1);
+2811:
+2812:    if (c.available())
+2813:      handleRawTCP(c);
+2814:
+2815:    c.stop();
+2816:  }
+2817:
+2818:  WiFiClient uc = uploadServer.accept();
+2819:  if (uc)
+2820:  {
+2821:    unsigned long t = millis();
+2822:    while (!uc.available() && uc.connected() && (millis() - t) < 5000)
+2823:      delay(2);
+2824:
+2825:    if (uc.available())
+2826:      handleRawUpload(uc);
+2827:
+2828:    uc.stop();
+2829:  }
+2830:
+2831:  // Auto-sync moi 60 giay. Neu peer busy thi bo qua lan do.
+2832:}
