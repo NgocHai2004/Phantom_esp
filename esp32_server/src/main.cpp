@@ -36,6 +36,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <FS.h>
+#include <driver/i2s.h>
 #include <time.h>
 #include <vector>
 #include "test_wav.h"
@@ -67,6 +68,34 @@
 #define MY_AP_IP_STR "192.168.4.1"
 #define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: handleAutoSync() is not called
 
+// ── I2S MIC ───────────────────────────────────────────────────
+#define I2S_WS 25
+#define I2S_SD 22
+#define I2S_SCK 26
+#define I2S_PORT I2S_NUM_0
+
+#define MIC_SAMPLE_RATE 16000
+#define MIC_SAMPLE_BITS 16
+#define MIC_I2S_READ_LEN 1024
+
+// ── Auto trigger record ───────────────────────────────────────
+#define AUTO_RECORD_MS 30000UL
+
+// ── Human voice trigger tuning ────────────────────────────────
+#define MIC_ANALYZE_SHIFT 15
+#define MIC_TRIGGER_RMS_LEVEL 400
+#define MIC_REARM_RMS_LEVEL 200
+#define MIC_MIN_ZCR 3
+#define MIC_MAX_ZCR 90
+#define MIC_VOICE_FRAMES_TO_TRIGGER 4
+#define MIC_COOLDOWN_MS 2000UL
+#define MIC_LOG_INTERVAL_MS 500UL
+#define REC_LOG_INTERVAL_MS 1000UL
+
+// Keep legacy defines to avoid accidental references breaking build
+#define MIC_TRIGGER_LEVEL 5000
+#define MIC_REARM_LEVEL 3000
+
 // ── SD card ───────────────────────────────────────────────────
 #define SD_CS 5
 #define SD_SCK 18
@@ -92,6 +121,13 @@ bool ramReady = false;
 // ── State ─────────────────────────────────────────────────────
 bool nodeEnabled = true;
 bool sdReady = false;
+bool micReady = false;
+bool micArmed = true;
+bool recordingInProgress = false;
+uint32_t micFileCounter = 0;
+String lastMicWavFile = "none";
+unsigned long lastMicTriggerMs = 0;
+unsigned long lastRecordLoudMs = 0;
 
 bool syncDone = false;
 bool syncFailed = false;
@@ -128,6 +164,13 @@ void markLocalFileChanged(const String &reason);
 void handlePrioritySync();
 bool requestPeerPullSync();
 void debugScanPeerNetworks(const char *targetSsid);
+void setupI2SMic();
+String genMicFilename();
+struct MicVoiceStats;
+MicVoiceStats readMicVoiceStats();
+bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_MS);
+void handleAutoMicRecord();
+bool verifyPeerHasLocalFile(const String &localPath);
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -348,6 +391,399 @@ bool sdLoadToRam()
   ramReady = (rd >= 44);
   Serial.printf("[SD] Load %d bytes to RAM -> %s\n", rd, ramReady ? "OK" : "FAIL");
   return ramReady;
+}
+
+// ── I2S Mic Functions ─────────────────────────────────────────
+void setupI2SMic()
+{
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+      .sample_rate = MIC_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 8,
+      .dma_buf_len = 256,
+      .use_apll = false,
+      .tx_desc_auto_clear = false,
+      .fixed_mclk = 0};
+  i2s_pin_config_t pin_config = {
+      .bck_io_num = I2S_SCK,
+      .ws_io_num = I2S_WS,
+      .data_out_num = I2S_PIN_NO_CHANGE,
+      .data_in_num = I2S_SD};
+
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK)
+    return;
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK)
+    return;
+
+  micReady = true;
+  Serial.println("[MIC] I2S initialized.");
+}
+
+String genMicFilename()
+{
+  struct tm timeinfo;
+
+  if (getLocalTime(&timeinfo))
+  {
+    char buf[64];
+    strftime(buf, sizeof(buf), "/rec/rec_%Y%m%d_%H%M%S.wav", &timeinfo);
+    return String(buf);
+  }
+
+  micFileCounter++;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "/rec/rec_no_time_%06lu.wav", (unsigned long)micFileCounter);
+  return String(buf);
+}
+
+struct MicVoiceStats
+{
+  int peak13;
+  int peak15;
+  int rms15;
+  int zcr;
+  bool voiceLike;
+};
+
+MicVoiceStats readMicVoiceStats()
+{
+  MicVoiceStats st = {0, 0, 0, 0, false};
+
+  if (!micReady || recordingInProgress)
+    return st;
+
+  uint8_t i2sData[MIC_I2S_READ_LEN];
+  size_t bytesRead = 0;
+
+  if (i2s_read(I2S_PORT, (void *)i2sData, MIC_I2S_READ_LEN, &bytesRead, 20 / portTICK_PERIOD_MS) != ESP_OK)
+    return st;
+  if (bytesRead == 0)
+    return st;
+
+  int32_t *samples32 = (int32_t *)i2sData;
+  int sampleCount = bytesRead / 4;
+  if (sampleCount <= 0)
+    return st;
+
+  int64_t sum = 0;
+  for (int i = 0; i < sampleCount; i++)
+    sum += samples32[i];
+  int32_t dc = (int32_t)(sum / sampleCount);
+
+  int64_t sumSq15 = 0;
+  int prevSign = 0;
+  int zcr = 0;
+
+  for (int i = 0; i < sampleCount; i++)
+  {
+    int32_t centered = samples32[i] - dc;
+
+    int32_t s13 = centered >> 13;
+    if (s13 > 32767)
+      s13 = 32767;
+    if (s13 < -32768)
+      s13 = -32768;
+    int a13 = abs((int)s13);
+    if (a13 > st.peak13)
+      st.peak13 = a13;
+
+    int32_t s15 = centered >> MIC_ANALYZE_SHIFT;
+    if (s15 > 32767)
+      s15 = 32767;
+    if (s15 < -32768)
+      s15 = -32768;
+
+    int a15 = abs((int)s15);
+    if (a15 > st.peak15)
+      st.peak15 = a15;
+
+    sumSq15 += (int64_t)s15 * (int64_t)s15;
+
+    int sign = 0;
+    if (s15 > 100)
+      sign = 1;
+    else if (s15 < -100)
+      sign = -1;
+
+    if (sign != 0)
+    {
+      if (prevSign != 0 && sign != prevSign)
+        zcr++;
+      prevSign = sign;
+    }
+  }
+
+  st.rms15 = (int)sqrt((float)sumSq15 / (float)sampleCount);
+  st.zcr = zcr;
+
+  st.voiceLike = (st.rms15 >= MIC_TRIGGER_RMS_LEVEL &&
+                  st.zcr >= MIC_MIN_ZCR &&
+                  st.zcr <= MIC_MAX_ZCR);
+
+  return st;
+}
+
+bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
+{
+  if (!sdReady || !micReady || recordingInProgress)
+    return false;
+
+  recordingInProgress = true;
+
+  if (!SD.exists("/rec"))
+    SD.mkdir("/rec");
+
+  if (SD.exists(path))
+    SD.remove(path);
+
+  File audioFile = SD.open(path, FILE_WRITE);
+  if (!audioFile)
+  {
+    recordingInProgress = false;
+    Serial.printf("[MIC] Cannot open file for recording: %s\n", path);
+    return false;
+  }
+
+  uint8_t emptyHeader[44] = {0};
+  audioFile.write(emptyHeader, 44);
+
+  i2s_zero_dma_buffer(I2S_PORT);
+  delay(50);
+
+  uint8_t i2sData[MIC_I2S_READ_LEN];
+  size_t bytesRead = 0;
+  uint32_t totalDataBytes = 0;
+  uint32_t samplesRecorded = 0;
+  uint32_t maxSamplesAllowed = ((MAX_FILE_SIZE - 44UL) / 2UL);
+
+  int recPeak14 = 0;
+  int recPeak15 = 0;
+  unsigned long lastRecLogMs = millis();
+  lastRecordLoudMs = millis();
+
+  digitalWrite(LED_PIN, HIGH);
+  Serial.printf("[MIC] REC START: %s (stop after %lu ms silence)\n", path, (unsigned long)durationMs);
+
+  while (true)
+  {
+    server.handleClient();
+    if (!nodeEnabled)
+      break;
+
+    if (millis() - lastRecordLoudMs >= durationMs)
+    {
+      Serial.println("[MIC] Silence timeout -> stop recording");
+      break;
+    }
+
+    if (samplesRecorded >= maxSamplesAllowed)
+    {
+      Serial.println("[MIC] Max file size reached -> stop recording");
+      break;
+    }
+
+    if (i2s_read(I2S_PORT, (void *)i2sData, MIC_I2S_READ_LEN, &bytesRead, portMAX_DELAY) != ESP_OK)
+    {
+      Serial.println("[MIC] i2s_read failed");
+      break;
+    }
+
+    int32_t *samples32 = (int32_t *)i2sData;
+    int sampleCount = bytesRead / 4;
+
+    int64_t frameSumSq15 = 0;
+    int framePeak15 = 0;
+
+    for (int i = 0; i < sampleCount && samplesRecorded < maxSamplesAllowed; i++)
+    {
+      int32_t raw = samples32[i];
+
+      int32_t s14 = raw >> 14;
+      if (s14 > 32767)
+        s14 = 32767;
+      if (s14 < -32768)
+        s14 = -32768;
+
+      int32_t s15 = raw >> 15;
+      if (s15 > 32767)
+        s15 = 32767;
+      if (s15 < -32768)
+        s15 = -32768;
+
+      int a14 = abs((int)s14);
+      int a15 = abs((int)s15);
+      if (a14 > recPeak14)
+        recPeak14 = a14;
+      if (a15 > recPeak15)
+        recPeak15 = a15;
+      if (a15 > framePeak15)
+        framePeak15 = a15;
+      frameSumSq15 += (int64_t)s15 * (int64_t)s15;
+
+      int16_t s16 = (int16_t)s14;
+      audioFile.write((uint8_t *)&s16, sizeof(s16));
+
+      totalDataBytes += sizeof(s16);
+      samplesRecorded++;
+    }
+
+    int frameRms15 = (sampleCount > 0) ? (int)sqrt((float)frameSumSq15 / (float)sampleCount) : 0;
+    if (frameRms15 >= MIC_TRIGGER_RMS_LEVEL || framePeak15 >= (MIC_TRIGGER_RMS_LEVEL * 2))
+    {
+      lastRecordLoudMs = millis();
+    }
+
+    if (millis() - lastRecLogMs >= REC_LOG_INTERVAL_MS)
+    {
+      Serial.printf("[MIC] REC LOG peak14=%d peak15=%d rms15=%d silence_ms=%lu samples=%lu\n",
+                    recPeak14, recPeak15, frameRms15,
+                    (unsigned long)(millis() - lastRecordLoudMs),
+                    (unsigned long)samplesRecorded);
+      recPeak14 = 0;
+      recPeak15 = 0;
+      lastRecLogMs = millis();
+    }
+  }
+
+  uint32_t chunkSize = 36 + totalDataBytes;
+  uint32_t subchunk1Size = 16;
+  uint16_t audioFormat = 1;
+  uint16_t channels = 1;
+  uint32_t sampleRate = MIC_SAMPLE_RATE;
+  uint16_t bitsPerSample = MIC_SAMPLE_BITS;
+  uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+  uint16_t blockAlign = channels * bitsPerSample / 8;
+
+  audioFile.seek(0);
+  audioFile.write((const uint8_t *)"RIFF", 4);
+  audioFile.write((uint8_t *)&chunkSize, 4);
+  audioFile.write((const uint8_t *)"WAVE", 4);
+  audioFile.write((const uint8_t *)"fmt ", 4);
+  audioFile.write((uint8_t *)&subchunk1Size, 4);
+  audioFile.write((uint8_t *)&audioFormat, 2);
+  audioFile.write((uint8_t *)&channels, 2);
+  audioFile.write((uint8_t *)&sampleRate, 4);
+  audioFile.write((uint8_t *)&byteRate, 4);
+  audioFile.write((uint8_t *)&blockAlign, 2);
+  audioFile.write((uint8_t *)&bitsPerSample, 2);
+  audioFile.write((const uint8_t *)"data", 4);
+  audioFile.write((uint8_t *)&totalDataBytes, 4);
+
+  audioFile.close();
+  digitalWrite(LED_PIN, LOW);
+
+  recordingInProgress = false;
+
+  Serial.printf("[MIC] REC DONE: %s (%lu bytes audio)\n", path, (unsigned long)totalDataBytes);
+  return totalDataBytes > 0;
+}
+
+void handleAutoMicRecord()
+{
+  if (!micReady || !sdReady || recordingInProgress || !micArmed)
+    return;
+
+  if (syncPending || syncInProgress || peerSyncRequestInProgress)
+    return;
+
+  if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS)
+    return;
+
+  static int voiceFrames = 0;
+  static unsigned long lastLogMs = 0;
+
+  MicVoiceStats st = readMicVoiceStats();
+
+  if (millis() - lastLogMs >= MIC_LOG_INTERVAL_MS)
+  {
+    Serial.printf("[MIC] peak13=%d peak15=%d rms15=%d zcr=%d voice=%s frames=%d/%d\n",
+                  st.peak13, st.peak15, st.rms15, st.zcr,
+                  st.voiceLike ? "yes" : "no",
+                  voiceFrames, MIC_VOICE_FRAMES_TO_TRIGGER);
+    lastLogMs = millis();
+  }
+
+  if (st.voiceLike)
+    voiceFrames++;
+  else
+    voiceFrames = 0;
+
+  if (voiceFrames >= MIC_VOICE_FRAMES_TO_TRIGGER)
+  {
+    String path = genMicFilename();
+    lastMicWavFile = path;
+    lastMicTriggerMs = millis();
+    micArmed = false;
+    voiceFrames = 0;
+
+    Serial.printf("[FLOW] Human-like voice trigger peak13=%d peak15=%d rms15=%d zcr=%d\n",
+                  st.peak13, st.peak15, st.rms15, st.zcr);
+
+    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS);
+
+    if (ok)
+    {
+      Serial.println("[FLOW] Record done -> priority peer sync");
+      markLocalFileChanged("mic record " + path);
+    }
+    else
+    {
+      Serial.println("[FLOW] Record failed -> skip sync");
+    }
+  }
+}
+
+bool verifyPeerHasLocalFile(const String &localPath)
+{
+  if (!sdReady || localPath.length() == 0)
+    return false;
+
+  String base = localPath;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0)
+    base = base.substring(slash + 1);
+  if (base.length() == 0)
+    return false;
+
+  String displayRec = "rec/" + base;
+  size_t localSize = 0;
+  if (SD.exists(localPath))
+  {
+    File f = SD.open(localPath, "r");
+    if (f)
+    {
+      localSize = f.size();
+      f.close();
+    }
+  }
+
+  String listJson = httpGetFromPeer("/file/list", 5000);
+  if (listJson.length() == 0)
+  {
+    Serial.println("[PrioritySync] Verify: Phantom-2 /file/list empty");
+    return false;
+  }
+
+  bool hasName = (listJson.indexOf("\"name\":\"" + displayRec + "\"") >= 0) ||
+                 (listJson.indexOf("\"name\":\"" + base + "\"") >= 0) ||
+                 (listJson.indexOf(displayRec) >= 0) ||
+                 (listJson.indexOf(base) >= 0);
+
+  bool sizeOk = true;
+  if (localSize > 0)
+    sizeOk = (listJson.indexOf("\"size\":" + String((uint32_t)localSize)) >= 0);
+
+  Serial.printf("[PrioritySync] Verify Phantom-2 has '%s': name=%s size=%s localSize=%lu\n",
+                displayRec.c_str(),
+                hasName ? "yes" : "no",
+                sizeOk ? "yes" : "no",
+                (unsigned long)localSize);
+
+  return hasName && sizeOk;
 }
 
 // ── JSON WAV info ─────────────────────────────────────────────
@@ -1041,15 +1477,15 @@ void handleStatus()
                   ",\"sync_done\":" + (syncDone ? "true" : "false") +
                   ",\"sync_failed\":" + (syncFailed ? "true" : "false") +
                   ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false") +
-                  ",\"busy\":" + String(syncInProgress ? "true" : "false") +
+                  ",\"busy\":" + String((recordingInProgress || syncInProgress || peerSyncRequestInProgress) ? "true" : "false") +
                   ",\"sync_msg\":\"" + syncMsg + "\"" +
                   ",\"sd_has_file\":" + (sdHasFile() ? "true" : "false") +
                   ",\"sd_ready\":" + String(sdReady ? "true" : "false") +
-                  ",\"mic_ready\":false" +
-                  ",\"recording\":false" +
-                  ",\"last_mic_file\":\"none\"" +
-                  ",\"sd_total\":" + String(sdReady ? (uint32_t)(SD.totalBytes() / 1024) : 0) +
-                  ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0) +
+                  ",\"mic_ready\":" + String(micReady ? "true" : "false") +
+                  ",\"recording\":" + String(recordingInProgress ? "true" : "false") +
+                  ",\"last_mic_file\":\"" + lastMicWavFile + "\"" +
+                  ",\"sd_total\":" + String(sdReady ? (uint32_t)(SD.totalBytes() / 1024) : 0) + " KB" +
+                  ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0) + " KB" +
                   ",\"ram_ready\":" + (ramReady ? "true" : "false") +
                   ",\"ram_size\":" + String(ramSize) +
                   ",\"node_enabled\":" + (nodeEnabled ? "true" : "false") +
@@ -1621,10 +2057,10 @@ void handleRamInfo()
 
 void handleSync()
 {
-  if (syncInProgress)
+  if (recordingInProgress || syncInProgress)
   {
     server.send(423, "application/json",
-                "{\"status\":\"busy\",\"message\":\"Phantom-1 is syncing\"}");
+                "{\"status\":\"busy\",\"message\":\"Phantom-1 is recording or syncing\"}");
     return;
   }
 
@@ -1636,15 +2072,17 @@ void handleSync()
 
 void handleBusy()
 {
-  bool busy = syncInProgress || peerSyncRequestInProgress;
+  bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress;
+  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle"));
   String j = "{\"node\":1";
   j += ",\"busy\":" + String(busy ? "true" : "false");
-  j += ",\"recording\":false";
+  j += ",\"recording\":" + String(recordingInProgress ? "true" : "false");
   j += ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false");
   j += ",\"peer_sync_request_in_progress\":" + String(peerSyncRequestInProgress ? "true" : "false");
-  j += ",\"reason\":\"" + String(syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle")) + "\"";
-  j += ",\"sync_msg\":\"" + syncMsg + "\"}";
-  server.send(syncInProgress ? 423 : 200, "application/json", j);
+  j += ",\"reason\":\"" + reason + "\"";
+  j += ",\"sync_msg\":\"" + syncMsg + "\"";
+  j += ",\"last_mic_file\":\"" + lastMicWavFile + "\"}";
+  server.send(busy ? 423 : 200, "application/json", j);
 }
 
 // ── Priority sync: khi SD co file local moi/cap nhat thi bao Phantom-2 keo ve ──
@@ -1657,12 +2095,16 @@ void markLocalFileChanged(const String &reason)
   syncPendingReason = reason;
   prioritySyncFailCount = 0;
   syncMsg = "pending peer sync: " + reason;
+
+  // Uu tien dong bo: khoa trigger ghi am cho den khi dong bo xong
+  micArmed = false;
+
   Serial.println("[PrioritySync] Pending -> " + reason);
 }
 
 bool requestPeerPullSync()
 {
-  if (!sdReady || syncInProgress || peerSyncRequestInProgress)
+  if (!sdReady || recordingInProgress || syncInProgress || peerSyncRequestInProgress)
     return false;
 
   peerSyncRequestInProgress = true;
@@ -1700,6 +2142,7 @@ bool requestPeerPullSync()
     return false;
   }
 
+  // Neu peer dang ban thi giu pending va thu lai sau
   String busyBody = httpGetFromPeer("/busy", 3000);
   if (busyBody.indexOf("\"busy\":true") >= 0 ||
       busyBody.indexOf("\"recording\":true") >= 0 ||
@@ -1753,20 +2196,30 @@ bool requestPeerPullSync()
     return false;
   }
 
+  // Doi Phantom-2 sync xong va VERIFY file da co tren Phantom-2.
+  // Khong duoc chi dua vao /busy, vi peer co the idle neu da skip sync.
+  ok = false;
+  bool verified = false;
   unsigned long waitStart = millis();
-  while (millis() - waitStart < 70000UL)
+  while (millis() - waitStart < 90000UL)
   {
-    server.handleClient();
+    server.handleClient(); // cho Phantom-2 keo /file/list va /file/download tu node nay
+
     String b = httpGetFromPeer("/busy", 2500);
-    if (b.length() > 0 &&
-        b.indexOf("\"busy\":true") < 0 &&
-        b.indexOf("\"sync_in_progress\":true") < 0 &&
-        b.indexOf("\"recording\":true") < 0)
+    bool peerIdle = (b.length() > 0 &&
+                     b.indexOf("\"busy\":true") < 0 &&
+                     b.indexOf("\"sync_in_progress\":true") < 0);
+
+    if (peerIdle)
     {
-      ok = true;
-      break;
+      verified = verifyPeerHasLocalFile(lastMicWavFile);
+      if (verified)
+      {
+        ok = true;
+        break;
+      }
     }
-    delay(250);
+    delay(500);
   }
 
   WiFi.disconnect(false);
@@ -1774,20 +2227,24 @@ bool requestPeerPullSync()
 
   peerSyncRequestInProgress = false;
 
-  if (ok)
+  if (ok && verified)
   {
     syncPending = false;
     syncDone = true;
     syncFailed = false;
-    syncMsg = "ok: peer pulled latest local files";
+    syncMsg = "ok: Phantom-2 verified latest local file";
     syncPendingReason = "none";
     prioritySyncFailCount = 0;
-    Serial.println("[PrioritySync] Done");
+    micArmed = true;
+    lastMicTriggerMs = millis();
+    Serial.println("[PrioritySync] Done + verified -> recording can run again");
     return true;
   }
 
-  syncMsg = "pending: wait Phantom-2 sync timeout";
+  syncMsg = "pending: wait/verify Phantom-2 sync timeout";
   syncFailed = true;
+  micArmed = false; // tiep tuc khoa mic, handlePrioritySync se retry
+  Serial.println("[PrioritySync] Verify failed -> keep mic locked and retry");
   return false;
 }
 
@@ -1796,9 +2253,13 @@ void handlePrioritySync()
   if (!syncPending)
     return;
 
-  if (syncInProgress || peerSyncRequestInProgress)
+  // Uu tien dong bo hon ghi am: khi pending thi khong cho mic arm
+  micArmed = false;
+
+  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
     return;
 
+  // Chong retry qua day neu peer khong tim thay/ban
   if (millis() - lastPrioritySyncAttemptMs < 3000UL)
     return;
   lastPrioritySyncAttemptMs = millis();
@@ -1811,14 +2272,15 @@ void handlePrioritySync()
 
     if (prioritySyncFailCount >= 3)
     {
-      Serial.println("[PrioritySync] Peer not reachable after 3 tries -> cancel pending sync");
-      syncPending = false;
-      peerSyncRequestInProgress = false;
+      // STRICT GATE: do not allow new recording until Phantom-2 sync is verified.
+      // Keep syncPending=true and micArmed=false; just slow down retries.
+      Serial.println("[PrioritySync] Peer not verified after 3 tries -> keep mic locked, retry later");
       syncFailed = true;
       syncDone = false;
-      syncPendingReason = "none";
-      syncMsg = "cancelled: Phantom-2 not reachable after 3 tries";
+      syncMsg = "pending: Phantom-2 sync not verified; mic locked";
       prioritySyncFailCount = 0;
+      micArmed = false;
+      lastPrioritySyncAttemptMs = millis() + 12000UL;
       restoreMyAP();
     }
   }
@@ -1831,8 +2293,12 @@ void handleAutoSync()
 
   lastAutoSyncMs = millis();
 
-  if (!sdReady || syncInProgress)
+  if (!sdReady || recordingInProgress || syncInProgress)
+  {
+    if (recordingInProgress)
+      syncMsg = "skip: recording in progress";
     return;
+  }
 
   Serial.println("[AutoSync] 60s tick -> try sync from Phantom-2");
   syncDone = syncFromPeer();
@@ -2295,6 +2761,8 @@ void setup()
   audioServer.begin();
   uploadServer.begin();
 
+  setupI2SMic();
+
   // Gio Viet Nam. Neu khong co internet thi khong anh huong dong bo file.
   configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
@@ -2313,7 +2781,7 @@ void setup()
   Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
   Serial.printf("  POST http://%s/sync  -> sync from Phantom-2\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
-  Serial.println("  Mic/record: DISABLED on Phantom-1");
+  Serial.println("  Priority sync: any local file write -> ask Phantom-2 to pull; recording waits until sync done");
 }
 
 // ── Loop ──────────────────────────────────────────────────────
@@ -2321,10 +2789,18 @@ void loop()
 {
   server.handleClient();
 
-  // Priority sync chay truoc auto-sync dinh ky
+  // Priority sync chay truoc mic va auto-sync dinh ky
   handlePrioritySync();
+  handleAutoMicRecord();
   // AutoSync disabled: only sync when upload or recording marks syncPending.
   // handleAutoSync();
+
+  if (!micArmed && !recordingInProgress && !syncPending && !syncInProgress && !peerSyncRequestInProgress)
+  {
+    MicVoiceStats st = readMicVoiceStats();
+    if (st.rms15 < MIC_REARM_RMS_LEVEL)
+      micArmed = true;
+  }
 
   WiFiClient c = audioServer.accept();
   if (c)
