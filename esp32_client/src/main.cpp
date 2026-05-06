@@ -7,7 +7,9 @@
  *
  * Logic ghi âm:
  *   Có tiếng to vượt ngưỡng → ghi 30 giây vào SD /rec
- *   Ghi xong → thử đồng bộ Phantom-1; nếu không thấy thì bỏ qua
+ *   Ghi xong → ma hoa AES-GCM thanh .enc tren SD
+ *   Sau do thu dong bo Phantom-1 toi da 3 lan
+ *   Neu 3 lan fail → giu file .enc tren SD va tiep tuc ghi am
  *
  * Endpoints (port 80):
  *   GET  /status              ← trạng thái
@@ -32,6 +34,8 @@
 #include <FS.h>
 #include <time.h>
 #include <vector>
+#include <mbedtls/gcm.h>
+#include <esp_system.h>
 #include "test_wav.h"
 
 // ── Cấu hình Node-2 ───────────────────────────────────────────
@@ -83,8 +87,8 @@
 // I2S 32-bit -> center DC -> shift về int16 để phân tích.
 // peak13 chỉ để xem log so sánh với code cũ; trigger chính dùng rms15.
 #define MIC_ANALYZE_SHIFT 15
-#define MIC_TRIGGER_RMS_LEVEL 400     // tăng lên 1800-2500 nếu vẫn tự ghi
-#define MIC_REARM_RMS_LEVEL 200       // phải nhỏ hơn trigger
+#define MIC_TRIGGER_RMS_LEVEL 1800    // tăng lên 1800-2500 nếu vẫn tự ghi
+#define MIC_REARM_RMS_LEVEL 600       // phải nhỏ hơn trigger
 #define MIC_MIN_ZCR 3                 // zero-crossing thấp quá thường là ù/rung DC
 #define MIC_MAX_ZCR 90                // cao quá thường là hiss/nhiễu cao tần
 #define MIC_VOICE_FRAMES_TO_TRIGGER 4 // ~8 frame liên tục mới ghi
@@ -162,6 +166,8 @@ void handlePrioritySync();
 bool requestPeerPullSync();
 void debugScanPeerNetworks(const char *targetSsid);
 bool verifyNode1HasLocalFile(const String &localPath);
+String encryptedPathFromWavPath(const String &wavPath);
+bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool deletePlainAfterEncrypt);
 // ── State ─────────────────────────────────────────────────────
 bool nodeEnabled = true; // Luon bat, da bo chuc nang nut BOOT bat/tat node
 
@@ -242,6 +248,8 @@ String mimeForExt(const String &ext)
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
   if (ext == ".xlsx")
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (ext == ".enc")
+    return "application/octet-stream";
   if (ext == ".bin")
     return "application/octet-stream";
   return "application/octet-stream";
@@ -384,6 +392,125 @@ bool sdLoadToRam()
   ramReady = (rd >= 44);
   Serial.printf("[SD] Load %d bytes to RAM → %s\n", rd, ramReady ? "OK" : "FAIL");
   return ramReady;
+}
+
+// ── AES-GCM file encryption ───────────────────────────────────
+// File format: "PHGCM1" + IV(12 bytes) + ciphertext + TAG(16 bytes)
+// IMPORTANT: Change this demo key before real deployment. UI decrypt must use the same 64-hex key.
+static const uint8_t AES_GCM_KEY[32] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01};
+
+#define ENC_MAGIC "PHGCM1"
+#define ENC_MAGIC_LEN 6
+#define AES_GCM_IV_LEN 12
+#define AES_GCM_TAG_LEN 16
+#define AES_GCM_BUF_LEN 1024
+
+String encryptedPathFromWavPath(const String &wavPath)
+{
+  String encPath = wavPath;
+  int dot = encPath.lastIndexOf('.');
+  if (dot >= 0)
+    encPath = encPath.substring(0, dot);
+  encPath += ".enc";
+  return encPath;
+}
+
+bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool deletePlainAfterEncrypt = true)
+{
+  if (!sdReady || !SD.exists(plainPath))
+  {
+    Serial.println("[AES-GCM] Plain file not found: " + plainPath);
+    return false;
+  }
+
+  File in = SD.open(plainPath, "r");
+  if (!in)
+  {
+    Serial.println("[AES-GCM] Cannot open plain file: " + plainPath);
+    return false;
+  }
+
+  if (SD.exists(encPath))
+    SD.remove(encPath);
+
+  File out = SD.open(encPath, FILE_WRITE);
+  if (!out)
+  {
+    in.close();
+    Serial.println("[AES-GCM] Cannot create encrypted file: " + encPath);
+    return false;
+  }
+
+  uint8_t iv[AES_GCM_IV_LEN];
+  esp_fill_random(iv, AES_GCM_IV_LEN);
+
+  out.write((const uint8_t *)ENC_MAGIC, ENC_MAGIC_LEN);
+  out.write(iv, AES_GCM_IV_LEN);
+
+  mbedtls_gcm_context ctx;
+  mbedtls_gcm_init(&ctx);
+
+  int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, AES_GCM_KEY, 256);
+  if (ret == 0)
+    ret = mbedtls_gcm_starts(&ctx, MBEDTLS_GCM_ENCRYPT, iv, AES_GCM_IV_LEN, NULL, 0);
+
+  uint8_t inBuf[AES_GCM_BUF_LEN];
+  uint8_t outBuf[AES_GCM_BUF_LEN];
+  size_t totalIn = 0;
+
+  while (ret == 0 && in.available())
+  {
+    size_t rd = in.read(inBuf, AES_GCM_BUF_LEN);
+    if (rd == 0)
+      break;
+
+    ret = mbedtls_gcm_update(&ctx, rd, inBuf, outBuf);
+    if (ret != 0)
+      break;
+
+    size_t wr = out.write(outBuf, rd);
+    if (wr != rd)
+    {
+      ret = -1;
+      break;
+    }
+    totalIn += rd;
+    server.handleClient();
+    delay(1);
+  }
+
+  uint8_t tag[AES_GCM_TAG_LEN];
+  if (ret == 0)
+    ret = mbedtls_gcm_finish(&ctx, tag, AES_GCM_TAG_LEN);
+
+  if (ret == 0)
+  {
+    size_t wr = out.write(tag, AES_GCM_TAG_LEN);
+    if (wr != AES_GCM_TAG_LEN)
+      ret = -1;
+  }
+
+  mbedtls_gcm_free(&ctx);
+  in.close();
+  out.close();
+
+  if (ret != 0 || totalIn == 0)
+  {
+    SD.remove(encPath);
+    Serial.printf("[AES-GCM] Encrypt FAILED ret=%d plain=%s enc=%s\n", ret, plainPath.c_str(), encPath.c_str());
+    return false;
+  }
+
+  if (deletePlainAfterEncrypt)
+    SD.remove(plainPath);
+
+  Serial.printf("[AES-GCM] Encrypt OK: %s -> %s (%lu bytes plaintext)\n",
+                plainPath.c_str(), encPath.c_str(), (unsigned long)totalIn);
+  return true;
 }
 
 // ── I2S Mic Functions ─────────────────────────────────────────
@@ -703,8 +830,10 @@ void handleAutoMicRecord()
   if (!micReady || !sdReady || recordingInProgress || !micArmed)
     return;
 
-  // Sync duoc uu tien hon ghi am
-  if (syncPending || syncInProgress || peerSyncRequestInProgress)
+  // Chi khoa mic khi dang thuc su sync/request sync.
+  // Khong dung syncPending de khoa vinh vien, vi neu peer offline 3 lan
+  // thi file .enc van duoc giu tren SD va mic phai duoc mo lai de ghi tiep.
+  if (syncInProgress || peerSyncRequestInProgress)
     return;
 
   if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS)
@@ -735,8 +864,9 @@ void handleAutoMicRecord()
 
   if (voiceFrames >= MIC_VOICE_FRAMES_TO_TRIGGER)
   {
-    String path = genMicFilename();
-    lastMicWavFile = path;
+    String wavPath = genMicFilename();
+    String encPath = encryptedPathFromWavPath(wavPath);
+    lastMicWavFile = encPath;
     lastMicTriggerMs = millis();
     micArmed = false;
     voiceFrames = 0;
@@ -744,16 +874,29 @@ void handleAutoMicRecord()
     Serial.printf("[FLOW] Human-like voice trigger peak13=%d peak15=%d rms15=%d zcr=%d\n",
                   st.peak13, st.peak15, st.rms15, st.zcr);
 
-    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS); // 30s im lang thi dung
+    bool ok = recordTriggeredWavToSD(wavPath.c_str(), AUTO_RECORD_MS);
 
     if (ok)
     {
-      Serial.println("[FLOW] Record done -> priority peer sync");
-      markLocalFileChanged("mic record " + path);
+      Serial.println("[FLOW] Record done -> AES-GCM encrypt");
+      bool encOk = aesGcmEncryptFile(wavPath, encPath, true);
+      if (encOk)
+      {
+        Serial.println("[FLOW] Encrypt done -> priority peer sync");
+        markLocalFileChanged("mic encrypted record " + encPath);
+      }
+      else
+      {
+        Serial.println("[FLOW] Encrypt failed -> skip sync, re-arm mic");
+        micArmed = true;
+        lastMicTriggerMs = millis();
+      }
     }
     else
     {
-      Serial.println("[FLOW] Record failed -> skip sync");
+      Serial.println("[FLOW] Record failed -> skip sync, re-arm mic");
+      micArmed = true;
+      lastMicTriggerMs = millis();
     }
   }
 }
@@ -945,16 +1088,28 @@ void handlePrioritySync()
 
     if (prioritySyncFailCount >= 3)
     {
-      // STRICT GATE: do not allow new recording until Phantom-1 sync is verified.
-      // Keep syncPending=true and micArmed=false; just slow down retries.
-      Serial.println("[PrioritySync] Peer not verified after 3 tries -> keep mic locked, retry later");
+      // OFFLINE FALLBACK:
+      // Sau 3 lan khong ket noi/khong verify duoc Phantom-1:
+      //   1) Khong retry vo han.
+      //   2) Giu file .enc da ma hoa tren SD card.
+      //   3) Huy pending sync cua file hien tai.
+      //   4) Mo lai mic de tiep tuc ghi file moi.
+      Serial.println("[PrioritySync] 3 retries failed -> keep encrypted file on SD and continue recording");
+
+      syncPending = false;
+      syncPendingReason = "none";
+      prioritySyncFailCount = 0;
+
       syncFailed = true;
       syncDone = false;
-      syncMsg = "pending: Phantom-1 sync not verified; mic locked";
-      prioritySyncFailCount = 0;
-      micArmed = false;
-      lastPrioritySyncAttemptMs = millis() + 12000UL;
+      syncMsg = "offline: encrypted file kept on SD; recording continues";
+
+      peerSyncRequestInProgress = false;
+      micArmed = true;
+      lastMicTriggerMs = millis();
+
       restorePhantom2AP();
+      return;
     }
   }
 }
