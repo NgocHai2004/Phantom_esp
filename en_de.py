@@ -21,9 +21,69 @@ def _resource_path(relative: str) -> str:
     base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
     return str(base / relative)
 
-sys.path.insert(0, _resource_path("project_nen"))
-from zipfolder.compressor import compress_folder
-from zipfolder.decompressor import decompress_folder
+# Không dùng zipfolder/pyminizip nữa vì pyminizip cần Microsoft Visual C++ Build Tools trên Windows.
+# Dùng zipfile chuẩn của Python để nén/giải nén .zfld.
+
+def compress_folder(folder_path, output_zip_path=None, optimize=True, algorithm="zip"):
+    """
+    Nén toàn bộ folder thành file .zfld/.zip bằng zipfile chuẩn Python.
+
+    Tương thích với cách gọi cũ:
+        compress_folder(str(work_folder), str(zfld_path), optimize=True, algorithm="7z")
+
+    Các tham số optimize/algorithm được giữ để code cũ không lỗi,
+    nhưng bên trong dùng ZIP_DEFLATED thay cho zipfolder/pyminizip.
+    """
+    folder_path = Path(folder_path).resolve()
+
+    if output_zip_path is None:
+        output_zip_path = str(folder_path) + ".zfld"
+
+    output_zip_path = Path(output_zip_path).resolve()
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(folder_path):
+            root_path = Path(root)
+            for filename in files:
+                file_path = root_path / filename
+                arcname = file_path.relative_to(folder_path)
+                zipf.write(file_path, arcname.as_posix())
+
+    return output_zip_path
+
+
+def decompress_folder(zip_path, output_dir):
+    """
+    Giải nén file .zfld/.zip ra output_dir bằng zipfile chuẩn Python.
+
+    Tương thích với cách gọi cũ:
+        result_folder = decompress_folder(zfld_tmp, out_d)
+
+    Có kiểm tra zip-slip để tránh file trong zip ghi ra ngoài output_dir.
+    """
+    zip_path = Path(zip_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        for member in zipf.infolist():
+            member_name = member.filename.replace("\\", "/")
+
+            if not member_name or member_name.endswith("/"):
+                continue
+
+            target_path = (output_dir / member_name).resolve()
+
+            if not str(target_path).startswith(str(output_dir)):
+                raise ValueError(f"Unsafe zip path: {member.filename}")
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with zipf.open(member, "r") as src_file, open(target_path, "wb") as dst_file:
+                shutil.copyfileobj(src_file, dst_file)
+
+    return output_dir
 
 # ── PHANTOM 3-layer crypto ────────────────────────────────────────────────────
 try:
@@ -110,20 +170,77 @@ def tcp_upload(host, port, data: bytes, timeout=30, filename=""):
         try: s.close()
         except: pass
 
-def scan_phantoms(known=_KNOWN_IPS, timeout=2):
+def scan_phantoms(known=_KNOWN_IPS, timeout=3):
+    """Scan Phantom ESP32 APs via /status.
+
+    Bản fix này chịu được lỗi JSON từ ESP32 kiểu:
+        "sd_total":520192 KB
+        "sd_used":105762 KB
+    vì JSON chuẩn không cho chữ KB nằm ngoài dấu nháy.
+    Nếu gặp lỗi đó, app sẽ tự bỏ hậu tố KB để vẫn nhận Phantom ONLINE.
+    """
+    import re
+
     found = []
+
+    def _fix_bad_json(raw: str) -> str:
+        raw = (raw or "").strip()
+        # Sửa số có hậu tố KB không nằm trong chuỗi:
+        #   "sd_total":520192 KB,  ->  "sd_total":520192,
+        #   "sd_used":105762 KB    ->  "sd_used":105762
+        raw = re.sub(r'(:\s*-?\d+(?:\.\d+)?)\s+KB(?=\s*[,}])', r'\1', raw)
+        return raw
+
+    def _load_status(ip: str):
+        req = urllib.request.Request(
+            f"http://{ip}/status",
+            headers={"User-Agent": "PhantomGUI/5.0", "Cache-Control": "no-cache"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode(errors="replace").strip()
+
+        try:
+            return json.loads(raw)
+        except Exception:
+            fixed = _fix_bad_json(raw)
+            return json.loads(fixed)
+
     def _check(ip, name):
         try:
-            req = urllib.request.Request(f"http://{ip}/status",
-                                         headers={"User-Agent": "PhantomGUI/5.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                d = json.loads(r.read().decode())
+            d = _load_status(ip)
+
+            if not isinstance(d, dict):
+                d = {"ok": True, "raw": str(d)}
+
+            # Nếu ESP32 có trả ap_ssid/node thì ưu tiên tên thực tế từ thiết bị.
+            real_name = d.get("ap_ssid") or name
+
             pk = d.get("public_key", "")
-            found.append((ip, name, pk[-4:].upper() if len(pk) >= 4 else "????", d))
-        except: pass
-    threads = [threading.Thread(target=_check, args=(ip, nm), daemon=True) for ip, nm in known]
-    for t in threads: t.start()
-    for t in threads: t.join()
+            found.append((
+                ip,
+                real_name,
+                pk[-4:].upper() if isinstance(pk, str) and len(pk) >= 4 else "????",
+                d
+            ))
+
+        except Exception as e:
+            # In ra console để debug, không làm crash GUI.
+            try:
+                print(f"[SCAN] {name} {ip} failed: {e}")
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=_check, args=(ip, nm), daemon=True)
+        for ip, nm in known
+    ]
+
+    for t in threads:
+        t.start()
+
+    for t in threads:
+        t.join()
+
     return found
 
 

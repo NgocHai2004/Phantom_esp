@@ -1,33 +1,36 @@
 /*
- * Phantom-1 — APSTA + SD File Relay + sync voi Phantom-2
- * Duoc tao tu firmware Phantom-2 cua ban.
+ * Phantom Dual Equal Firmware — APSTA + SD File Relay + MIC Recorder + AES-GCM .bin Sync
+ * Dung chung cho ca Phantom-1 va Phantom-2.
  *
- * Vai tro:
- *   - Phat WiFi AP "Phantom-1" tai 192.168.4.1 de laptop truy cap file.
- *   - Luu/quan ly file tren SD card.
- *   - Dong bo file voi Phantom-2 qua WiFi STA.
- *   - Phantom-1 CHUA CO MIC nen khong ghi am, khong auto-trigger record.
+ * Cach dung:
+ *   - File Phantom_1_equal.ino: #define NODE_ID 1
+ *   - File Phantom_2_equal.ino: #define NODE_ID 2
+ *
+ * Hai node co cung vai tro:
+ *   - Moi node phat WiFi AP rieng de laptop truy cap.
+ *   - Moi node co MIC, tu dong ghi am vao /rec.
+ *   - WAV chi la file tam trong luc ghi; ghi xong ma hoa AES-GCM thanh .bin.
+ *   - .bin la file chinh thuc de luu va dong bo hai chieu.
+ *   - Khi mot node co file moi, node do yeu cau peer POST /sync de peer keo file ve.
+ *   - Neu peer dang ghi, peer se dung ghi an toan, finalize, ma hoa .bin roi sync.
  *
  * Endpoints port 80:
  *   GET  /status
  *   GET  /file/info
  *   GET  /file/list
  *   GET  /file/download?name=<filename>
- *   POST /file/upload        (multipart/form-data file upload -> saves to /rec)
+ *   POST /file/upload
  *   POST /file/clear
  *   POST /file/delete?name=<filename>
  *   GET  /ram/info
- *   POST /sync               (tai file tu Phantom-2 ve SD Phantom-1)
+ *   POST /sync
  *   GET  /sync/status
  *   GET  /sd/list
  *   GET  /sd/download?name=<filename>
  *   GET  /battery
  *
- * Port 8080:
- *   Raw TCP GET/POST audio.wav / file upload cu
- *
- * Port 8081:
- *   Raw TCP upload file bat ky dinh dang
+ * Port 8080: Raw TCP GET/POST audio.wav / file upload cu
+ * Port 8081: Raw TCP upload file bat ky dinh dang
  */
 
 #include <Arduino.h>
@@ -39,22 +42,36 @@
 #include <driver/i2s.h>
 #include <time.h>
 #include <vector>
+#include <mbedtls/gcm.h>
+#include <esp_system.h>
 #include "test_wav.h"
 
-// ── Cau hinh Phantom-1 ────────────────────────────────────────
+// ── Cau hinh node doi xung ───────────────────────────────────
+#ifndef NODE_ID
 #define NODE_ID 1
+#endif
 
-// AP cua Phantom-1
+#if NODE_ID == 1
 #define MY_AP_SSID "Phantom-1"
-#define MY_AP_PASSWORD "12345678"
 #define MY_AP_CHANNEL 1
+#define MY_AP_IP_STR "192.168.4.1"
+#define PEER_SSID "Phantom-2"
+#define PEER_IP "192.168.5.1"
+#elif NODE_ID == 2
+#define MY_AP_SSID "Phantom-2"
+#define MY_AP_CHANNEL 6
+#define MY_AP_IP_STR "192.168.5.1"
+#define PEER_SSID "Phantom-1"
+#define PEER_IP "192.168.4.1"
+#else
+#error "NODE_ID must be 1 or 2"
+#endif
+
+#define MY_AP_PASSWORD "12345678"
 #define MY_AP_HIDDEN false
 #define MY_AP_MAX_CON 4
 
-// Phantom-2 can ket noi de dong bo
-#define PEER_SSID "Phantom-2"
 #define PEER_PASSWORD "12345678"
-#define PEER_IP "192.168.5.1"
 #define PEER_TCP_PORT 8080
 #define PEER_HTTP_PORT 80
 
@@ -65,8 +82,7 @@
 
 #define AUDIO_WAV_PATH "/audio.wav"
 #define MAX_FILE_SIZE 50000000
-#define MY_AP_IP_STR "192.168.4.1"
-#define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: handleAutoSync() is not called
+#define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: no 60s auto sync; priority sync only
 
 // ── I2S MIC ───────────────────────────────────────────────────
 #define I2S_WS 25
@@ -82,15 +98,20 @@
 #define AUTO_RECORD_MS 30000UL
 
 // ── Human voice trigger tuning ────────────────────────────────
-#define MIC_ANALYZE_SHIFT 15
-#define MIC_TRIGGER_RMS_LEVEL 400
-#define MIC_REARM_RMS_LEVEL 200
-#define MIC_MIN_ZCR 3
-#define MIC_MAX_ZCR 90
-#define MIC_VOICE_FRAMES_TO_TRIGGER 4
-#define MIC_COOLDOWN_MS 2000UL
-#define MIC_LOG_INTERVAL_MS 500UL
-#define REC_LOG_INTERVAL_MS 1000UL
+// FIX nhẹ CPU: Trigger ghi âm CHỈ theo peak14.
+// Không tính rms15/zcr trong chế độ chờ vì không dùng để quyết định ghi.
+// Cần peak14 vượt ngưỡng đủ 8 frame liên tiếp mới bắt đầu ghi.
+
+// Nguong peak14 dung chung cho hai node de vai tro va logic giong nhau.
+// Neu moi truong qua on, tang len 4000-6000; neu kho bat tieng, ha xuong 1500-2500.
+#define MIC_TRIGGER_PEAK14_LEVEL 3000
+
+// Các define cũ giữ lại để tránh lỗi tham chiếu, nhưng KHÔNG dùng để trigger nữa.
+// Các define cũ đã bỏ khỏi logic trigger để tiết kiệm CPU.
+#define MIC_VOICE_FRAMES_TO_TRIGGER 8
+#define MIC_COOLDOWN_MS 1000UL
+#define MIC_LOG_INTERVAL_MS 1000UL // giảm log idle: 0.5s -> 3s
+#define REC_LOG_INTERVAL_MS 2000UL // giảm log khi đang ghi: 1s -> 5s
 
 // Keep legacy defines to avoid accidental references breaking build
 #define MIC_TRIGGER_LEVEL 5000
@@ -140,6 +161,12 @@ unsigned long lastAutoSyncMs = 0;
 unsigned long lastPrioritySyncAttemptMs = 0;
 uint8_t prioritySyncFailCount = 0;
 
+// Sync priority control:
+// Khi peer gọi POST /sync trong lúc đang ghi âm, thiết bị sẽ dừng bản ghi hiện tại,
+// finalize WAV -> mã hóa .bin, rồi chạy sync ngay sau khi recordingInProgress=false.
+bool stopRecordingForSyncRequested = false;
+bool peerSyncQueuedByRequest = false;
+
 // HTTP multipart upload state for /file/upload
 File httpUploadFile;
 String httpUploadFilename = "";
@@ -171,6 +198,14 @@ MicVoiceStats readMicVoiceStats();
 bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_MS);
 void handleAutoMicRecord();
 bool verifyPeerHasLocalFile(const String &localPath);
+bool verifyPeerHasAllLocalRecFiles();
+String encryptedPathFromWavPath(const String &wavPath);
+bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool deletePlainAfterEncrypt);
+bool isZeroByteRecFile(const String &path);
+void cleanupZeroByteRecFiles();
+void cleanupAllZeroByteFilesOnBoot();
+uint32_t cleanupZeroByteFilesRecursive(const char *dirPath, uint8_t depth);
+String normalizeRecPath(const String &path);
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -247,6 +282,8 @@ String mimeForExt(const String &ext)
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
   if (ext == ".xlsx")
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  if (ext == ".bin")
+    return "application/octet-stream";
   if (ext == ".bin")
     return "application/octet-stream";
   return "application/octet-stream";
@@ -332,6 +369,276 @@ size_t sdFileSize(const String &path = AUDIO_WAV_PATH)
   return sz;
 }
 
+String normalizeRecPath(const String &pathIn)
+{
+  String p = pathIn;
+  p.trim();
+  if (p.length() == 0)
+    return "";
+
+  // SD.open("/rec").openNextFile() trên một số bản core ESP32 có thể trả:
+  //   "rec2_xxx.wav", "/rec2_xxx.wav" hoặc "/rec/rec2_xxx.wav".
+  // Chuẩn hóa tất cả file ghi âm rec*.wav/rec*.bin về đúng thư mục /rec/.
+  String base = p;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0)
+    base = base.substring(slash + 1);
+
+  String lowBase = base;
+  lowBase.toLowerCase();
+  bool isRecAudio = (lowBase.startsWith("rec") &&
+                     (lowBase.endsWith(".wav") || lowBase.endsWith(".bin")));
+
+  if (isRecAudio)
+    return "/rec/" + base;
+
+  if (p.startsWith("/"))
+    return p;
+  return "/" + p;
+}
+
+#define MIN_VALID_ENC_REC_SIZE 34
+
+bool isRecWavPath(const String &pathIn)
+{
+  String p = normalizeRecPath(pathIn);
+  String base = p;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0)
+    base = base.substring(slash + 1);
+  base.toLowerCase();
+  return base.startsWith("rec") && base.endsWith(".wav");
+}
+
+bool isRecEncPath(const String &pathIn)
+{
+  String p = normalizeRecPath(pathIn);
+  String base = p;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0)
+    base = base.substring(slash + 1);
+  base.toLowerCase();
+  return base.startsWith("rec") && base.endsWith(".bin");
+}
+
+bool isValidEncSize(size_t sz)
+{
+  return sz > MIN_VALID_ENC_REC_SIZE;
+}
+
+size_t safeFileSize(const String &path)
+{
+  if (!sdReady || !SD.exists(path))
+    return 0;
+  File f = SD.open(path, "r");
+  if (!f)
+    return 0;
+  size_t sz = f.size();
+  f.close();
+  return sz;
+}
+
+void removeIfExists(const String &path)
+{
+  if (path.length() > 0 && SD.exists(path))
+    SD.remove(path);
+}
+
+// ── Boot cleanup: xóa tất cả file 0 byte trên SD ─────────────
+// Mục tiêu: nếu thiết bị bị mất nguồn/reset khi đang tạo file,
+// mọi file 0KB còn sót trên thẻ sẽ bị xóa ngay khi khởi động lại.
+uint32_t cleanupZeroByteFilesRecursive(const char *dirPath, uint8_t depth)
+{
+  if (!sdReady || !dirPath || depth > 8)
+    return 0;
+
+  File root = SD.open(dirPath);
+  if (!root || !root.isDirectory())
+  {
+    if (root)
+      root.close();
+    return 0;
+  }
+
+  uint32_t deletedCount = 0;
+  File f = root.openNextFile();
+  while (f)
+  {
+    String name = String(f.name());
+    bool isDir = f.isDirectory();
+    size_t sz = isDir ? 0 : f.size();
+
+    String path = name;
+    if (!path.startsWith("/"))
+    {
+      String parent = String(dirPath);
+      if (parent.endsWith("/"))
+        path = parent + name;
+      else
+        path = parent + "/" + name;
+    }
+
+    f.close();
+
+    if (isDir)
+    {
+      deletedCount += cleanupZeroByteFilesRecursive(path.c_str(), depth + 1);
+    }
+    else if (sz == 0)
+    {
+      if (SD.remove(path))
+      {
+        deletedCount++;
+        Serial.printf("[BOOT CLEANUP] Delete 0KB file: %s\n", path.c_str());
+      }
+      else
+      {
+        Serial.printf("[BOOT CLEANUP] Cannot delete 0KB file: %s\n", path.c_str());
+      }
+    }
+
+    f = root.openNextFile();
+    delay(1);
+  }
+
+  root.close();
+  return deletedCount;
+}
+
+void cleanupAllZeroByteFilesOnBoot()
+{
+  if (!sdReady)
+    return;
+
+  Serial.println("[BOOT CLEANUP] Scan SD for 0KB files...");
+  uint32_t deletedCount = cleanupZeroByteFilesRecursive("/", 0);
+  Serial.printf("[BOOT CLEANUP] Done. Deleted 0KB files: %lu\n", (unsigned long)deletedCount);
+}
+
+// ── Cleanup file ghi âm lỗi: xóa .wav/.bin rỗng để không kẹt sync ──
+
+// ── Cleanup file ghi âm lỗi và chuẩn hóa dữ liệu chính thức ──
+// Quy tắc thực tế:
+//   - .bin là file chính thức để lưu/sync.
+//   - .wav chỉ là file tạm trong lúc ghi/mã hóa.
+//   - .wav/.bin rỗng hoặc .bin quá nhỏ đều bị xóa.
+//   - .wav còn sót nhưng đã có .bin hợp lệ tương ứng thì xóa .wav.
+//   - file rec*.wav/rec*.bin nằm nhầm root / sẽ được chuyển về /rec/ nếu có thể.
+bool isZeroByteRecFile(const String &pathIn)
+{
+  if (!sdReady || pathIn.length() == 0)
+    return false;
+
+  String path = normalizeRecPath(pathIn);
+  if (!isRecWavPath(path) && !isRecEncPath(path))
+    return false;
+
+  return safeFileSize(path) == 0;
+}
+
+void cleanupZeroByteRecFiles()
+{
+  if (!sdReady)
+    return;
+
+  if (!SD.exists("/rec"))
+    SD.mkdir("/rec");
+
+  auto cleanOne = [](const String &rawIn, size_t sz)
+  {
+    String raw = rawIn;
+    if (!raw.startsWith("/"))
+      raw = "/" + raw;
+
+    String norm = normalizeRecPath(raw);
+    bool isWav = isRecWavPath(norm);
+    bool isEnc = isRecEncPath(norm);
+    if (!isWav && !isEnc)
+      return;
+
+    // Nếu file ghi âm đang nằm nhầm ở root, chuyển về /rec/ để mọi API thống nhất đường dẫn.
+    if (raw != norm && SD.exists(raw) && !SD.exists(norm) && sz > 0)
+    {
+      Serial.printf("[CLEANUP] Move misplaced rec file: %s -> %s\n", raw.c_str(), norm.c_str());
+      SD.rename(raw, norm);
+    }
+
+    size_t realSize = safeFileSize(norm);
+    if (realSize == 0 && SD.exists(raw))
+      realSize = safeFileSize(raw);
+
+    if (isWav && realSize == 0)
+    {
+      Serial.printf("[CLEANUP] Delete zero-byte WAV: %s\n", norm.c_str());
+      removeIfExists(norm);
+      if (raw != norm)
+        removeIfExists(raw);
+      return;
+    }
+
+    if (isEnc && !isValidEncSize(realSize))
+    {
+      Serial.printf("[CLEANUP] Delete invalid/zero BIN: %s size=%lu\n", norm.c_str(), (unsigned long)realSize);
+      removeIfExists(norm);
+      if (raw != norm)
+        removeIfExists(raw);
+      return;
+    }
+
+    // Nếu .wav còn sót nhưng đã có .bin hợp lệ cùng tên thì xóa .wav.
+    if (isWav && realSize > 0)
+    {
+      String encPath = norm;
+      int dot = encPath.lastIndexOf('.');
+      if (dot >= 0)
+        encPath = encPath.substring(0, dot);
+      encPath += ".bin";
+
+      size_t encSize = safeFileSize(encPath);
+      if (isValidEncSize(encSize))
+      {
+        Serial.printf("[CLEANUP] Delete leftover WAV because BIN exists: %s encSize=%lu\n",
+                      norm.c_str(), (unsigned long)encSize);
+        removeIfExists(norm);
+        if (raw != norm)
+          removeIfExists(raw);
+      }
+    }
+  };
+
+  auto scanDir = [&](const char *dirPath)
+  {
+    File root = SD.open(dirPath);
+    if (!root || !root.isDirectory())
+    {
+      if (root)
+        root.close();
+      return;
+    }
+
+    File f = root.openNextFile();
+    while (f)
+    {
+      String raw = String(f.name());
+      bool isDir = f.isDirectory();
+      size_t sz = isDir ? 0 : f.size();
+      f.close();
+
+      if (!isDir)
+        cleanOne(raw, sz);
+
+      f = root.openNextFile();
+      server.handleClient();
+      delay(1);
+    }
+
+    root.close();
+  };
+
+  scanDir("/");
+  scanDir("/rec");
+}
+
 bool sdSaveAs(const uint8_t *buf, size_t size, const String &path)
 {
   File f = SD.open(path, "w");
@@ -393,6 +700,154 @@ bool sdLoadToRam()
   return ramReady;
 }
 
+// ── AES-GCM file encryption ───────────────────────────────────
+// File format: "PHGCM1" + IV(12 bytes) + ciphertext + TAG(16 bytes)
+// IMPORTANT: Change this demo key before real deployment. UI decrypt must use the same 64-hex key.
+static const uint8_t AES_GCM_KEY[32] = {
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01};
+
+#define BIN_MAGIC "PHGCM1"
+#define BIN_MAGIC_LEN 6
+#define AES_GCM_IV_LEN 12
+#define AES_GCM_TAG_LEN 16
+#define AES_GCM_BUF_LEN 1024
+
+String encryptedPathFromWavPath(const String &wavPath)
+{
+  String encPath = wavPath;
+  int dot = encPath.lastIndexOf('.');
+  if (dot >= 0)
+    encPath = encPath.substring(0, dot);
+  encPath += ".bin";
+  return encPath;
+}
+
+bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool deletePlainAfterEncrypt = true)
+{
+  if (!sdReady || !SD.exists(plainPath))
+  {
+    Serial.println("[AES-GCM] Plain file not found: " + plainPath);
+    return false;
+  }
+
+  File in = SD.open(plainPath, "r");
+  if (!in)
+  {
+    Serial.println("[AES-GCM] Cannot open plain file: " + plainPath);
+    return false;
+  }
+
+  if (SD.exists(encPath))
+    SD.remove(encPath);
+
+  File out = SD.open(encPath, FILE_WRITE);
+  if (!out)
+  {
+    in.close();
+    Serial.println("[AES-GCM] Cannot create encrypted file: " + encPath);
+    return false;
+  }
+
+  uint8_t iv[AES_GCM_IV_LEN];
+  esp_fill_random(iv, AES_GCM_IV_LEN);
+
+  out.write((const uint8_t *)BIN_MAGIC, BIN_MAGIC_LEN);
+  out.write(iv, AES_GCM_IV_LEN);
+
+  mbedtls_gcm_context ctx;
+  mbedtls_gcm_init(&ctx);
+
+  int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, AES_GCM_KEY, 256);
+  if (ret == 0)
+    ret = mbedtls_gcm_starts(&ctx, MBEDTLS_GCM_ENCRYPT, iv, AES_GCM_IV_LEN, NULL, 0);
+
+  uint8_t inBuf[AES_GCM_BUF_LEN];
+  uint8_t outBuf[AES_GCM_BUF_LEN];
+  size_t totalIn = 0;
+
+  while (ret == 0 && in.available())
+  {
+    size_t rd = in.read(inBuf, AES_GCM_BUF_LEN);
+    if (rd == 0)
+      break;
+
+    ret = mbedtls_gcm_update(&ctx, rd, inBuf, outBuf);
+    if (ret != 0)
+      break;
+
+    size_t wr = out.write(outBuf, rd);
+    if (wr != rd)
+    {
+      ret = -1;
+      break;
+    }
+    totalIn += rd;
+    server.handleClient();
+    delay(1);
+  }
+
+  uint8_t tag[AES_GCM_TAG_LEN];
+  if (ret == 0)
+    ret = mbedtls_gcm_finish(&ctx, tag, AES_GCM_TAG_LEN);
+
+  if (ret == 0)
+  {
+    size_t wr = out.write(tag, AES_GCM_TAG_LEN);
+    if (wr != AES_GCM_TAG_LEN)
+      ret = -1;
+  }
+
+  mbedtls_gcm_free(&ctx);
+  in.close();
+  out.close();
+
+  if (ret != 0 || totalIn == 0)
+  {
+    SD.remove(encPath);
+    Serial.printf("[AES-GCM] Encrypt FAILED ret=%d plain=%s enc=%s\n", ret, plainPath.c_str(), encPath.c_str());
+    return false;
+  }
+
+  // Verify file .bin sau khi ghi xong.
+  // Format toi thieu = magic 6 + IV 12 + TAG 16 = 34 bytes.
+  // Neu <= 34 thi coi nhu file ma hoa hong/rong, xoa luon va khong sync.
+  size_t encSize = 0;
+  if (SD.exists(encPath))
+  {
+    File chk = SD.open(encPath, "r");
+    if (chk)
+    {
+      encSize = chk.size();
+      chk.close();
+    }
+  }
+
+  if (encSize <= (BIN_MAGIC_LEN + AES_GCM_IV_LEN + AES_GCM_TAG_LEN))
+  {
+    SD.remove(encPath);
+    Serial.printf("[AES-GCM] Encrypt output invalid/empty -> delete: %s size=%lu\n",
+                  encPath.c_str(), (unsigned long)encSize);
+    return false;
+  }
+
+  // Ma hoa OK thi chi giu .bin, xoa .wav goc.
+  if (deletePlainAfterEncrypt && SD.exists(plainPath))
+  {
+    bool rmOk = SD.remove(plainPath);
+    Serial.printf("[AES-GCM] Delete plain WAV after encrypt: %s -> %s\n",
+                  plainPath.c_str(), rmOk ? "OK" : "FAIL");
+  }
+
+  Serial.printf("[AES-GCM] Encrypt OK: %s -> %s encSize=%lu plaintext=%lu\n",
+                plainPath.c_str(), encPath.c_str(),
+                (unsigned long)encSize,
+                (unsigned long)totalIn);
+  return true;
+}
+
 // ── I2S Mic Functions ─────────────────────────────────────────
 void setupI2SMic()
 {
@@ -425,33 +880,57 @@ void setupI2SMic()
 
 String genMicFilename()
 {
-  struct tm timeinfo;
+  if (!SD.exists("/rec"))
+    SD.mkdir("/rec");
 
+  struct tm timeinfo;
+  char buf[80];
+
+  // Co gio NTP: /rec/rec1_YYYYMMDD_HHMMSS.wav hoac /rec/rec2_YYYYMMDD_HHMMSS.wav
   if (getLocalTime(&timeinfo))
   {
-    char buf[64];
-    strftime(buf, sizeof(buf), "/rec/rec_%Y%m%d_%H%M%S.wav", &timeinfo);
-    return String(buf);
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%Y%m%d_%H%M%S", &timeinfo);
+
+    uint16_t extra = 0;
+    while (true)
+    {
+      if (extra == 0)
+        snprintf(buf, sizeof(buf), "/rec/rec%d_%s.wav", NODE_ID, timeBuf);
+      else
+        snprintf(buf, sizeof(buf), "/rec/rec%d_%s_%02u.wav", NODE_ID, timeBuf, extra);
+
+      if (!SD.exists(buf))
+        return String(buf);
+
+      extra++;
+      if (extra > 99)
+        break;
+    }
   }
 
-  micFileCounter++;
-  char buf[64];
-  snprintf(buf, sizeof(buf), "/rec/rec_no_time_%06lu.wav", (unsigned long)micFileCounter);
-  return String(buf);
+  // Chua co gio NTP: /rec/rec1_no_time_000001.wav hoac /rec/rec2_no_time_000001.wav
+  while (true)
+  {
+    micFileCounter++;
+    snprintf(buf, sizeof(buf), "/rec/rec%d_no_time_%06lu.wav",
+             NODE_ID,
+             (unsigned long)micFileCounter);
+
+    if (!SD.exists(buf))
+      return String(buf);
+  }
 }
 
 struct MicVoiceStats
 {
-  int peak13;
-  int peak15;
-  int rms15;
-  int zcr;
+  int peak14;
   bool voiceLike;
 };
 
 MicVoiceStats readMicVoiceStats()
 {
-  MicVoiceStats st = {0, 0, 0, 0, false};
+  MicVoiceStats st = {0, false};
 
   if (!micReady || recordingInProgress)
     return st;
@@ -469,61 +948,29 @@ MicVoiceStats readMicVoiceStats()
   if (sampleCount <= 0)
     return st;
 
+  // Tinh DC offset de loai bo lech nen cua mic I2S.
   int64_t sum = 0;
   for (int i = 0; i < sampleCount; i++)
     sum += samples32[i];
   int32_t dc = (int32_t)(sum / sampleCount);
 
-  int64_t sumSq15 = 0;
-  int prevSign = 0;
-  int zcr = 0;
-
+  // Chỉ tính peak14: bỏ rms15/zcr/peak15 để giảm CPU trong chế độ chờ.
   for (int i = 0; i < sampleCount; i++)
   {
     int32_t centered = samples32[i] - dc;
 
-    int32_t s13 = centered >> 13;
-    if (s13 > 32767)
-      s13 = 32767;
-    if (s13 < -32768)
-      s13 = -32768;
-    int a13 = abs((int)s13);
-    if (a13 > st.peak13)
-      st.peak13 = a13;
+    int32_t s14 = centered >> 14;
+    if (s14 > 32767)
+      s14 = 32767;
+    if (s14 < -32768)
+      s14 = -32768;
 
-    int32_t s15 = centered >> MIC_ANALYZE_SHIFT;
-    if (s15 > 32767)
-      s15 = 32767;
-    if (s15 < -32768)
-      s15 = -32768;
-
-    int a15 = abs((int)s15);
-    if (a15 > st.peak15)
-      st.peak15 = a15;
-
-    sumSq15 += (int64_t)s15 * (int64_t)s15;
-
-    int sign = 0;
-    if (s15 > 100)
-      sign = 1;
-    else if (s15 < -100)
-      sign = -1;
-
-    if (sign != 0)
-    {
-      if (prevSign != 0 && sign != prevSign)
-        zcr++;
-      prevSign = sign;
-    }
+    int a14 = abs((int)s14);
+    if (a14 > st.peak14)
+      st.peak14 = a14;
   }
 
-  st.rms15 = (int)sqrt((float)sumSq15 / (float)sampleCount);
-  st.zcr = zcr;
-
-  st.voiceLike = (st.rms15 >= MIC_TRIGGER_RMS_LEVEL &&
-                  st.zcr >= MIC_MIN_ZCR &&
-                  st.zcr <= MIC_MAX_ZCR);
-
+  st.voiceLike = (st.peak14 >= MIC_TRIGGER_PEAK14_LEVEL);
   return st;
 }
 
@@ -561,7 +1008,6 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
   uint32_t maxSamplesAllowed = ((MAX_FILE_SIZE - 44UL) / 2UL);
 
   int recPeak14 = 0;
-  int recPeak15 = 0;
   unsigned long lastRecLogMs = millis();
   lastRecordLoudMs = millis();
 
@@ -573,6 +1019,13 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
     server.handleClient();
     if (!nodeEnabled)
       break;
+
+    if (stopRecordingForSyncRequested)
+    {
+      Serial.println("[MIC] Stop requested by peer sync -> finalize current recording");
+      stopRecordingForSyncRequested = false;
+      break;
+    }
 
     if (millis() - lastRecordLoudMs >= durationMs)
     {
@@ -595,12 +1048,22 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
     int32_t *samples32 = (int32_t *)i2sData;
     int sampleCount = bytesRead / 4;
 
-    int64_t frameSumSq15 = 0;
-    int framePeak15 = 0;
+    int framePeak14 = 0;
 
+    // FIX MIC: tinh DC offset tung frame giong Phantom-2 de loai bo lech nen I2S.
+    // Neu khong tru DC, mic co the bi peak/rms cao gia du moi truong yen tinh.
+    int64_t dcSum = 0;
+    for (int k = 0; k < sampleCount; k++)
+    {
+      dcSum += samples32[k];
+    }
+    int32_t dc = (sampleCount > 0) ? (int32_t)(dcSum / sampleCount) : 0;
+
+    // 32-bit I2S -> remove DC -> shift >> 14 -> int16 WAV.
+    // Trong khi ghi, neu frame van co RMS on dinh thi reset bo dem im lang.
     for (int i = 0; i < sampleCount && samplesRecorded < maxSamplesAllowed; i++)
     {
-      int32_t raw = samples32[i];
+      int32_t raw = samples32[i] - dc;
 
       int32_t s14 = raw >> 14;
       if (s14 > 32767)
@@ -608,21 +1071,11 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
       if (s14 < -32768)
         s14 = -32768;
 
-      int32_t s15 = raw >> 15;
-      if (s15 > 32767)
-        s15 = 32767;
-      if (s15 < -32768)
-        s15 = -32768;
-
       int a14 = abs((int)s14);
-      int a15 = abs((int)s15);
       if (a14 > recPeak14)
         recPeak14 = a14;
-      if (a15 > recPeak15)
-        recPeak15 = a15;
-      if (a15 > framePeak15)
-        framePeak15 = a15;
-      frameSumSq15 += (int64_t)s15 * (int64_t)s15;
+      if (a14 > framePeak14)
+        framePeak14 = a14;
 
       int16_t s16 = (int16_t)s14;
       audioFile.write((uint8_t *)&s16, sizeof(s16));
@@ -631,20 +1084,19 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
       samplesRecorded++;
     }
 
-    int frameRms15 = (sampleCount > 0) ? (int)sqrt((float)frameSumSq15 / (float)sampleCount) : 0;
-    if (frameRms15 >= MIC_TRIGGER_RMS_LEVEL || framePeak15 >= (MIC_TRIGGER_RMS_LEVEL * 2))
+    // Reset bộ đếm im lặng CHỈ theo peak14, cùng logic với trigger.
+    if (recPeak14 >= MIC_TRIGGER_PEAK14_LEVEL || framePeak14 >= MIC_TRIGGER_PEAK14_LEVEL)
     {
       lastRecordLoudMs = millis();
     }
 
     if (millis() - lastRecLogMs >= REC_LOG_INTERVAL_MS)
     {
-      Serial.printf("[MIC] REC LOG peak14=%d peak15=%d rms15=%d silence_ms=%lu samples=%lu\n",
-                    recPeak14, recPeak15, frameRms15,
+      Serial.printf("[MIC] REC LOG peak14=%d threshold=%d silence_ms=%lu samples=%lu\n",
+                    recPeak14, MIC_TRIGGER_PEAK14_LEVEL,
                     (unsigned long)(millis() - lastRecordLoudMs),
                     (unsigned long)samplesRecorded);
       recPeak14 = 0;
-      recPeak15 = 0;
       lastRecLogMs = millis();
     }
   }
@@ -684,10 +1136,13 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
 
 void handleAutoMicRecord()
 {
-  if (!micReady || !sdReady || recordingInProgress || !micArmed)
+  if (!micReady || !sdReady || recordingInProgress || !micArmed || peerSyncQueuedByRequest)
     return;
 
-  if (syncPending || syncInProgress || peerSyncRequestInProgress)
+  // Chi khoa mic khi dang thuc su sync/request sync.
+  // Khong dung syncPending de khoa vinh vien, vi neu peer offline 3 lan
+  // thi file .bin van duoc giu tren SD va mic phai duoc mo lai de ghi tiep.
+  if (syncInProgress || peerSyncRequestInProgress)
     return;
 
   if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS)
@@ -700,8 +1155,8 @@ void handleAutoMicRecord()
 
   if (millis() - lastLogMs >= MIC_LOG_INTERVAL_MS)
   {
-    Serial.printf("[MIC] peak13=%d peak15=%d rms15=%d zcr=%d voice=%s frames=%d/%d\n",
-                  st.peak13, st.peak15, st.rms15, st.zcr,
+    Serial.printf("[MIC] peak14=%d threshold=%d voice=%s frames=%d/%d\n",
+                  st.peak14, MIC_TRIGGER_PEAK14_LEVEL,
                   st.voiceLike ? "yes" : "no",
                   voiceFrames, MIC_VOICE_FRAMES_TO_TRIGGER);
     lastLogMs = millis();
@@ -714,21 +1169,31 @@ void handleAutoMicRecord()
 
   if (voiceFrames >= MIC_VOICE_FRAMES_TO_TRIGGER)
   {
-    String path = genMicFilename();
-    lastMicWavFile = path;
+    String wavPath = genMicFilename();
+    String encPath = encryptedPathFromWavPath(wavPath);
+    lastMicWavFile = encPath;
     lastMicTriggerMs = millis();
     micArmed = false;
     voiceFrames = 0;
 
-    Serial.printf("[FLOW] Human-like voice trigger peak13=%d peak15=%d rms15=%d zcr=%d\n",
-                  st.peak13, st.peak15, st.rms15, st.zcr);
+    Serial.printf("[FLOW] Peak14 trigger peak14=%d threshold=%d\n",
+                  st.peak14, MIC_TRIGGER_PEAK14_LEVEL);
 
-    bool ok = recordTriggeredWavToSD(path.c_str(), AUTO_RECORD_MS);
+    bool ok = recordTriggeredWavToSD(wavPath.c_str(), AUTO_RECORD_MS);
 
     if (ok)
     {
-      Serial.println("[FLOW] Record done -> priority peer sync");
-      markLocalFileChanged("mic record " + path);
+      Serial.println("[FLOW] Record done -> AES-GCM encrypt");
+      bool encOk = aesGcmEncryptFile(wavPath, encPath, true);
+      if (encOk)
+      {
+        Serial.println("[FLOW] Encrypt done -> priority peer sync");
+        markLocalFileChanged("mic encrypted record " + encPath);
+      }
+      else
+      {
+        Serial.println("[FLOW] Encrypt failed -> skip sync");
+      }
     }
     else
     {
@@ -737,12 +1202,78 @@ void handleAutoMicRecord()
   }
 }
 
+long extractFileSizeFromListJson(const String &listJson, const String &base)
+{
+  String name1 = "rec/" + base;
+  String name2 = base;
+
+  int pos = 0;
+  while (true)
+  {
+    int ni = listJson.indexOf("\"name\":\"", pos);
+    if (ni < 0)
+      break;
+
+    ni += 8;
+    int ne = listJson.indexOf("\"", ni);
+    if (ne < 0)
+      break;
+
+    String n = listJson.substring(ni, ne);
+
+    if (n == name1 || n == name2)
+    {
+      int si = listJson.indexOf("\"size\":", ne);
+      if (si < 0)
+        return -1;
+
+      si += 7;
+      while (si < (int)listJson.length() && listJson[si] == ' ')
+        si++;
+
+      String numStr = "";
+      while (si < (int)listJson.length() && isDigit(listJson[si]))
+      {
+        numStr += listJson[si];
+        si++;
+      }
+
+      if (numStr.length() == 0)
+        return -1;
+
+      return numStr.toInt();
+    }
+
+    pos = ne + 1;
+  }
+
+  return -1;
+}
+
 bool verifyPeerHasLocalFile(const String &localPath)
 {
   if (!sdReady || localPath.length() == 0)
     return false;
 
-  String base = localPath;
+  cleanupZeroByteRecFiles();
+
+  String cleanPath = normalizeRecPath(localPath);
+  if (!isRecEncPath(cleanPath))
+  {
+    Serial.printf("[PrioritySync] Ignore non-BIN local file in single verify: %s\n", cleanPath.c_str());
+    return true;
+  }
+
+  size_t localSize = safeFileSize(cleanPath);
+  if (!isValidEncSize(localSize))
+  {
+    Serial.printf("[PrioritySync] Delete invalid local BIN before single verify: %s size=%lu\n",
+                  cleanPath.c_str(), (unsigned long)localSize);
+    removeIfExists(cleanPath);
+    return true;
+  }
+
+  String base = cleanPath;
   int slash = base.lastIndexOf('/');
   if (slash >= 0)
     base = base.substring(slash + 1);
@@ -750,40 +1281,122 @@ bool verifyPeerHasLocalFile(const String &localPath)
     return false;
 
   String displayRec = "rec/" + base;
-  size_t localSize = 0;
-  if (SD.exists(localPath))
-  {
-    File f = SD.open(localPath, "r");
-    if (f)
-    {
-      localSize = f.size();
-      f.close();
-    }
-  }
 
   String listJson = httpGetFromPeer("/file/list", 5000);
   if (listJson.length() == 0)
   {
-    Serial.println("[PrioritySync] Verify: Phantom-2 /file/list empty");
+    Serial.println("[PrioritySync] Verify: peer /file/list empty");
     return false;
   }
 
-  bool hasName = (listJson.indexOf("\"name\":\"" + displayRec + "\"") >= 0) ||
-                 (listJson.indexOf("\"name\":\"" + base + "\"") >= 0) ||
-                 (listJson.indexOf(displayRec) >= 0) ||
-                 (listJson.indexOf(base) >= 0);
+  long remoteSize = extractFileSizeFromListJson(listJson, base);
+  bool hasName = (remoteSize >= 0);
+  bool sizeOk = (isValidEncSize(localSize) && remoteSize == (long)localSize);
 
-  bool sizeOk = true;
-  if (localSize > 0)
-    sizeOk = (listJson.indexOf("\"size\":" + String((uint32_t)localSize)) >= 0);
-
-  Serial.printf("[PrioritySync] Verify Phantom-2 has '%s': name=%s size=%s localSize=%lu\n",
+  Serial.printf("[PrioritySync] Verify peer has BIN '%s': name=%s size=%s localSize=%lu remoteSize=%ld\n",
                 displayRec.c_str(),
                 hasName ? "yes" : "no",
                 sizeOk ? "yes" : "no",
-                (unsigned long)localSize);
+                (unsigned long)localSize,
+                remoteSize);
 
   return hasName && sizeOk;
+}
+
+bool verifyPeerHasAllLocalRecFiles()
+{
+  if (!sdReady)
+    return false;
+
+  cleanupZeroByteRecFiles();
+
+  String listJson = httpGetFromPeer("/file/list", 5000);
+  if (listJson.length() == 0 || listJson.indexOf("\"name\"") < 0)
+  {
+    Serial.println("[PrioritySync] Verify all BIN: peer /file/list empty");
+    return false;
+  }
+
+  if (!SD.exists("/rec"))
+  {
+    Serial.println("[PrioritySync] Verify all BIN: local /rec missing");
+    return true;
+  }
+
+  File root = SD.open("/rec");
+  if (!root || !root.isDirectory())
+  {
+    Serial.println("[PrioritySync] Verify all BIN: local /rec is not a directory");
+    if (root)
+      root.close();
+    return true;
+  }
+
+  int totalEnc = 0;
+  int okCount = 0;
+  int skipped = 0;
+
+  File f = root.openNextFile();
+  while (f)
+  {
+    if (!f.isDirectory())
+    {
+      String fullPath = normalizeRecPath(String(f.name()));
+      size_t localSize = f.size();
+
+      if (!isRecEncPath(fullPath))
+      {
+        skipped++;
+        f.close();
+        f = root.openNextFile();
+        continue;
+      }
+
+      if (!isValidEncSize(localSize))
+      {
+        f.close();
+        Serial.printf("[PrioritySync] Delete invalid BIN before verify-all: %s size=%lu\n",
+                      fullPath.c_str(), (unsigned long)localSize);
+        removeIfExists(fullPath);
+        f = root.openNextFile();
+        continue;
+      }
+
+      String base = fullPath;
+      int slash = base.lastIndexOf('/');
+      if (slash >= 0)
+        base = base.substring(slash + 1);
+
+      long remoteSize = extractFileSizeFromListJson(listJson, base);
+      bool ok = (remoteSize >= 0 && remoteSize == (long)localSize);
+
+      Serial.printf("[PrioritySync] Verify all BIN peer '%s': local=%lu remote=%ld -> %s\n",
+                    base.c_str(),
+                    (unsigned long)localSize,
+                    remoteSize,
+                    ok ? "OK" : "MISS/SIZE_DIFF");
+
+      totalEnc++;
+      if (ok)
+        okCount++;
+      else
+      {
+        f.close();
+        root.close();
+        return false;
+      }
+    }
+
+    f.close();
+    f = root.openNextFile();
+    server.handleClient();
+    delay(1);
+  }
+
+  root.close();
+
+  Serial.printf("[PrioritySync] Verify all BIN peer done: %d/%d OK, skipped=%d\n", okCount, totalEnc, skipped);
+  return totalEnc == 0 || okCount == totalEnc;
 }
 
 // ── JSON WAV info ─────────────────────────────────────────────
@@ -886,8 +1499,9 @@ void restoreMyAP()
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
-  IPAddress apIP(192, 168, 4, 1);
-  IPAddress gw(192, 168, 4, 1);
+  IPAddress apIP;
+  apIP.fromString(MY_AP_IP_STR);
+  IPAddress gw = apIP;
   IPAddress sn(255, 255, 255, 0);
 
   WiFi.softAPConfig(apIP, gw, sn);
@@ -897,7 +1511,7 @@ void restoreMyAP()
   audioServer.begin();
   uploadServer.begin();
 
-  Serial.printf("[WiFi] Phantom-1 AP restored max_clients=%d clients=%d\n",
+  Serial.printf("[WiFi] %s AP restored max_clients=%d clients=%d\n", MY_AP_SSID,
                 MY_AP_MAX_CON, WiFi.softAPgetStationNum());
 }
 
@@ -1035,6 +1649,13 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist = null
 {
   String path = "/file/download?name=" + filename;
 
+  // Chỉ tải file .bin hợp lệ; .wav không phải dữ liệu sync chính thức.
+  if (!isRecEncPath(filename))
+  {
+    Serial.printf("[Sync] Refuse download non-BIN file: %s\n", filename.c_str());
+    return false;
+  }
+
   WiFiClient _own;
   WiFiClient *c = persist ? persist : &_own;
 
@@ -1105,7 +1726,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist = null
     return false;
   }
 
-  String sdPath = "/" + filename;
+  String sdPath = normalizeRecPath(filename);
   if (SD.exists(sdPath))
     SD.remove(sdPath);
 
@@ -1223,7 +1844,7 @@ bool isPeerBusy()
   return false;
 }
 
-// ── Dong bo tat ca file tu Phantom-2 ve Phantom-1 ─────────────
+// ── Dong bo tat ca file tu peer ve node nay ─────────────
 bool syncFromPeer()
 {
   if (syncInProgress)
@@ -1234,8 +1855,8 @@ bool syncFromPeer()
   }
 
   syncInProgress = true;
-  Serial.println("\n[Sync] == Bat dau ket noi Phantom-2 ==");
-  syncMsg = "connecting Phantom-2";
+  Serial.println("\n[Sync] == Bat dau ket noi peer ==");
+  syncMsg = "connecting peer";
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
@@ -1260,15 +1881,15 @@ bool syncFromPeer()
 
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("\n[Sync] FAILED: Phantom-2 not found");
-    syncMsg = "failed: Phantom-2 not found";
+    Serial.println("\n[Sync] FAILED: peer not found");
+    syncMsg = "failed: peer not found";
     WiFi.disconnect(false);
     restoreMyAP();
     syncInProgress = false;
     return false;
   }
 
-  Serial.printf("\n[Sync] Connected Phantom-2. STA IP: %s\n",
+  Serial.printf("\n[Sync] Connected peer. STA IP: %s\n",
                 WiFi.localIP().toString().c_str());
   delay(100);
 
@@ -1313,10 +1934,10 @@ bool syncFromPeer()
 
   if (listJson.indexOf("\"count\":0") >= 0 || listJson.indexOf("\"files\":[]") >= 0 || peerCount == 0)
   {
-    Serial.println("[Sync] Phantom-2 has no file");
+    Serial.println("[Sync] peer has no file");
     WiFi.disconnect(false);
     restoreMyAP();
-    syncMsg = "ok: Phantom-2 empty";
+    syncMsg = "ok: peer empty";
     syncInProgress = false;
     return false;
   }
@@ -1357,8 +1978,26 @@ bool syncFromPeer()
 
   for (auto &fname : remoteFiles)
   {
-    String path = "/" + fname;
+    String path = normalizeRecPath(fname);
     int32_t remoteSize = getRemoteFileSize(listJson, fname);
+
+    String fnameLow = fname;
+    fnameLow.toLowerCase();
+
+    // Chỉ đồng bộ file ghi âm chính thức đã mã hóa. .wav là file tạm, không sync.
+    if (!isRecEncPath(fname))
+    {
+      Serial.printf("[Sync] Skip non-BIN file from peer: %s\n", fname.c_str());
+      skipped++;
+      continue;
+    }
+
+    if (remoteSize <= MIN_VALID_ENC_REC_SIZE)
+    {
+      Serial.printf("[Sync] Skip remote invalid/missing BIN: %s size=%d\n", fname.c_str(), (int)remoteSize);
+      skipped++;
+      continue;
+    }
 
     if (SD.exists(path))
     {
@@ -1367,7 +2006,7 @@ bool syncFromPeer()
       if (f)
         f.close();
 
-      if (remoteSize > 0 && (int32_t)localSize == remoteSize)
+      if (remoteSize > MIN_VALID_ENC_REC_SIZE && (int32_t)localSize == remoteSize)
       {
         Serial.printf("[Sync] Skip '%s' - already exists (%d bytes)\n",
                       fname.c_str(), (int)localSize);
@@ -1453,7 +2092,7 @@ bool syncFromPeer()
     }
   }
 
-  syncMsg = "ok: synced " + String(downloaded) + "/" + String(remoteFiles.size()) + " files from Phantom-2";
+  syncMsg = "ok: synced " + String(downloaded) + "/" + String(remoteFiles.size()) + " files from peer";
   syncInProgress = false;
   return (downloaded > 0);
 }
@@ -1466,7 +2105,7 @@ void handleStatus()
   int _br = readBatteryRaw();
 
   server.send(200, "application/json",
-              String("{\"node\":1") +
+              String("{\"node\":") + String(NODE_ID) +
                   ",\"ap_ssid\":\"" + MY_AP_SSID + "\"" +
                   ",\"ap_ip\":\"" + MY_AP_IP_STR + "\"" +
                   ",\"ap_clients\":" + String(WiFi.softAPgetStationNum()) +
@@ -2057,35 +2696,53 @@ void handleRamInfo()
 
 void handleSync()
 {
-  if (recordingInProgress || syncInProgress)
+  if (syncInProgress)
   {
     server.send(423, "application/json",
-                "{\"status\":\"busy\",\"message\":\"Phantom-1 is recording or syncing\"}");
+                "{\"status\":\"busy\",\"message\":\"local node is already syncing\"}");
+    return;
+  }
+
+  // Sync được ưu tiên hơn ghi âm.
+  // Nếu đang ghi, yêu cầu dừng bản ghi hiện tại, finalize WAV -> encrypt .bin,
+  // rồi queue sync chạy ngay trong loop sau khi recordingInProgress=false.
+  if (recordingInProgress)
+  {
+    stopRecordingForSyncRequested = true;
+    peerSyncQueuedByRequest = true;
+    micArmed = false;
+    syncMsg = "peer sync requested: stopping recording first";
+    server.send(200, "application/json",
+                "{\"status\":\"ok\",\"message\":\"local node stopping recording, sync queued\"}");
+    Serial.println("[Sync] Peer requested sync -> stop recording then sync");
     return;
   }
 
   server.send(200, "application/json",
-              "{\"status\":\"ok\",\"message\":\"Sync Phantom-2 starting\"}");
+              "{\"status\":\"ok\",\"message\":\"peer sync starting\"}");
   syncDone = syncFromPeer();
   syncFailed = !syncDone;
 }
 
 void handleBusy()
 {
-  bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress;
-  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : "idle"));
-  String j = "{\"node\":1";
+  // syncPending cũng được báo là busy để peer biết chưa được mở mic: còn file local cần kéo ngược lại.
+  bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress || peerSyncQueuedByRequest || syncPending;
+  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : (peerSyncQueuedByRequest ? "peer_sync_queued" : (syncPending ? "sync_pending" : "idle"))));
+  String j = "{\"node\":" + String(NODE_ID);
   j += ",\"busy\":" + String(busy ? "true" : "false");
   j += ",\"recording\":" + String(recordingInProgress ? "true" : "false");
   j += ",\"sync_in_progress\":" + String(syncInProgress ? "true" : "false");
   j += ",\"peer_sync_request_in_progress\":" + String(peerSyncRequestInProgress ? "true" : "false");
+  j += ",\"peer_sync_queued\":" + String(peerSyncQueuedByRequest ? "true" : "false");
+  j += ",\"sync_pending\":" + String(syncPending ? "true" : "false");
   j += ",\"reason\":\"" + reason + "\"";
   j += ",\"sync_msg\":\"" + syncMsg + "\"";
   j += ",\"last_mic_file\":\"" + lastMicWavFile + "\"}";
   server.send(busy ? 423 : 200, "application/json", j);
 }
 
-// ── Priority sync: khi SD co file local moi/cap nhat thi bao Phantom-2 keo ve ──
+// ── Priority sync: khi SD co file local moi/cap nhat thi bao peer keo ve ──
 void markLocalFileChanged(const String &reason)
 {
   if (!sdReady)
@@ -2108,9 +2765,9 @@ bool requestPeerPullSync()
     return false;
 
   peerSyncRequestInProgress = true;
-  syncMsg = "priority: ask Phantom-2 to pull files";
+  syncMsg = "priority: ask peer to pull files";
 
-  Serial.println("[PrioritySync] Connect Phantom-2 and POST /sync");
+  Serial.println("[PrioritySync] Connect peer and POST /sync");
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
@@ -2134,8 +2791,8 @@ bool requestPeerPullSync()
 
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("\n[PrioritySync] Phantom-2 not found");
-    syncMsg = "pending: Phantom-2 not found";
+    Serial.println("\n[PrioritySync] peer not found");
+    syncMsg = "pending: peer not found";
     WiFi.disconnect(false);
     restoreMyAP();
     peerSyncRequestInProgress = false;
@@ -2144,12 +2801,14 @@ bool requestPeerPullSync()
 
   // Neu peer dang ban thi giu pending va thu lai sau
   String busyBody = httpGetFromPeer("/busy", 3000);
-  if (busyBody.indexOf("\"busy\":true") >= 0 ||
-      busyBody.indexOf("\"recording\":true") >= 0 ||
-      busyBody.indexOf("\"sync_in_progress\":true") >= 0)
+  // Sync có quyền ưu tiên hơn ghi âm của peer.
+  // Vì vậy KHÔNG coi "recording":true là busy; cứ POST /sync để peer dừng ghi và queue sync.
+  // Chỉ né khi peer đang sync thật sự hoặc đang xử lý peer-sync khác.
+  if (busyBody.indexOf("\"sync_in_progress\":true") >= 0 ||
+      busyBody.indexOf("\"peer_sync_request_in_progress\":true") >= 0)
   {
-    Serial.println("[PrioritySync] Phantom-2 busy -> retry later");
-    syncMsg = "pending: Phantom-2 busy";
+    Serial.println("[PrioritySync] peer syncing -> retry later");
+    syncMsg = "pending: peer syncing";
     WiFi.disconnect(false);
     restoreMyAP();
     peerSyncRequestInProgress = false;
@@ -2166,7 +2825,7 @@ bool requestPeerPullSync()
     String resp = "";
     while ((c.connected() || c.available()) && (millis() - t) < 15000)
     {
-      server.handleClient(); // cho Phantom-2 co the keo /file/list va /file/download tu node nay
+      server.handleClient(); // cho peer co the keo /file/list va /file/download tu node nay
       if (c.available())
       {
         char ch = (char)c.read();
@@ -2189,36 +2848,40 @@ bool requestPeerPullSync()
   if (!ok)
   {
     Serial.println("[PrioritySync] POST /sync failed or timeout");
-    syncMsg = "pending: trigger Phantom-2 sync failed";
+    syncMsg = "pending: trigger peer sync failed";
     WiFi.disconnect(false);
     restoreMyAP();
     peerSyncRequestInProgress = false;
     return false;
   }
 
-  // Doi Phantom-2 sync xong va VERIFY file da co tren Phantom-2.
-  // Khong duoc chi dua vao /busy, vi peer co the idle neu da skip sync.
+  // Doi peer kéo xong file của mình, sau đó nếu peer cũng có file dở
+  // thì cho peer gọi ngược /sync để node nay kéo file đó về.
+  // Chỉ mở mic khi: toàn bộ file /rec của node nay đã nằm trên peer VÀ peer hết sync_pending.
   ok = false;
   bool verified = false;
   unsigned long waitStart = millis();
   while (millis() - waitStart < 90000UL)
   {
-    server.handleClient(); // cho Phantom-2 keo /file/list va /file/download tu node nay
+    server.handleClient(); // cho peer kéo file và/hoặc gọi ngược POST /sync
 
     String b = httpGetFromPeer("/busy", 2500);
-    bool peerIdle = (b.length() > 0 &&
-                     b.indexOf("\"busy\":true") < 0 &&
-                     b.indexOf("\"sync_in_progress\":true") < 0);
+    bool peerStable = (b.length() > 0 &&
+                       b.indexOf("\"recording\":true") < 0 &&
+                       b.indexOf("\"sync_in_progress\":true") < 0 &&
+                       b.indexOf("\"peer_sync_request_in_progress\":true") < 0 &&
+                       b.indexOf("\"peer_sync_queued\":true") < 0 &&
+                       b.indexOf("\"sync_pending\":true") < 0);
 
-    if (peerIdle)
+    if (!verified && b.length() > 0 && b.indexOf("\"sync_in_progress\":true") < 0)
+      verified = verifyPeerHasAllLocalRecFiles();
+
+    if (verified && peerStable)
     {
-      verified = verifyPeerHasLocalFile(lastMicWavFile);
-      if (verified)
-      {
-        ok = true;
-        break;
-      }
+      ok = true;
+      break;
     }
+
     delay(500);
   }
 
@@ -2232,7 +2895,7 @@ bool requestPeerPullSync()
     syncPending = false;
     syncDone = true;
     syncFailed = false;
-    syncMsg = "ok: Phantom-2 verified latest local file";
+    syncMsg = "ok: peer verified all local /rec files";
     syncPendingReason = "none";
     prioritySyncFailCount = 0;
     micArmed = true;
@@ -2241,7 +2904,7 @@ bool requestPeerPullSync()
     return true;
   }
 
-  syncMsg = "pending: wait/verify Phantom-2 sync timeout";
+  syncMsg = "pending: wait/verify peer all /rec files timeout";
   syncFailed = true;
   micArmed = false; // tiep tuc khoa mic, handlePrioritySync se retry
   Serial.println("[PrioritySync] Verify failed -> keep mic locked and retry");
@@ -2253,7 +2916,11 @@ void handlePrioritySync()
   if (!syncPending)
     return;
 
-  // Uu tien dong bo hon ghi am: khi pending thi khong cho mic arm
+  cleanupZeroByteRecFiles();
+
+  // Uu tien dong bo hon ghi am trong luc dang thu 3 lan.
+  // Sau khi fail du 3 lan thi se BO pending va MO mic de ghi tiep,
+  // file .bin van nam tren SD card de tai/xu ly sau.
   micArmed = false;
 
   if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
@@ -2265,24 +2932,35 @@ void handlePrioritySync()
   lastPrioritySyncAttemptMs = millis();
 
   bool ok = requestPeerPullSync();
-  if (!ok)
-  {
-    prioritySyncFailCount++;
-    Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+  if (ok)
+    return;
 
-    if (prioritySyncFailCount >= 3)
-    {
-      // STRICT GATE: do not allow new recording until Phantom-2 sync is verified.
-      // Keep syncPending=true and micArmed=false; just slow down retries.
-      Serial.println("[PrioritySync] Peer not verified after 3 tries -> keep mic locked, retry later");
-      syncFailed = true;
-      syncDone = false;
-      syncMsg = "pending: Phantom-2 sync not verified; mic locked";
-      prioritySyncFailCount = 0;
-      micArmed = false;
-      lastPrioritySyncAttemptMs = millis() + 12000UL;
-      restoreMyAP();
-    }
+  prioritySyncFailCount++;
+  Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+
+  if (prioritySyncFailCount >= 3)
+  {
+    // FIX LOOP:
+    // Truoc day code giu syncPending=true + micArmed=false nen lap vo han.
+    // Yeu cau moi: sau 3 lan khong ket noi/xac minh duoc peer,
+    // chap nhan luu file ma hoa tren SD va tiep tuc cho phep ghi am file moi.
+    Serial.println("[PrioritySync] Failed 3/3 -> keep encrypted file on SD, stop retry, unlock mic");
+
+    syncPending = false;
+    syncPendingReason = "none";
+    prioritySyncFailCount = 0;
+
+    syncDone = false;
+    syncFailed = true;
+    syncMsg = "offline: saved encrypted file on SD; peer not connected after 3 tries";
+
+    peerSyncRequestInProgress = false;
+    WiFi.disconnect(false);
+    restoreMyAP();
+
+    // Mo lai mic de thiet bi tiep tuc ghi am lan tiep theo.
+    micArmed = true;
+    lastMicTriggerMs = millis(); // cooldown ngan de tranh trigger lai ngay lap tuc
   }
 }
 
@@ -2300,17 +2978,39 @@ void handleAutoSync()
     return;
   }
 
-  Serial.println("[AutoSync] 60s tick -> try sync from Phantom-2");
+  Serial.println("[AutoSync] 60s tick -> try sync from peer");
   syncDone = syncFromPeer();
   syncFailed = !syncDone;
+}
+
+void handleQueuedPeerSyncRequest()
+{
+  if (!peerSyncQueuedByRequest)
+    return;
+
+  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+    return;
+
+  // Chạy trước priority sync local để đảm bảo yêu cầu /sync từ peer được xử lý ngay.
+  peerSyncQueuedByRequest = false;
+  micArmed = false;
+  syncMsg = "peer requested sync: running now";
+  Serial.println("[Sync] Queued peer sync -> running now");
+  syncDone = syncFromPeer();
+  syncFailed = !syncDone;
+  restoreMyAP();
+  lastMicTriggerMs = millis();
+
+  if (!syncPending && !syncInProgress && !peerSyncRequestInProgress)
+    micArmed = true;
 }
 
 void handleSyncStatus()
 {
   int count = countSdFiles();
 
-  String j = "{\"node\":1";
-  j += ",\"peer\":\"Phantom-2\"";
+  String j = "{\"node\":" + String(NODE_ID);
+  j += ",\"peer\":\"" + String(PEER_SSID) + "\"";
   j += ",\"file_count\":" + String(count);
   j += ",\"sd_used\":" + String(sdReady ? (uint32_t)(SD.usedBytes() / 1024) : 0);
   j += ",\"sd_free\":" + String(sdReady ? (uint32_t)((SD.totalBytes() - SD.usedBytes()) / 1024) : 0);
@@ -2717,11 +3417,20 @@ void setup()
 
   sdReady = setupSDCard();
 
+  if (sdReady)
+  {
+    // Xóa mọi file 0KB còn sót trên toàn bộ SD ngay khi khởi động.
+    // Sau đó tiếp tục cleanup riêng cho file ghi âm .wav/.bin lỗi.
+    cleanupAllZeroByteFilesOnBoot();
+    cleanupZeroByteRecFiles();
+  }
+
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
-  IPAddress apIP(192, 168, 4, 1);
-  IPAddress gw(192, 168, 4, 1);
+  IPAddress apIP;
+  apIP.fromString(MY_AP_IP_STR);
+  IPAddress gw = apIP;
   IPAddress sn(255, 255, 255, 0);
 
   WiFi.softAPConfig(apIP, gw, sn);
@@ -2773,13 +3482,13 @@ void setup()
   syncFailed = false;
   syncMsg = "ready: priority sync after any local file write";
 
-  Serial.println("\n[Ready] Phantom-1 endpoints:");
+  Serial.printf("\n[Ready] %s endpoints:\n", MY_AP_SSID);
   Serial.printf("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
   Serial.printf("  GET  http://%s/status\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/list\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
   Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
-  Serial.printf("  POST http://%s/sync  -> sync from Phantom-2\n", MY_AP_IP_STR);
+  Serial.printf("  POST http://%s/sync  -> sync from peer\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
   Serial.println("  Priority sync: any local file write -> ask Phantom-2 to pull; recording waits until sync done");
 }
@@ -2789,16 +3498,22 @@ void loop()
 {
   server.handleClient();
 
+  // Peer sync request co uu tien cao nhat: neu peer yeu cau sync trong luc dang ghi,
+  // thiet bi se dung ghi -> ma hoa -> chay sync truoc khi nghe mic tiep.
+  handleQueuedPeerSyncRequest();
+
   // Priority sync chay truoc mic va auto-sync dinh ky
   handlePrioritySync();
   handleAutoMicRecord();
   // AutoSync disabled: only sync when upload or recording marks syncPending.
+  // 60s auto-sync disabled by request; sync only runs after local file changes or POST /sync.
   // handleAutoSync();
 
   if (!micArmed && !recordingInProgress && !syncPending && !syncInProgress && !peerSyncRequestInProgress)
   {
     MicVoiceStats st = readMicVoiceStats();
-    if (st.rms15 < MIC_REARM_RMS_LEVEL)
+    // Rearm theo peak14 thấp hơn nửa ngưỡng, không dùng rms15 nữa.
+    if (st.peak14 < (MIC_TRIGGER_PEAK14_LEVEL / 2))
       micArmed = true;
   }
 
