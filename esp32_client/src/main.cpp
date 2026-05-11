@@ -115,11 +115,11 @@
 
 // Nguong peak14 dung chung cho hai node de vai tro va logic giong nhau.
 // Neu moi truong qua on, tang len 4000-6000; neu kho bat tieng, ha xuong 1500-2500.
-#define MIC_TRIGGER_PEAK14_LEVEL 10000
+#define MIC_TRIGGER_PEAK14_LEVEL 2000
 
 // Các define cũ giữ lại để tránh lỗi tham chiếu, nhưng KHÔNG dùng để trigger nữa.
 // Các define cũ đã bỏ khỏi logic trigger để tiết kiệm CPU.
-#define MIC_VOICE_FRAMES_TO_TRIGGER 8
+#define MIC_VOICE_FRAMES_TO_TRIGGER 4
 #define MIC_COOLDOWN_MS 3000UL
 #define MIC_LOG_INTERVAL_MS 1000UL // giảm log idle: 0.5s -> 3s
 #define REC_LOG_INTERVAL_MS 2000UL // giảm log khi đang ghi: 1s -> 5s
@@ -186,6 +186,7 @@ String httpUploadPath = "";
 size_t httpUploadSize = 0;
 bool httpUploadOk = false;
 String httpUploadError = "none";
+bool httpUploadInProgress = false;
 
 // ── Function prototypes ───────────────────────────────────────
 bool setupSDCard();
@@ -1279,7 +1280,7 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
 
 void handleAutoMicRecord()
 {
-  if (!micReady || !sdReady || recordingInProgress || !micArmed || peerSyncQueuedByRequest)
+  if (!micReady || !sdReady || recordingInProgress || !micArmed || peerSyncQueuedByRequest || httpUploadInProgress)
     return;
 
   // Chi khoa mic khi dang thuc su sync/request sync.
@@ -2757,6 +2758,7 @@ void handleFileUploadDone()
                 (int)httpUploadSize,
                 httpUploadOk ? "true" : "false",
                 httpUploadError.c_str());
+  httpUploadInProgress = false;
 }
 
 void handleFileUploadStream()
@@ -2765,6 +2767,7 @@ void handleFileUploadStream()
 
   if (upload.status == UPLOAD_FILE_START)
   {
+    httpUploadInProgress = true;
     httpUploadSize = 0;
     httpUploadOk = false;
     httpUploadError = "none";
@@ -2893,6 +2896,7 @@ void handleFileUploadStream()
 
     httpUploadError = "upload aborted";
     httpUploadOk = false;
+    httpUploadInProgress = false;
     Serial.println("[UploadHTTP] aborted");
   }
 }
@@ -3106,7 +3110,9 @@ void handleBusy()
 {
   // syncPending cũng được báo là busy để peer biết chưa được mở mic: còn file local cần kéo ngược lại.
   bool busy = recordingInProgress || syncInProgress || peerSyncRequestInProgress || peerSyncQueuedByRequest || syncPending;
-  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : (peerSyncQueuedByRequest ? "peer_sync_queued" : (syncPending ? "sync_pending" : "idle"))));
+  if (httpUploadInProgress)
+    busy = true;
+  String reason = recordingInProgress ? "recording" : (syncInProgress ? "syncing" : (peerSyncRequestInProgress ? "peer_sync_request" : (peerSyncQueuedByRequest ? "peer_sync_queued" : (syncPending ? "sync_pending" : (httpUploadInProgress ? "uploading" : "idle")))));
   String j = "{\"node\":" + String(NODE_ID);
   j += ",\"busy\":" + String(busy ? "true" : "false");
   j += ",\"recording\":" + String(recordingInProgress ? "true" : "false");
@@ -3332,7 +3338,7 @@ void handlePrioritySync()
   // file .bin van nam tren SD card de tai/xu ly sau.
   micArmed = false;
 
-  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress)
+  if (recordingInProgress || syncInProgress || peerSyncRequestInProgress || httpUploadInProgress)
     return;
 
   // Chong retry qua day neu peer khong tim thay/ban

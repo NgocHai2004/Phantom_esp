@@ -2141,13 +2141,8 @@ class DecryptPage(ctk.CTkFrame):
 
     @staticmethod
     def _phantom_key_dir() -> str:
-        """Default picker dir for key files: ~/Documents/Phantom/output"""
-        d = Path.home() / "Documents" / "Phantom" / "output"
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        return str(d) if d.exists() else str(Path.home())
+        """Default picker dir for key files: same folder as Encrypt key picker."""
+        return _phantom_dir("input")
 
     def _refresh_bin_display(self, name: str = ""):
         """Update the .bin file display row."""
