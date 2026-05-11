@@ -71,6 +71,12 @@
 #define SYNC_INITIATOR 0
 #endif
 
+#if NODE_ID == 2
+#define MIC_RECORD_ENABLED 1
+#else
+#define MIC_RECORD_ENABLED 0
+#endif
+
 #define MY_AP_PASSWORD "12345678"
 #define MY_AP_HIDDEN false
 #define MY_AP_MAX_CON 4
@@ -193,6 +199,7 @@ void handleBusy();
 void handleAutoSync();
 void handleFileUploadDone();
 void handleFileUploadStream();
+void handleRecClearAll();
 void markLocalFileChanged(const String &reason);
 void handlePrioritySync();
 bool requestPeerPullSync(bool requestBackSync = true);
@@ -215,6 +222,49 @@ void cleanupZeroByteRecFiles();
 void cleanupAllZeroByteFilesOnBoot();
 uint32_t cleanupZeroByteFilesRecursive(const char *dirPath, uint8_t depth);
 String normalizeRecPath(const String &path);
+
+uint32_t deleteAllFilesInRec()
+{
+  if (!sdReady)
+    return 0;
+
+  if (!SD.exists("/rec"))
+    return 0;
+
+  File root = SD.open("/rec");
+  if (!root || !root.isDirectory())
+  {
+    if (root)
+      root.close();
+    return 0;
+  }
+
+  uint32_t deleted = 0;
+  File f = root.openNextFile();
+  while (f)
+  {
+    String name = String(f.name());
+    bool isDir = f.isDirectory();
+    f.close();
+
+    if (!isDir)
+    {
+      String base = name;
+      int slash = base.lastIndexOf('/');
+      if (slash >= 0)
+        base = base.substring(slash + 1);
+      String path = "/rec/" + base;
+      if (SD.remove(path))
+        deleted++;
+    }
+
+    f = root.openNextFile();
+    delay(1);
+  }
+
+  root.close();
+  return deleted;
+}
 
 // ── LED ───────────────────────────────────────────────────────
 void blinkLED(int times, int ms = 100)
@@ -2923,6 +2973,83 @@ void handleFileDelete()
   Serial.printf("[SD] Delete '%s' -> %s\n", path.c_str(), ok ? "OK" : "FAIL");
 }
 
+void handleRecClearAll()
+{
+  if (!sdReady)
+  {
+    server.send(500, "application/json", "{\"status\":\"fail\",\"error\":\"sd not ready\"}");
+    return;
+  }
+
+  bool localOnly = (server.arg("local_only") == "1");
+  uint32_t localDeleted = deleteAllFilesInRec();
+
+  syncPending = false;
+  syncPendingReason = "none";
+  syncDone = false;
+  syncFailed = false;
+  syncMsg = "rec cleared";
+  if (MIC_RECORD_ENABLED)
+  {
+    micArmed = true;
+    lastMicTriggerMs = millis();
+  }
+
+  bool peerCalled = false;
+  bool peerOk = false;
+
+  if (!localOnly)
+  {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    WiFi.disconnect(false);
+    delay(200);
+    WiFi.begin(PEER_SSID, PEER_PASSWORD);
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 25)
+    {
+      delay(200);
+      retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      WiFiClient c;
+      if (c.connect(PEER_IP, PEER_HTTP_PORT))
+      {
+        peerCalled = true;
+        c.printf("POST /rec/clear_all?local_only=1 HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", PEER_IP);
+        unsigned long t = millis();
+        String resp = "";
+        while ((c.connected() || c.available()) && (millis() - t) < 8000)
+        {
+          if (c.available())
+          {
+            resp += (char)c.read();
+            t = millis();
+          }
+          else
+          {
+            delay(2);
+          }
+        }
+        c.stop();
+        peerOk = (resp.indexOf("\"status\":\"ok\"") >= 0);
+      }
+    }
+
+    WiFi.disconnect(false);
+    restoreMyAP();
+  }
+
+  String j = "{\"status\":\"ok\"";
+  j += ",\"local_deleted\":" + String(localDeleted);
+  j += ",\"peer_called\":" + String(peerCalled ? "true" : "false");
+  j += ",\"peer_ok\":" + String(peerOk ? "true" : "false");
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
 void handleRamInfo()
 {
   if (!ramReady || ramSize < 44)
@@ -2947,7 +3074,6 @@ void handleRamInfo()
 
 void handleSync()
 {
-  bool allowBackSync = (server.arg("bounce") != "0");
   if (syncInProgress)
   {
     server.send(423, "application/json",
@@ -2974,14 +3100,6 @@ void handleSync()
               "{\"status\":\"ok\",\"message\":\"peer sync starting\"}");
   syncDone = syncFromPeer();
   syncFailed = !syncDone;
-
-  // Sau khi node nay pull xong file tu peer, goi nguoc 1 lan de peer pull lai.
-  // Dung query bounce=0 de chong loop ping-pong vo han.
-  if (SYNC_INITIATOR && syncDone && allowBackSync && !recordingInProgress && !syncInProgress)
-  {
-    Serial.println("[Sync] Back-sync request to peer (one-shot)");
-    requestPeerPullSync(false);
-  }
 }
 
 void handleBusy()
@@ -3037,16 +3155,7 @@ bool requestPeerPullSync(bool requestBackSync)
 {
   if (!sdReady || recordingInProgress || syncInProgress || peerSyncRequestInProgress)
     return false;
-
-  // Pull-first strategy for initiator:
-  // when Phantom-1 has new local data, first pull missing files from Phantom-2,
-  // then ask Phantom-2 to pull back from Phantom-1.
-  if (SYNC_INITIATOR && requestBackSync)
-  {
-    Serial.println("[PrioritySync] Pull-first: sync local from peer before trigger peer pull");
-    bool prePullOk = syncFromPeer();
-    Serial.printf("[PrioritySync] Pull-first result: %s\n", prePullOk ? "OK" : "SKIP/FAIL");
-  }
+  (void)requestBackSync;
 
   lastPriorityFailPeerNotFound = false;
   peerSyncRequestInProgress = true;
@@ -3116,7 +3225,7 @@ bool requestPeerPullSync(bool requestBackSync)
   bool ok = false;
   if (c.connect(PEER_IP, PEER_HTTP_PORT))
   {
-    const char *syncPath = requestBackSync ? "/sync?bounce=1" : "/sync?bounce=0";
+    const char *syncPath = "/sync?bounce=0";
     c.printf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", syncPath, PEER_IP);
 
     unsigned long t = millis();
@@ -3234,39 +3343,12 @@ void handlePrioritySync()
   bool ok = requestPeerPullSync();
   if (ok)
     return;
-
-  prioritySyncFailCount++;
-  Serial.printf("[PrioritySync] Retry failed %u/1\n", prioritySyncFailCount);
-
-  if (prioritySyncFailCount >= 1)
-  {
-    if (lastPriorityFailPeerNotFound)
-    {
-      Serial.println("[PrioritySync] Failed 1/1 (peer not found) -> unlock mic and continue recording");
-      syncPending = false;
-      syncPendingReason = "none";
-      syncDone = false;
-      syncFailed = true;
-      syncMsg = "offline: peer not found, continue local recording";
-      micArmed = true;
-      lastMicTriggerMs = millis();
-    }
-    else
-    {
-      // Keep waiting state: do not unlock mic until 2-way sync verification succeeds.
-      Serial.println("[PrioritySync] Failed 1/1 -> keep waiting, mic stays locked, retry next cycle");
-      syncDone = false;
-      syncFailed = true;
-      syncMsg = "pending: retry sync next cycle (mic locked until 2-way sync done)";
-      micArmed = false;
-    }
-    prioritySyncFailCount = 0;
-    lastPriorityFailPeerNotFound = false;
-
-    peerSyncRequestInProgress = false;
-    WiFi.disconnect(false);
-    restoreMyAP();
-  }
+  // Giu khoa mic den khi peer pull xong; neu fail thi tiep tuc retry.
+  Serial.println("[PrioritySync] Retry later; mic remains locked until peer pulled files");
+  syncDone = false;
+  syncFailed = true;
+  syncMsg = "pending: waiting Phantom-1 pull missing files";
+  micArmed = false;
 }
 
 void handleAutoSync()
@@ -3757,6 +3839,7 @@ void setup()
   server.on("/file/upload", HTTP_POST, handleFileUploadDone, handleFileUploadStream);
   server.on("/file/clear", HTTP_POST, handleFileClear);
   server.on("/file/delete", HTTP_POST, handleFileDelete);
+  server.on("/rec/clear_all", HTTP_POST, handleRecClearAll);
 
   server.on("/ram/info", HTTP_GET, handleRamInfo);
   server.on("/battery", HTTP_GET, handleBattery);
@@ -3777,7 +3860,9 @@ void setup()
   audioServer.begin();
   uploadServer.begin();
 
+#if MIC_RECORD_ENABLED
   setupI2SMic();
+#endif
 
   // Gio Viet Nam. Neu khong co internet thi khong anh huong dong bo file.
   configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -3811,11 +3896,14 @@ void loop()
 
   // Priority sync chay truoc mic va auto-sync dinh ky
   handlePrioritySync();
+#if MIC_RECORD_ENABLED
   handleAutoMicRecord();
+#endif
   // AutoSync disabled: only sync when upload or recording marks syncPending.
   // 60s auto-sync disabled by request; sync only runs after local file changes or POST /sync.
   // handleAutoSync();
 
+#if MIC_RECORD_ENABLED
   if (!micArmed && !recordingInProgress && !syncPending && !syncInProgress && !peerSyncRequestInProgress)
   {
     MicVoiceStats st = readMicVoiceStats();
@@ -3823,6 +3911,7 @@ void loop()
     if (st.peak14 < (MIC_TRIGGER_PEAK14_LEVEL / 2))
       micArmed = true;
   }
+#endif
 
   WiFiClient c = audioServer.accept();
   if (c)
