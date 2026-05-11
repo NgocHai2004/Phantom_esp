@@ -94,6 +94,7 @@
 #define MAX_FILE_SIZE 50000000
 #define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: no 60s auto sync; priority sync only
 #define PRIORITY_SYNC_WAIT_PEER_IDLE_MS 30000UL
+#define UPLOAD_SYNC_DELAY_MS 5000UL
 
 // ── I2S MIC ───────────────────────────────────────────────────
 #define I2S_WS 25
@@ -168,6 +169,7 @@ bool syncInProgress = false;
 bool syncPending = false;               // Co file local moi/cap nhat can dong bo sang Phantom-2
 bool peerSyncRequestInProgress = false; // Dang yeu cau Phantom-2 keo file ve
 String syncPendingReason = "none";
+unsigned long syncPendingNotBeforeMs = 0;
 unsigned long lastAutoSyncMs = 0;
 unsigned long lastPrioritySyncAttemptMs = 0;
 uint8_t prioritySyncFailCount = 0;
@@ -3149,7 +3151,16 @@ void markLocalFileChanged(const String &reason)
   syncPending = true;
   syncPendingReason = reason;
   prioritySyncFailCount = 0;
-  syncMsg = "pending peer sync: " + reason;
+  syncPendingNotBeforeMs = millis();
+  if (reason.startsWith("HTTP upload ") || reason.startsWith("TCP8080 upload ") || reason.startsWith("TCP8081 upload "))
+  {
+    syncPendingNotBeforeMs += UPLOAD_SYNC_DELAY_MS;
+    syncMsg = "pending peer sync in 5s: " + reason;
+  }
+  else
+  {
+    syncMsg = "pending peer sync: " + reason;
+  }
 
   // Uu tien dong bo: khoa trigger ghi am cho den khi dong bo xong
   micArmed = false;
@@ -3329,6 +3340,9 @@ void handlePrioritySync()
     return;
 
   if (!syncPending)
+    return;
+
+  if ((long)(syncPendingNotBeforeMs - millis()) > 0)
     return;
 
   cleanupZeroByteRecFiles();
