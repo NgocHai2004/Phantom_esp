@@ -47,9 +47,7 @@
 #include "test_wav.h"
 
 // ── Cau hinh node doi xung ───────────────────────────────────
-#ifndef NODE_ID
 #define NODE_ID 2
-#endif
 
 #if NODE_ID == 1
 #define MY_AP_SSID "Phantom-1"
@@ -65,6 +63,12 @@
 #define PEER_IP "192.168.4.1"
 #else
 #error "NODE_ID must be 1 or 2"
+#endif
+
+#if NODE_ID == 2
+#define SYNC_INITIATOR 1
+#else
+#define SYNC_INITIATOR 0
 #endif
 
 #define MY_AP_PASSWORD "12345678"
@@ -161,6 +165,7 @@ String syncPendingReason = "none";
 unsigned long lastAutoSyncMs = 0;
 unsigned long lastPrioritySyncAttemptMs = 0;
 uint8_t prioritySyncFailCount = 0;
+bool lastPriorityFailPeerNotFound = false;
 
 // Sync priority control:
 // Khi peer gọi POST /sync trong lúc đang ghi âm, thiết bị sẽ dừng bản ghi hiện tại,
@@ -202,6 +207,7 @@ void syncMicCounterFromSd();
 bool verifyPeerHasLocalFile(const String &localPath);
 bool verifyPeerHasAllLocalRecFiles();
 bool verifyBidirectionalRecBinSync();
+bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist);
 String encryptedPathFromWavPath(const String &wavPath);
 bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool deletePlainAfterEncrypt);
 bool isZeroByteRecFile(const String &path);
@@ -389,8 +395,9 @@ String normalizeRecPath(const String &pathIn)
 
   String lowBase = base;
   lowBase.toLowerCase();
-  bool isRecAudio = (lowBase.startsWith("rec") &&
-                     (lowBase.endsWith(".wav") || lowBase.endsWith(".bin")));
+  bool isRecAudio = ((lowBase.startsWith("rec") &&
+                      (lowBase.endsWith(".wav") || lowBase.endsWith(".bin"))) ||
+                     (lowBase.startsWith("phantom_") && lowBase.endsWith(".bin")));
 
   if (isRecAudio)
     return "/rec/" + base;
@@ -401,6 +408,7 @@ String normalizeRecPath(const String &pathIn)
 }
 
 #define MIN_VALID_ENC_REC_SIZE 34
+#define RECOVER_WAV_MIN_SIZE (100UL * 1024UL)
 
 bool isRecWavPath(const String &pathIn)
 {
@@ -421,7 +429,9 @@ bool isRecEncPath(const String &pathIn)
   if (slash >= 0)
     base = base.substring(slash + 1);
   base.toLowerCase();
-  return base.startsWith("rec") && base.endsWith(".bin");
+  if (!base.endsWith(".bin"))
+    return false;
+  return base.startsWith("rec") || base.startsWith("phantom_");
 }
 
 bool isValidEncSize(size_t sz)
@@ -560,18 +570,39 @@ void cleanupZeroByteRecFiles()
     if (!isWav && !isEnc)
       return;
 
-    // QUY TẮC MỚI:
-    // WAV chỉ là file tạm trong lúc ghi/mã hóa.
-    // Nếu boot lên hoặc cleanup mà còn thấy rec*.wav thì coi là file dở/lỗi -> xóa luôn.
-    // Chỉ giữ lại rec*.bin hợp lệ để lưu và đồng bộ.
+    // WAV là file tạm trong lúc ghi/mã hóa.
+    // Quy tắc:
+    // - WAV nhỏ hơn 100KB: coi như dở/lỗi -> xóa.
+    // - WAV >= 100KB: thử mã hóa sang .bin trước; nếu thành công thì xóa WAV.
     if (isWav)
     {
-      Serial.printf("[CLEANUP] Delete leftover/incomplete WAV: raw=%s norm=%s size=%lu\n",
-                    raw.c_str(), norm.c_str(), (unsigned long)sz);
+      if (sz >= RECOVER_WAV_MIN_SIZE)
+      {
+        String encPath = encryptedPathFromWavPath(norm);
+        Serial.printf("[RECOVER] Found WAV >=100KB, try encrypt: %s -> %s size=%lu\n",
+                      norm.c_str(), encPath.c_str(), (unsigned long)sz);
 
-      removeIfExists(raw);
-      if (raw != norm)
-        removeIfExists(norm);
+        bool encOk = aesGcmEncryptFile(norm, encPath, true);
+        if (encOk)
+        {
+          Serial.printf("[RECOVER] Encrypt OK: %s\n", encPath.c_str());
+          markLocalFileChanged("recover leftover wav " + encPath);
+        }
+        else
+        {
+          // Giu file de lan cleanup sau thu lai, tranh mat du lieu.
+          Serial.printf("[RECOVER] Encrypt FAILED, keep WAV for retry: %s\n", norm.c_str());
+        }
+      }
+      else
+      {
+        Serial.printf("[CLEANUP] Delete leftover/incomplete WAV (<100KB): raw=%s norm=%s size=%lu\n",
+                      raw.c_str(), norm.c_str(), (unsigned long)sz);
+
+        removeIfExists(raw);
+        if (raw != norm)
+          removeIfExists(norm);
+      }
 
       return;
     }
@@ -1523,9 +1554,45 @@ bool verifyBidirectionalRecBinSync()
     bool ok = (remoteSize >= 0 && remoteSize == (long)lb.size);
     if (!ok)
     {
-      Serial.printf("[PrioritySync] Verify 2-way FAIL local->peer: %s local=%lu remote=%ld\n",
+      Serial.printf("[PrioritySync] Verify 2-way local->peer missing/diff, ask peer pull once: %s local=%lu remote=%ld\n",
                     lb.base.c_str(), (unsigned long)lb.size, remoteSize);
-      return false;
+
+      bool asked = false;
+      WiFiClient c;
+      if (c.connect(PEER_IP, PEER_HTTP_PORT))
+      {
+        c.printf("POST /sync?bounce=0 HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", PEER_IP);
+        unsigned long t = millis();
+        while ((c.connected() || c.available()) && (millis() - t) < 5000)
+        {
+          if (c.available())
+            c.read();
+          server.handleClient();
+          delay(2);
+        }
+        c.stop();
+        asked = true;
+      }
+
+      if (asked)
+      {
+        delay(500);
+        String peerList2 = httpGetFromPeer("/file/list", 5000);
+        long remoteSize2 = extractFileSizeFromListJson(peerList2, lb.base);
+        bool fixed = (remoteSize2 >= 0 && remoteSize2 == (long)lb.size);
+        if (fixed)
+        {
+          remoteSize = remoteSize2;
+          ok = true;
+        }
+      }
+
+      if (!ok)
+      {
+        Serial.printf("[PrioritySync] Verify 2-way FAIL local->peer: %s local=%lu remote=%ld\n",
+                      lb.base.c_str(), (unsigned long)lb.size, remoteSize);
+        return false;
+      }
     }
     okLocalOnPeer++;
   }
@@ -1562,9 +1629,18 @@ bool verifyBidirectionalRecBinSync()
     bool ok = (isValidEncSize(localSize) && (long)localSize == peerSize);
     if (!ok)
     {
-      Serial.printf("[PrioritySync] Verify 2-way FAIL peer->local: %s local=%lu peer=%ld\n",
+      Serial.printf("[PrioritySync] Verify 2-way peer->local missing/diff, try pull: %s local=%lu peer=%ld\n",
                     base.c_str(), (unsigned long)localSize, peerSize);
-      return false;
+      bool pulled = httpDownloadFileFromPeer(base, nullptr);
+      size_t afterSize = safeFileSize(localPath);
+      bool fixed = (pulled && isValidEncSize(afterSize) && (long)afterSize == peerSize);
+      if (!fixed)
+      {
+        Serial.printf("[PrioritySync] Verify 2-way FAIL peer->local: %s local=%lu peer=%ld\n",
+                      base.c_str(), (unsigned long)afterSize, peerSize);
+        return false;
+      }
+      localSize = afterSize;
     }
     peerChecked++;
   }
@@ -1820,7 +1896,7 @@ int32_t getRemoteFileSize(const String &listJson, const String &fname)
 }
 
 // ── Download 1 file tu Phantom-2 ──────────────────────────────
-bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist = nullptr)
+bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
 {
   String path = "/file/download?name=" + filename;
 
@@ -2872,7 +2948,6 @@ void handleRamInfo()
 void handleSync()
 {
   bool allowBackSync = (server.arg("bounce") != "0");
-
   if (syncInProgress)
   {
     server.send(423, "application/json",
@@ -2902,7 +2977,7 @@ void handleSync()
 
   // Sau khi node nay pull xong file tu peer, goi nguoc 1 lan de peer pull lai.
   // Dung query bounce=0 de chong loop ping-pong vo han.
-  if (syncDone && allowBackSync && !recordingInProgress && !syncInProgress)
+  if (SYNC_INITIATOR && syncDone && allowBackSync && !recordingInProgress && !syncInProgress)
   {
     Serial.println("[Sync] Back-sync request to peer (one-shot)");
     requestPeerPullSync(false);
@@ -2933,6 +3008,20 @@ void markLocalFileChanged(const String &reason)
   if (!sdReady)
     return;
 
+  if (!SYNC_INITIATOR)
+  {
+    syncPending = false;
+    syncPendingReason = "none";
+    prioritySyncFailCount = 0;
+    syncDone = false;
+    syncFailed = false;
+    syncMsg = "local saved on Phantom-2; waiting Phantom-2 sync trigger";
+    micArmed = true;
+    lastMicTriggerMs = millis();
+    Serial.println("[PrioritySync] Passive node: keep local file, wait for Phantom-2 trigger");
+    return;
+  }
+
   syncPending = true;
   syncPendingReason = reason;
   prioritySyncFailCount = 0;
@@ -2949,6 +3038,17 @@ bool requestPeerPullSync(bool requestBackSync)
   if (!sdReady || recordingInProgress || syncInProgress || peerSyncRequestInProgress)
     return false;
 
+  // Pull-first strategy for initiator:
+  // when Phantom-1 has new local data, first pull missing files from Phantom-2,
+  // then ask Phantom-2 to pull back from Phantom-1.
+  if (SYNC_INITIATOR && requestBackSync)
+  {
+    Serial.println("[PrioritySync] Pull-first: sync local from peer before trigger peer pull");
+    bool prePullOk = syncFromPeer();
+    Serial.printf("[PrioritySync] Pull-first result: %s\n", prePullOk ? "OK" : "SKIP/FAIL");
+  }
+
+  lastPriorityFailPeerNotFound = false;
   peerSyncRequestInProgress = true;
   syncMsg = "priority: ask peer to pull files";
 
@@ -2978,6 +3078,7 @@ bool requestPeerPullSync(bool requestBackSync)
   {
     Serial.println("\n[PrioritySync] peer not found");
     syncMsg = "pending: peer not found";
+    lastPriorityFailPeerNotFound = true;
     WiFi.disconnect(false);
     restoreMyAP();
     peerSyncRequestInProgress = false;
@@ -3064,14 +3165,13 @@ bool requestPeerPullSync(bool requestBackSync)
 
     String b = httpGetFromPeer("/busy", 2500);
     bool peerStable = (b.length() > 0 &&
-                       b.indexOf("\"recording\":true") < 0 &&
                        b.indexOf("\"sync_in_progress\":true") < 0 &&
                        b.indexOf("\"peer_sync_request_in_progress\":true") < 0 &&
                        b.indexOf("\"peer_sync_queued\":true") < 0 &&
                        b.indexOf("\"sync_pending\":true") < 0);
 
     if (!verified && b.length() > 0 && b.indexOf("\"sync_in_progress\":true") < 0)
-      verified = verifyBidirectionalRecBinSync();
+      verified = verifyPeerHasAllLocalRecFiles();
 
     if (verified && peerStable)
     {
@@ -3092,16 +3192,16 @@ bool requestPeerPullSync(bool requestBackSync)
     syncPending = false;
     syncDone = true;
     syncFailed = false;
-    syncMsg = "ok: 2-way verified all /rec BIN files";
+    syncMsg = "ok: peer pulled all local /rec BIN files";
     syncPendingReason = "none";
     prioritySyncFailCount = 0;
     micArmed = true;
     lastMicTriggerMs = millis();
-    Serial.println("[PrioritySync] Done + verified -> recording can run again");
+    Serial.println("[PrioritySync] Done (one-way) -> recording can run again");
     return true;
   }
 
-  syncMsg = "pending: wait/verify 2-way /rec BIN files timeout";
+  syncMsg = "pending: wait/verify peer pull timeout";
   syncFailed = true;
   micArmed = false; // tiep tuc khoa mic, handlePrioritySync se retry
   Serial.println("[PrioritySync] Verify failed -> keep mic locked and retry");
@@ -3110,13 +3210,16 @@ bool requestPeerPullSync(bool requestBackSync)
 
 void handlePrioritySync()
 {
+  if (!SYNC_INITIATOR)
+    return;
+
   if (!syncPending)
     return;
 
   cleanupZeroByteRecFiles();
 
-  // Uu tien dong bo hon ghi am trong luc dang thu 3 lan.
-  // Sau khi fail du 3 lan thi se BO pending va MO mic de ghi tiep,
+  // Uu tien dong bo hon ghi am trong luc dang thu 1 lan.
+  // Sau khi fail 1 lan thi se BO pending va MO mic de ghi tiep,
   // file .bin van nam tren SD card de tai/xu ly sau.
   micArmed = false;
 
@@ -3133,31 +3236,36 @@ void handlePrioritySync()
     return;
 
   prioritySyncFailCount++;
-  Serial.printf("[PrioritySync] Retry failed %u/3\n", prioritySyncFailCount);
+  Serial.printf("[PrioritySync] Retry failed %u/1\n", prioritySyncFailCount);
 
-  if (prioritySyncFailCount >= 3)
+  if (prioritySyncFailCount >= 1)
   {
-    // FIX LOOP:
-    // Truoc day code giu syncPending=true + micArmed=false nen lap vo han.
-    // Yeu cau moi: sau 3 lan khong ket noi/xac minh duoc peer,
-    // chap nhan luu file ma hoa tren SD va tiep tuc cho phep ghi am file moi.
-    Serial.println("[PrioritySync] Failed 3/3 -> keep encrypted file on SD, stop retry, unlock mic");
-
-    syncPending = false;
-    syncPendingReason = "none";
+    if (lastPriorityFailPeerNotFound)
+    {
+      Serial.println("[PrioritySync] Failed 1/1 (peer not found) -> unlock mic and continue recording");
+      syncPending = false;
+      syncPendingReason = "none";
+      syncDone = false;
+      syncFailed = true;
+      syncMsg = "offline: peer not found, continue local recording";
+      micArmed = true;
+      lastMicTriggerMs = millis();
+    }
+    else
+    {
+      // Keep waiting state: do not unlock mic until 2-way sync verification succeeds.
+      Serial.println("[PrioritySync] Failed 1/1 -> keep waiting, mic stays locked, retry next cycle");
+      syncDone = false;
+      syncFailed = true;
+      syncMsg = "pending: retry sync next cycle (mic locked until 2-way sync done)";
+      micArmed = false;
+    }
     prioritySyncFailCount = 0;
-
-    syncDone = false;
-    syncFailed = true;
-    syncMsg = "offline: saved encrypted file on SD; peer not connected after 3 tries";
+    lastPriorityFailPeerNotFound = false;
 
     peerSyncRequestInProgress = false;
     WiFi.disconnect(false);
     restoreMyAP();
-
-    // Mo lai mic de thiet bi tiep tuc ghi am lan tiep theo.
-    micArmed = true;
-    lastMicTriggerMs = millis(); // cooldown ngan de tranh trigger lai ngay lap tuc
   }
 }
 
@@ -3557,7 +3665,8 @@ void handleRawTCP(WiFiClient &client)
       if (saveAs.length() == 0)
         saveAs = genAutoFilename();
 
-      bool sv = sdSaveAs(buf, rx, "/" + saveAs);
+      String targetPath = normalizeRecPath(saveAs);
+      bool sv = sdSaveAs(buf, rx, targetPath);
 
       if (sv)
         markLocalFileChanged("TCP8080 upload " + saveAs);

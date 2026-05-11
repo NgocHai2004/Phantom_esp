@@ -96,6 +96,16 @@ except ImportError:
     _CRYPTO_OK = False
 
 _PHTM_MAGIC, _PHTM_VERSION, _PHTM_KEY_SZ = b"PHTM", 2, 32
+_REC_MAGIC = b"PHGCM1"
+_REC_IV_LEN = 12
+_REC_TAG_LEN = 16
+_REC_HDR_LEN = len(_REC_MAGIC) + _REC_IV_LEN
+_REC_DEMO_KEY = bytes([
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01
+])
 
 def _phtm_load_key(path):
     d = open(path, "rb").read()
@@ -115,6 +125,15 @@ def _phtm_decrypt_3layer(enc: bytes, master: bytes) -> bytes:
     h.update(inner)
     h.verify(hmac_tag)
     return AESGCM(k_aes).decrypt(inner[:12], inner[12:], None)
+
+def _rec_decrypt_raw(raw: bytes, key32: bytes) -> bytes:
+    if not raw.startswith(_REC_MAGIC):
+        raise ValueError("NOT A REC RAW FILE")
+    if len(raw) <= (_REC_HDR_LEN + _REC_TAG_LEN):
+        raise ValueError("REC RAW FILE TOO SHORT")
+    iv = raw[len(_REC_MAGIC):_REC_HDR_LEN]
+    ct_and_tag = raw[_REC_HDR_LEN:]
+    return AESGCM(key32).decrypt(iv, ct_and_tag, None)
 
 def _phtm_encrypt_3layer(data: bytes, master: bytes) -> bytes:
     k_aes, k_hmac, k_chacha = _phtm_derive(master)
@@ -145,6 +164,7 @@ _KNOWN_IPS = [
     ("192.168.6.1", "Phantom-3"), ("192.168.7.1", "Phantom-4"),
 ]
 TCP_PORT = 8080
+_SCAN_ERR_LAST = {}
 
 def tcp_upload(host, port, data: bytes, timeout=30, filename=""):
     s = socket.socket(); s.settimeout(timeout)
@@ -169,6 +189,31 @@ def tcp_upload(host, port, data: bytes, timeout=30, filename=""):
     finally:
         try: s.close()
         except: pass
+
+def http_upload(host, data: bytes, timeout=20, filename=""):
+    try:
+        req = urllib.request.Request(
+            f"http://{host}/file/upload",
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Filename": filename or "upload.bin",
+                "User-Agent": "PhantomGUI/5.0",
+                "Connection": "close",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode(errors="replace")
+            return f"HTTP/1.1 {r.status} {r.reason}\r\n\r\n{body}", len(data)
+    except Exception as e:
+        return f"ERROR: {e}", 0
+
+def upload_with_fallback(host, data: bytes, filename=""):
+    resp, sent = tcp_upload(host, TCP_PORT, data, filename=filename)
+    if sent > 0 and "ERROR" not in (resp or ""):
+        return resp, sent
+    return http_upload(host, data, filename=filename)
 
 def scan_phantoms(known=_KNOWN_IPS, timeout=3):
     """Scan Phantom ESP32 APs via /status.
@@ -226,7 +271,12 @@ def scan_phantoms(known=_KNOWN_IPS, timeout=3):
         except Exception as e:
             # In ra console để debug, không làm crash GUI.
             try:
-                print(f"[SCAN] {name} {ip} failed: {e}")
+                now = time.time()
+                k = (ip, str(e))
+                last = _SCAN_ERR_LAST.get(k, 0.0)
+                if now - last >= 20.0:
+                    _SCAN_ERR_LAST[k] = now
+                    print(f"[SCAN] {name} {ip} failed: {e}")
             except Exception:
                 pass
 
@@ -1419,10 +1469,29 @@ class EncryptPage(ctk.CTkFrame):
             pass
 
     # ── SEND / SYNC ───────────────────────────────────────────────────────────
+    def _resolve_upload_ip(self):
+        if self._active_ip:
+            return self._active_ip
+        for ip, _ in _KNOWN_IPS:
+            s = socket.socket()
+            s.settimeout(0.8)
+            try:
+                s.connect((ip, TCP_PORT))
+                return ip
+            except Exception:
+                pass
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        return ""
+
     def _do_send(self):
         if not self._bin_bytes:
             self._log("No bundle — run Encrypt first"); return
-        if not self._active_ip:
+        target_ip = self._resolve_upload_ip()
+        if not target_ip:
             self._log("Not connected to Phantom"); return
         fname = self._bundle_name + ".bin"; data = self._bin_bytes
         size_kb = len(data) / 1024
@@ -1434,7 +1503,7 @@ class EncryptPage(ctk.CTkFrame):
         # Animate sync progress bar (indeterminate feel via steps)
         self._sync_progress(0)
         t0 = time.time()
-        resp, sent = tcp_upload(self._active_ip, TCP_PORT, data, filename=fname)
+        resp, sent = upload_with_fallback(target_ip, data, filename=fname)
         elapsed = time.time() - t0
         sl = resp.split("\r\n")[0] if resp else ""
         body = resp.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in resp else ""
@@ -1590,7 +1659,8 @@ class EncryptPage(ctk.CTkFrame):
                     self.after(0, lambda p=auto_path: self._update_enc_file_info(p))
                 self._app._show_toast(f"✓  Saved → output/{bundle_name}.bin")
                 # ── AUTO-SEND after 20s countdown ────────────────────────────
-                if self._active_ip:
+                _target_ip = self._resolve_upload_ip()
+                if _target_ip:
                     for _remaining in range(20, 0, -1):
                         self.after(0, lambda r=_remaining: self._enc_status.configure(
                             text=f"Auto-upload in {r}s…", text_color=C_BLUE))
@@ -1598,13 +1668,13 @@ class EncryptPage(ctk.CTkFrame):
                     # After countdown, run the send logic inline (same as _do_send but non-blocking)
                     _fname = self._bundle_name + ".bin"
                     _data  = self._bin_bytes
-                    _ip    = self._active_ip
+                    _ip    = _target_ip
                     if _data and _ip:
                         self.after(0, lambda: self._send_btn.configure(state="disabled"))
                         self.after(0, lambda: self._enc_status.configure(
                             text=f"Auto-sending {len(_data)/1024:.1f} KB…", text_color=C_BLUE))
                         _t0 = time.time()
-                        _resp, _sent = tcp_upload(_ip, TCP_PORT, _data, filename=_fname)
+                        _resp, _sent = upload_with_fallback(_ip, _data, filename=_fname)
                         _elapsed = time.time() - _t0
                         _sl   = _resp.split("\r\n")[0] if _resp else ""
                         _body = _resp.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in _resp else ""
@@ -2248,17 +2318,22 @@ class DecryptPage(ctk.CTkFrame):
 
             try:
                 raw = open(bin_p, "rb").read()
+                mode = "PHTM"
                 if raw[:4] != _PHTM_MAGIC:
-                    raise ValueError("NOT A PHANTOM FILE")
-                ver = struct.unpack_from("<I", raw, 4)[0]
-                if ver != _PHTM_VERSION:
-                    raise ValueError(f"UNSUPPORTED VERSION {ver}")
-                md5_stored = raw[8:24]
-                plen       = struct.unpack_from("<I", raw, 24)[0]
-                payload    = raw[28:28 + plen]
-                if hashlib.md5(payload).digest() != md5_stored:
-                    raise ValueError("MD5 MISMATCH — FILE CORRUPTED")
-                master = _phtm_load_key(key_p)
+                    if raw.startswith(_REC_MAGIC):
+                        mode = "REC_RAW"
+                    else:
+                        raise ValueError("NOT A PHANTOM FILE")
+                if mode == "PHTM":
+                    ver = struct.unpack_from("<I", raw, 4)[0]
+                    if ver != _PHTM_VERSION:
+                        raise ValueError(f"UNSUPPORTED VERSION {ver}")
+                    md5_stored = raw[8:24]
+                    plen       = struct.unpack_from("<I", raw, 24)[0]
+                    payload    = raw[28:28 + plen]
+                    if hashlib.md5(payload).digest() != md5_stored:
+                        raise ValueError("MD5 MISMATCH - FILE CORRUPTED")
+                    master = _phtm_load_key(key_p)
             except Exception as e:
                 self._dec_log_msg(f"✗  HEADER ERROR: {e}")
                 self.after(0, lambda: self._dec_status.configure(
@@ -2266,8 +2341,62 @@ class DecryptPage(ctk.CTkFrame):
                 self.after(0, lambda: self._dec_btn.configure(state="normal"))
                 return
 
-            self._dec_log_msg(f"✔  Header OK  |  {plen:,} bytes")
-            self._dec_log_msg(f"  MD5  : {md5_stored.hex()}")
+            if mode == "PHTM":
+                self._dec_log_msg(f"✔  Header OK  |  {plen:,} bytes")
+                self._dec_log_msg(f"  MD5  : {md5_stored.hex()}")
+            else:
+                self._dec_log_msg(f"✔  REC RAW header OK  |  {len(raw):,} bytes")
+
+            if mode == "REC_RAW":
+                os.makedirs(out_d, exist_ok=True)
+                key_candidates = []
+                try:
+                    kd = open(key_p, "rb").read()
+                    if len(kd) >= 32:
+                        key_candidates.append(kd[:32])
+                except Exception:
+                    pass
+
+                key_hex = os.getenv("PHANTOM_REC_AES_KEY_HEX", "").strip()
+                if key_hex:
+                    try:
+                        kb = bytes.fromhex(key_hex)
+                        if len(kb) == 32:
+                            key_candidates.append(kb)
+                    except Exception:
+                        pass
+
+                key_candidates.append(_REC_DEMO_KEY)
+
+                wav_bytes = None
+                rec_err = None
+                for k in key_candidates:
+                    try:
+                        wav_bytes = _rec_decrypt_raw(raw, k)
+                        rec_err = None
+                        break
+                    except Exception as e:
+                        rec_err = e
+
+                if wav_bytes is None:
+                    self._dec_log_msg(f"✗  DECRYPT ERROR: {rec_err}")
+                    self.after(0, lambda: self._dec_status.configure(
+                        text=f"Error: {rec_err}", text_color=C_RED))
+                    self.after(0, lambda: self._dec_btn.configure(state="normal"))
+                    return
+
+                stem = Path(bin_p).stem
+                out_file = Path(out_d) / f"{stem}.wav"
+                with open(out_file, "wb") as wf:
+                    wf.write(wav_bytes)
+
+                self._dec_log_msg(f"  Decrypted REC RAW -> {out_file.name} ({len(wav_bytes):,} bytes)")
+                self.after(0, lambda: self._dec_status.configure(
+                    text="Done — 1 file(s) decrypted", text_color=C_GREEN))
+                self.after(0, lambda p=out_file: self._update_dec_result_info(p, [p]))
+                self.after(0, lambda: self._dec_btn.configure(state="normal"))
+                self._app._show_toast("✓  Decrypt: 1 file(s) done")
+                return
 
             k_aes, k_hmac, k_chacha = _phtm_derive(master)
             h_chacha = hashlib.sha256(k_chacha).hexdigest()
@@ -2594,3 +2723,5 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+
+
