@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Phantom Dual Equal Firmware — APSTA + SD File Relay + MIC Recorder + AES-GCM .bin Sync
  * Dung chung cho ca Phantom-1 va Phantom-2.
  *
@@ -65,11 +65,7 @@
 #error "NODE_ID must be 1 or 2"
 #endif
 
-#if NODE_ID == 2
-#define SYNC_INITIATOR 1
-#else
 #define SYNC_INITIATOR 0
-#endif
 
 #if NODE_ID == 2
 #define MIC_RECORD_ENABLED 1
@@ -107,7 +103,7 @@
 #define MIC_I2S_READ_LEN 1024
 
 // ── Auto trigger record ───────────────────────────────────────
-#define AUTO_RECORD_MS 30000UL
+#define AUTO_RECORD_MS 10000UL
 
 // ── Human voice trigger tuning ────────────────────────────────
 // FIX nhẹ CPU: Trigger ghi âm CHỈ theo peak14.
@@ -116,7 +112,7 @@
 
 // Nguong peak14 dung chung cho hai node de vai tro va logic giong nhau.
 // Neu moi truong qua on, tang len 4000-6000; neu kho bat tieng, ha xuong 1500-2500.
-#define MIC_TRIGGER_PEAK14_LEVEL 2000
+#define MIC_TRIGGER_PEAK14_LEVEL 15000
 
 // Các define cũ giữ lại để tránh lỗi tham chiếu, nhưng KHÔNG dùng để trigger nữa.
 // Các define cũ đã bỏ khỏi logic trigger để tiết kiệm CPU.
@@ -126,9 +122,6 @@
 #define REC_LOG_INTERVAL_MS 2000UL // giảm log khi đang ghi: 1s -> 5s
 
 // Keep legacy defines to avoid accidental references breaking build
-#define MIC_TRIGGER_LEVEL 5000
-#define MIC_REARM_LEVEL 3000
-
 // ── SD card ───────────────────────────────────────────────────
 #define SD_CS 5
 #define SD_SCK 18
@@ -189,6 +182,7 @@ size_t httpUploadSize = 0;
 bool httpUploadOk = false;
 String httpUploadError = "none";
 bool httpUploadInProgress = false;
+unsigned long lastPeerRegisterMs = 0;
 
 // ── Function prototypes ───────────────────────────────────────
 bool setupSDCard();
@@ -214,6 +208,10 @@ MicVoiceStats readMicVoiceStats();
 bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_MS);
 void handleAutoMicRecord();
 void syncMicCounterFromSd();
+bool ensureStaConnectedToPeerAP();
+bool announceStaIpToPeer();
+bool uploadFileToPeer8081(const String &localPath, const String &saveName);
+bool uploadMissingLocalRecBinsToPeer();
 bool verifyPeerHasLocalFile(const String &localPath);
 bool verifyPeerHasAllLocalRecFiles();
 bool verifyBidirectionalRecBinSync();
@@ -741,44 +739,6 @@ bool sdSaveAs(const uint8_t *buf, size_t size, const String &path)
     Serial.printf("[SD] SaveAs '%s' %d/%d -> OK\n", path.c_str(), wr, size);
   }
   return ok;
-}
-
-bool sdLoadToRam()
-{
-  if (!sdHasFile())
-    return false;
-  File f = SD.open(AUDIO_WAV_PATH, "r");
-  if (!f)
-    return false;
-
-  size_t sz = f.size();
-  if (sz == 0 || sz > 2000000)
-  {
-    f.close();
-    return false;
-  }
-
-  if (ramBuf)
-  {
-    free(ramBuf);
-    ramBuf = nullptr;
-    ramSize = 0;
-  }
-
-  ramBuf = (uint8_t *)malloc(sz);
-  if (!ramBuf)
-  {
-    f.close();
-    Serial.println("[SD] OOM loading to RAM");
-    return false;
-  }
-
-  size_t rd = f.read(ramBuf, sz);
-  f.close();
-  ramSize = rd;
-  ramReady = (rd >= 44);
-  Serial.printf("[SD] Load %d bytes to RAM -> %s\n", rd, ramReady ? "OK" : "FAIL");
-  return ramReady;
 }
 
 // ── AES-GCM file encryption ───────────────────────────────────
@@ -1800,6 +1760,10 @@ int countSdFiles()
 // ── AP restore ────────────────────────────────────────────────
 void restoreMyAP()
 {
+#if NODE_ID == 2
+  ensureStaConnectedToPeerAP();
+  announceStaIpToPeer();
+#else
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
@@ -1811,12 +1775,12 @@ void restoreMyAP()
   WiFi.softAPConfig(apIP, gw, sn);
   WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
 
+  Serial.printf("[WiFi] %s AP restored max_clients=%d clients=%d\n", MY_AP_SSID,
+                MY_AP_MAX_CON, WiFi.softAPgetStationNum());
+#endif
   server.begin();
   audioServer.begin();
   uploadServer.begin();
-
-  Serial.printf("[WiFi] %s AP restored max_clients=%d clients=%d\n", MY_AP_SSID,
-                MY_AP_MAX_CON, WiFi.softAPgetStationNum());
 }
 
 // ── Debug WiFi scan trước khi connect peer ─────────────────────
@@ -3136,15 +3100,16 @@ void markLocalFileChanged(const String &reason)
 
   if (!SYNC_INITIATOR)
   {
-    syncPending = false;
-    syncPendingReason = "none";
+    syncPending = true;
+    syncPendingReason = reason;
+    syncPendingNotBeforeMs = millis();
     prioritySyncFailCount = 0;
     syncDone = false;
     syncFailed = false;
-    syncMsg = "local saved on Phantom-2; waiting Phantom-2 sync trigger";
-    micArmed = true;
+    syncMsg = "pending upload-to-Phantom-1: " + reason;
+    micArmed = false;
     lastMicTriggerMs = millis();
-    Serial.println("[PrioritySync] Passive node: keep local file, wait for Phantom-2 trigger");
+    Serial.println("[PrioritySync] Node-2 pending upload missing BIN to Phantom-1");
     return;
   }
 
@@ -3337,7 +3302,40 @@ bool requestPeerPullSync(bool requestBackSync)
 void handlePrioritySync()
 {
   if (!SYNC_INITIATOR)
+  {
+#if NODE_ID == 2
+    if (!syncPending)
+      return;
+    if ((long)(syncPendingNotBeforeMs - millis()) > 0)
+      return;
+    if (recordingInProgress || syncInProgress || peerSyncRequestInProgress || httpUploadInProgress)
+      return;
+    if (millis() - lastPrioritySyncAttemptMs < 2000UL)
+      return;
+    lastPrioritySyncAttemptMs = millis();
+
+    bool ok = uploadMissingLocalRecBinsToPeer();
+    if (ok)
+    {
+      syncPending = false;
+      syncPendingReason = "none";
+      syncDone = true;
+      syncFailed = false;
+      syncMsg = "ok: uploaded missing BIN to Phantom-1";
+      micArmed = true;
+      lastMicTriggerMs = millis();
+    }
+    else
+    {
+      syncDone = false;
+      syncFailed = true;
+      syncMsg = "peer offline/unreachable: continue recording, retry later";
+      micArmed = true;
+      syncPendingNotBeforeMs = millis() + 5000UL;
+    }
+#endif
     return;
+  }
 
   if (!syncPending)
     return;
@@ -3808,6 +3806,226 @@ void handleRawTCP(WiFiClient &client)
 }
 
 // ── Setup ─────────────────────────────────────────────────────
+bool ensureStaConnectedToPeerAP()
+{
+  if (WiFi.status() == WL_CONNECTED)
+    return true;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(PEER_SSID, PEER_PASSWORD);
+  Serial.printf("[WiFi] STA connect -> %s\n", PEER_SSID);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 40)
+  {
+    delay(200);
+    retries++;
+    server.handleClient();
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.printf("[WiFi] STA connected, ip=%s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+
+  Serial.println("[WiFi] STA connect failed");
+  return false;
+}
+
+bool announceStaIpToPeer()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  WiFiClient c;
+  if (!c.connect(PEER_IP, PEER_HTTP_PORT))
+    return false;
+
+  String ip = WiFi.localIP().toString();
+  String body = "ip=" + ip;
+  c.printf("POST /peer/register HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+           PEER_IP, (int)body.length(), body.c_str());
+
+  unsigned long t = millis();
+  String resp = "";
+  while ((c.connected() || c.available()) && (millis() - t) < 5000)
+  {
+    if (c.available())
+    {
+      resp += (char)c.read();
+      t = millis();
+    }
+    else
+    {
+      delay(2);
+    }
+  }
+  c.stop();
+
+  bool ok = (resp.indexOf(" 200 ") >= 0 || resp.indexOf("\"status\":\"ok\"") >= 0);
+  if (ok)
+  {
+    lastPeerRegisterMs = millis();
+    Serial.printf("[PeerReg] Sent STA IP to Phantom-1: %s\n", ip.c_str());
+  }
+  return ok;
+}
+
+bool uploadFileToPeer8081(const String &localPath, const String &saveName)
+{
+  if (!SD.exists(localPath))
+    return false;
+
+  File f = SD.open(localPath, "r");
+  if (!f || f.isDirectory())
+  {
+    if (f)
+      f.close();
+    return false;
+  }
+
+  size_t total = f.size();
+  if (!isValidEncSize(total))
+  {
+    f.close();
+    return false;
+  }
+
+  WiFiClient c;
+  if (!c.connect(PEER_IP, UPLOAD_PORT))
+  {
+    f.close();
+    return false;
+  }
+
+  c.printf("POST / HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nX-Filename: %s\r\nConnection: close\r\n\r\n",
+           PEER_IP, (int)total, saveName.c_str());
+
+  uint8_t buf[1024];
+  size_t sent = 0;
+  unsigned long t = millis();
+  while (sent < total && c.connected() && (millis() - t) < 30000)
+  {
+    size_t rd = f.read(buf, min((size_t)1024, total - sent));
+    if (rd == 0)
+      break;
+    size_t wr = c.write(buf, rd);
+    if (wr != rd)
+      break;
+    sent += wr;
+    t = millis();
+    delay(1);
+  }
+  f.close();
+
+  String resp = "";
+  t = millis();
+  while ((c.connected() || c.available()) && (millis() - t) < 7000)
+  {
+    if (c.available())
+    {
+      resp += (char)c.read();
+      t = millis();
+    }
+    else
+    {
+      delay(2);
+    }
+  }
+  c.stop();
+
+  bool ok = (sent == total &&
+             (resp.indexOf(" 200 ") >= 0 || resp.indexOf("\"status\":\"ok\"") >= 0) &&
+             resp.indexOf("\"sd_saved\":true") >= 0);
+  Serial.printf("[Node2Push] upload '%s' -> sent=%lu/%lu %s\n",
+                saveName.c_str(), (unsigned long)sent, (unsigned long)total, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+bool uploadMissingLocalRecBinsToPeer()
+{
+  if (!sdReady)
+    return false;
+  if (!ensureStaConnectedToPeerAP())
+  {
+    Serial.println("[Node2Push] WiFi to Phantom-1 unavailable");
+    return false;
+  }
+
+  String listJson = httpGetFromPeer("/file/list", 6000);
+  bool listAvailable = (listJson.length() > 0 && listJson.indexOf("\"files\"") >= 0);
+  if (!listAvailable)
+    Serial.println("[Node2Push] Peer /file/list unavailable -> fallback upload all local BIN");
+  else if (listJson.indexOf("\"files\":[]") >= 0 || listJson.indexOf("\"count\":0") >= 0)
+    Serial.println("[Node2Push] Peer /file/list empty -> upload all local BIN");
+
+  if (!SD.exists("/rec"))
+    return true;
+
+  File root = SD.open("/rec");
+  if (!root || !root.isDirectory())
+  {
+    if (root)
+      root.close();
+    return false;
+  }
+
+  int uploaded = 0;
+  int skipped = 0;
+  int failed = 0;
+
+  File f = root.openNextFile();
+  while (f)
+  {
+    if (!f.isDirectory())
+    {
+      String fullPath = normalizeRecPath(String(f.name()));
+      size_t localSize = f.size();
+
+      String base = fullPath;
+      int slash = base.lastIndexOf('/');
+      if (slash >= 0)
+        base = base.substring(slash + 1);
+
+      bool okType = isRecEncPath(fullPath) && isValidEncSize(localSize);
+      if (!okType)
+      {
+        skipped++;
+        f.close();
+        f = root.openNextFile();
+        continue;
+      }
+
+      long remoteSize = listAvailable ? extractFileSizeFromListJson(listJson, base) : -1;
+      if (listAvailable && remoteSize == (long)localSize)
+      {
+        skipped++;
+      }
+      else
+      {
+        bool upOk = uploadFileToPeer8081(fullPath, base);
+        if (upOk)
+          uploaded++;
+        else
+          failed++;
+      }
+    }
+
+    f.close();
+    f = root.openNextFile();
+    server.handleClient();
+    delay(1);
+  }
+  root.close();
+
+  announceStaIpToPeer();
+
+  Serial.printf("[Node2Push] done uploaded=%d skipped=%d failed=%d\n", uploaded, skipped, failed);
+  return failed == 0;
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -3834,19 +4052,23 @@ void setup()
     syncMicCounterFromSd();
   }
 
-  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
-
+#if NODE_ID == 2
+  ensureStaConnectedToPeerAP();
+  announceStaIpToPeer();
+  delay(200);
+  Serial.printf("[STA] Connected to %s, local IP: %s\n", PEER_SSID, WiFi.localIP().toString().c_str());
+#else
+  WiFi.mode(WIFI_AP_STA);
   IPAddress apIP;
   apIP.fromString(MY_AP_IP_STR);
   IPAddress gw = apIP;
   IPAddress sn(255, 255, 255, 0);
-
   WiFi.softAPConfig(apIP, gw, sn);
   WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
-
   delay(200);
   Serial.printf("[AP] SSID: %s  IP: %s  max_clients=%d\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str(), MY_AP_MAX_CON);
+#endif
   digitalWrite(LED_PIN, HIGH);
 
   const char *collectHeaders[] = {"X-Filename", "Content-Length", "Content-Type"};
@@ -3895,7 +4117,12 @@ void setup()
   syncMsg = "ready: priority sync after any local file write";
 
   Serial.printf("\n[Ready] %s endpoints:\n", MY_AP_SSID);
+#if NODE_ID == 2
+  Serial.printf("  STA: %s / %s\n", PEER_SSID, PEER_PASSWORD);
+  Serial.printf("  STA IP: %s\n", WiFi.localIP().toString().c_str());
+#else
   Serial.printf("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
+#endif
   Serial.printf("  GET  http://%s/status\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/list\n", MY_AP_IP_STR);
   Serial.printf("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
@@ -3909,6 +4136,16 @@ void setup()
 void loop()
 {
   server.handleClient();
+#if NODE_ID == 2
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    ensureStaConnectedToPeerAP();
+  }
+  if (WiFi.status() == WL_CONNECTED && (millis() - lastPeerRegisterMs > 10000UL))
+  {
+    announceStaIpToPeer();
+  }
+#endif
 
   // Peer sync request co uu tien cao nhat: neu peer yeu cau sync trong luc dang ghi,
   // thiet bi se dung ghi -> ma hoa -> chay sync truoc khi nghe mic tiep.

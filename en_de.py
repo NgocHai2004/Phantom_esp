@@ -549,8 +549,8 @@ def _attach_hover(btn: ctk.CTkButton):
 
 def pill(parent, text, color, tint):
     f = ctk.CTkFrame(parent, fg_color=tint, corner_radius=10, border_width=0)
-    ctk.CTkLabel(f, text=text, font=_mono(9, "bold"),
-                 text_color=color, padx=6, pady=2).pack()
+    ctk.CTkLabel(f, text=text, font=_mono(8, "bold"),
+                 text_color=color, padx=4, pady=1).pack()
     return f
 
 # legacy alias
@@ -702,10 +702,10 @@ class EncryptPage(ctk.CTkFrame):
         self._dz_icon  = ctk.CTkLabel(dz_inner, text="📄", font=_font(12))
         self._dz_icon.pack(side="left", padx=(0, 4))
         self._dz_title = ctk.CTkLabel(dz_inner, text="Drop files here",
-                                      font=_font(10, "bold"), text_color=C_TEXT2)
+                                      font=_font(9, "bold"), text_color=C_TEXT2)
         self._dz_title.pack(side="left")
         self._dz_sub   = ctk.CTkLabel(dz_inner, text="or click 'Add' to select files",
-                                      font=_font(9), text_color=C_TEXT3)
+                                      font=_font(8), text_color=C_TEXT3)
         # self._dz_sub hidden
         for w in (self._dz, dz_inner, self._dz_icon, self._dz_title, self._dz_sub):
             w.bind("<Button-1>", _dz_browse)
@@ -754,7 +754,7 @@ class EncryptPage(ctk.CTkFrame):
         self._kz_icon  = ctk.CTkLabel(kz_inner, text="🔑", font=_font(12))
         self._kz_icon.pack(side="left", padx=(0, 4))
         self._kz_title = ctk.CTkLabel(kz_inner, text="Click to load key",
-                                      font=_font(10, "bold"), text_color=C_TEXT3)
+                                      font=_font(9, "bold"), text_color=C_TEXT3)
         self._kz_title.pack(side="left")
         for w in (self._kz, kz_inner, self._kz_icon, self._kz_title):
             w.bind("<Button-1>", _kz_browse)
@@ -869,9 +869,9 @@ class EncryptPage(ctk.CTkFrame):
     def _build_content(self, parent):
         # Split content into left (engine) and right (phantom files) panes
         parent.grid_rowconfigure(1, weight=1)
-        parent.grid_columnconfigure(0, weight=3)
+        parent.grid_columnconfigure(0, weight=5)
         parent.grid_columnconfigure(1, weight=0)
-        parent.grid_columnconfigure(2, weight=2)
+        parent.grid_columnconfigure(2, weight=1)
 
         # Sub-toolbar — spans full width
         hdr = ctk.CTkFrame(parent, fg_color=C_SURFACE, height=32, corner_radius=0)
@@ -909,77 +909,80 @@ class EncryptPage(ctk.CTkFrame):
             ("L3", "STR",  "Encryption Layer 3", "Third pass",   C_BLUE, "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
-        lf.pack(fill="x", pady=(0, 6))
+        lf.pack(fill="x", pady=(0, 1))
         lf.grid_columnconfigure((0, 1, 2), weight=1)
 
         self._layer_cards = []
         for col, (lnum, lshort, algo, desc, color, tint) in enumerate(_LAYERS):
-            card = ctk.CTkFrame(lf, fg_color=C_CARD, corner_radius=8,
+            card = ctk.CTkFrame(lf, fg_color=C_CARD, corner_radius=5,
                                 border_color=C_BORDER, border_width=2)
             card.grid(row=0, column=col, sticky="nsew",
-                      padx=(0 if col == 0 else 6, 0))
+                      padx=(0 if col == 0 else 2, 0))
 
             top = ctk.CTkFrame(card, fg_color="transparent")
-            top.pack(fill="x", padx=8, pady=(8, 2))
+            top.pack(fill="x", padx=2, pady=(1, 0))
             pill(top, lnum, color, tint).pack(side="left", padx=(0, 3))
             pill(top, lshort, color, tint).pack(side="left")
-            dot = ctk.CTkLabel(top, text="●", font=_font(9), text_color=C_TEXT3)
+            dot = ctk.CTkLabel(top, text="●", font=_font(7), text_color=C_TEXT3)
             dot.pack(side="right")
 
-            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(11, "bold"),
+            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(8, "bold"),
                                      text_color=C_TEXT)
-            title_lbl.pack(anchor="w", padx=8, pady=(2, 1))
-            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(9),
+            title_lbl.pack(anchor="w", padx=3, pady=(0, 0))
+            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(6),
                                     text_color=C_TEXT2)
-            desc_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+            desc_lbl.pack_forget()
 
             hash_f = ctk.CTkFrame(card, fg_color=C_SURFACE, corner_radius=4)
-            hash_f.pack(fill="x", padx=8, pady=(0, 4))
+            hash_f.pack(fill="x", padx=2, pady=(0, 1))
             hash_lbl = ctk.CTkLabel(hash_f, text="HASH ——",
-                                    font=_mono(9), text_color=C_TEXT3,
+                                    font=_mono(7), text_color=C_TEXT3,
                                     anchor="w", justify="left")
-            hash_lbl.pack(fill="x", padx=6, pady=3)
+            hash_lbl.pack(fill="x", padx=2, pady=0)
 
-            bar = ctk.CTkProgressBar(card, mode="determinate", height=3,
+            bar = ctk.CTkProgressBar(card, mode="determinate", height=2,
                                      progress_color=color, fg_color=C_BORDER,
                                      corner_radius=2)
             bar.set(0)
-            bar.pack(fill="x", padx=8, pady=(0, 2))
+            bar.pack(fill="x", padx=2, pady=(0, 1))
+            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x", padx=2, pady=(0, 1))
 
-            pct = ctk.CTkLabel(card, text="0 %", font=_font(14, "bold"),
+            pct = ctk.CTkLabel(card, text="0 %", font=_font(9, "bold"),
                                text_color=color, anchor="e")
-            pct.pack(fill="x", padx=8, pady=(0, 6))
+            pct.pack(fill="x", padx=2, pady=(0, 1))
+            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x", padx=2, pady=(0, 1))
 
             self._layer_cards.append((card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl))
 
         # ── Overall progress ──────────────────────────────────────────────────
         op = ctk.CTkFrame(inner, fg_color="transparent")
-        op.pack(fill="x", pady=(0, 2))
+        op.pack(fill="x", pady=(0, 1))
         ctk.CTkLabel(op, text="OVERALL PROGRESS",
-                     font=_font(9), text_color=C_TEXT2).pack(side="left")
+                     font=_font(8), text_color=C_TEXT2).pack(side="left")
         self._enc_pct2 = ctk.CTkLabel(op, text="0 %",
-                                      font=_font(11, "bold"), text_color=C_TEXT)
+                                      font=_font(9, "bold"), text_color=C_TEXT)
         self._enc_pct2.pack(side="right")
 
         self._enc_bar2 = ctk.CTkProgressBar(inner, mode="determinate",
-                                            height=3, corner_radius=2,
+                                            height=2, corner_radius=2,
                                             progress_color=C_BLUE, fg_color=C_BORDER)
         self._enc_bar2.set(0)
-        self._enc_bar2.pack(fill="x", pady=(0, 6))
+        self._enc_bar2.pack(fill="x", pady=(0, 4))
 
         # ── Terminal log ──────────────────────────────────────────────────────
         log_hdr = ctk.CTkFrame(inner, fg_color="transparent")
         log_hdr.pack(fill="x", pady=(0, 4))
 
         ctk.CTkLabel(log_hdr, text="TERMINAL OUTPUT",
-                     font=_font(10, "bold"), text_color=C_TEXT2).pack(side="left")
+                     font=_font(11, "bold"), text_color=C_TEXT2).pack(side="left")
         tg_btn(log_hdr, "CLR", self._clear_log,
                style="ghost", height=20, width=40,
                font=_font(9), corner_radius=10).pack(side="right")
 
         self.log = ctk.CTkTextbox(
             inner,
-            fg_color=C_SURFACE, text_color=C_TEXT, font=_mono(11),
+            fg_color=C_SURFACE, text_color=C_TEXT, font=_mono(12),
+            height=520,
             corner_radius=8, border_color=C_BORDER, border_width=2,
             wrap="word",
             scrollbar_button_color=C_BORDER,
@@ -1038,7 +1041,7 @@ class EncryptPage(ctk.CTkFrame):
             r.pack(fill="x", padx=14, pady=2)
             ctk.CTkLabel(r, text=key, font=_font(10), text_color=C_TEXT3,
                          width=72, anchor="w").pack(side="left")
-            ctk.CTkLabel(r, text=val, font=_font(10, "bold"), text_color=val_color,
+            ctk.CTkLabel(r, text=val, font=_font(9, "bold"), text_color=val_color,
                          anchor="w").pack(side="left", fill="x", expand=True)
 
         _row("Kind:",     "PHANTOM Bundle")
@@ -1783,7 +1786,7 @@ class DecryptPage(ctk.CTkFrame):
         self._bz_icon  = ctk.CTkLabel(bz_inner, text="📦", font=_font(12))
         self._bz_icon.pack(side="left", padx=(0, 4))
         self._bz_title = ctk.CTkLabel(bz_inner, text="Click to select .bin file",
-                                      font=_font(10, "bold"), text_color=C_TEXT2)
+                                      font=_font(9, "bold"), text_color=C_TEXT2)
         self._bz_title.pack(side="left")
         for w in (self._bz, bz_inner, self._bz_icon, self._bz_title):
             w.bind("<Button-1>", _bz_browse)
@@ -1926,78 +1929,81 @@ class DecryptPage(ctk.CTkFrame):
             ("L3", "FIN",  "Decryption Layer 3", "Third pass",   C_BLUE, "#EBF1FF"),
         ]
         lf = ctk.CTkFrame(inner, fg_color="transparent")
-        lf.pack(fill="x", pady=(0, 6))
+        lf.pack(fill="x", pady=(0, 1))
         lf.grid_columnconfigure((0, 1, 2), weight=1)
 
         self._layer_cards = []
         for col, (lnum, lshort, algo, desc, color, tint) in enumerate(_LAYERS):
-            card = ctk.CTkFrame(lf, fg_color=C_CARD, corner_radius=8,
+            card = ctk.CTkFrame(lf, fg_color=C_CARD, corner_radius=5,
                                 border_color=C_BORDER, border_width=2)
             card.grid(row=0, column=col, sticky="nsew",
-                      padx=(0 if col == 0 else 6, 0))
+                      padx=(0 if col == 0 else 2, 0))
 
             # Top row: pill badges + status dot
             top = ctk.CTkFrame(card, fg_color="transparent")
-            top.pack(fill="x", padx=8, pady=(8, 2))
+            top.pack(fill="x", padx=2, pady=(1, 0))
             pill(top, lnum, color, tint).pack(side="left", padx=(0, 3))
             pill(top, lshort, color, tint).pack(side="left")
-            dot = ctk.CTkLabel(top, text="●", font=_font(9), text_color=C_TEXT3)
+            dot = ctk.CTkLabel(top, text="●", font=_font(7), text_color=C_TEXT3)
             dot.pack(side="right")
 
-            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(11, "bold"),
+            title_lbl = ctk.CTkLabel(card, text=algo, font=_font(8, "bold"),
                                      text_color=C_TEXT)
-            title_lbl.pack(anchor="w", padx=8, pady=(2, 1))
-            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(9),
+            title_lbl.pack(anchor="w", padx=3, pady=(0, 0))
+            desc_lbl = ctk.CTkLabel(card, text=desc, font=_font(6),
                                     text_color=C_TEXT2)
-            desc_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+            desc_lbl.pack_forget()
 
             # Hash display box
             hash_f = ctk.CTkFrame(card, fg_color=C_SURFACE, corner_radius=4)
-            hash_f.pack(fill="x", padx=8, pady=(0, 4))
+            hash_f.pack(fill="x", padx=2, pady=(0, 1))
             hash_lbl = ctk.CTkLabel(hash_f, text="HASH ——",
-                                    font=_mono(9), text_color=C_TEXT3,
+                                    font=_mono(7), text_color=C_TEXT3,
                                     anchor="w", justify="left")
-            hash_lbl.pack(fill="x", padx=6, pady=3)
+            hash_lbl.pack(fill="x", padx=2, pady=0)
 
-            bar = ctk.CTkProgressBar(card, mode="determinate", height=3,
+            bar = ctk.CTkProgressBar(card, mode="determinate", height=2,
                                      progress_color=color, fg_color=C_BORDER,
                                      corner_radius=2)
             bar.set(0)
-            bar.pack(fill="x", padx=8, pady=(0, 2))
+            bar.pack(fill="x", padx=2, pady=(0, 1))
+            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x", padx=2, pady=(0, 1))
 
-            pct = ctk.CTkLabel(card, text="0 %", font=_font(14, "bold"),
+            pct = ctk.CTkLabel(card, text="0 %", font=_font(9, "bold"),
                                text_color=color, anchor="e")
-            pct.pack(fill="x", padx=8, pady=(0, 6))
+            pct.pack(fill="x", padx=2, pady=(0, 1))
+            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(fill="x", padx=2, pady=(0, 1))
 
             self._layer_cards.append((card, hash_lbl, bar, pct, dot, color, title_lbl, desc_lbl))
 
         # ── Overall progress ──────────────────────────────────────────────────
         op = ctk.CTkFrame(inner, fg_color="transparent")
-        op.pack(fill="x", pady=(0, 2))
+        op.pack(fill="x", pady=(0, 1))
         ctk.CTkLabel(op, text="OVERALL PROGRESS",
-                     font=_font(9), text_color=C_TEXT2).pack(side="left")
+                     font=_font(8), text_color=C_TEXT2).pack(side="left")
         self._dec_pct2 = ctk.CTkLabel(op, text="0 %",
-                                      font=_font(11, "bold"), text_color=C_TEXT)
+                                      font=_font(9, "bold"), text_color=C_TEXT)
         self._dec_pct2.pack(side="right")
 
         self._dec_bar2 = ctk.CTkProgressBar(inner, mode="determinate",
-                                            height=3, corner_radius=2,
+                                            height=2, corner_radius=2,
                                             progress_color=C_BLUE, fg_color=C_BORDER)
         self._dec_bar2.set(0)
-        self._dec_bar2.pack(fill="x", pady=(0, 6))
+        self._dec_bar2.pack(fill="x", pady=(0, 4))
 
         # ── Terminal log ──────────────────────────────────────────────────────
         log_hdr = ctk.CTkFrame(inner, fg_color="transparent")
         log_hdr.pack(fill="x", pady=(0, 4))
         ctk.CTkLabel(log_hdr, text="TERMINAL OUTPUT",
-                     font=_font(10, "bold"), text_color=C_TEXT2).pack(side="left")
+                     font=_font(11, "bold"), text_color=C_TEXT2).pack(side="left")
         tg_btn(log_hdr, "CLR", self._dec_clear_log,
                style="ghost", height=20, width=40,
                font=_font(9), corner_radius=10).pack(side="right")
 
         self._dec_log = ctk.CTkTextbox(
             inner,
-            fg_color=C_SURFACE, text_color=C_TEXT, font=_mono(11),
+            fg_color=C_SURFACE, text_color=C_TEXT, font=_mono(12),
+            height=520,
             corner_radius=8, border_color=C_BORDER, border_width=2,
             wrap="word",
             scrollbar_button_color=C_BORDER,
@@ -2655,7 +2661,7 @@ class App(ctk.CTk):
         ctk.CTkFrame(enc_hdr, fg_color=C_BLUE, width=3, height=22,
                      corner_radius=0).pack(side="left")
         ctk.CTkLabel(enc_hdr, text="\U0001f512  Encrypt",
-                     font=_font(10, "bold"), text_color=C_TEXT,
+                     font=_font(9, "bold"), text_color=C_TEXT,
                      anchor="w").pack(side="left", padx=6)
 
         # Enc controls
@@ -2674,7 +2680,7 @@ class App(ctk.CTk):
         ctk.CTkFrame(dec_hdr, fg_color=C_TEAL, width=3, height=22,
                      corner_radius=0).pack(side="left")
         ctk.CTkLabel(dec_hdr, text="\U0001f513  Decrypt",
-                     font=_font(10, "bold"), text_color=C_TEXT,
+                     font=_font(9, "bold"), text_color=C_TEXT,
                      anchor="w").pack(side="left", padx=6)
 
         # Dec controls
@@ -2718,5 +2724,9 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+
+
+
+
 
 
