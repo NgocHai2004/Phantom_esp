@@ -104,6 +104,7 @@
 
 // ── Auto trigger record ───────────────────────────────────────
 #define AUTO_RECORD_MS 10000UL
+#define NODE2_SYNC_CHECK_INTERVAL_MS 60000UL
 
 // ── Human voice trigger tuning ────────────────────────────────
 // FIX nhẹ CPU: Trigger ghi âm CHỈ theo peak14.
@@ -173,6 +174,8 @@ bool lastPriorityFailPeerNotFound = false;
 // finalize WAV -> mã hóa .bin, rồi chạy sync ngay sau khi recordingInProgress=false.
 bool stopRecordingForSyncRequested = false;
 bool peerSyncQueuedByRequest = false;
+bool node2SyncUploadRequested = false;
+unsigned long lastNode2SyncCheckMs = 0;
 
 // HTTP multipart upload state for /file/upload
 File httpUploadFile;
@@ -207,6 +210,7 @@ struct MicVoiceStats;
 MicVoiceStats readMicVoiceStats();
 bool recordTriggeredWavToSD(const char *path, uint32_t durationMs = AUTO_RECORD_MS);
 void handleAutoMicRecord();
+void handleNode2PeriodicSyncCheck();
 void syncMicCounterFromSd();
 bool ensureStaConnectedToPeerAP();
 bool announceStaIpToPeer();
@@ -412,6 +416,50 @@ String genAutoFilename()
   char buf[24];
   snprintf(buf, sizeof(buf), "file_%04d.bin", _fileCounter);
   return String(buf);
+}
+
+String resolveRecUploadPathBySize(const String &requestedName, size_t incomingSize, String &resolvedSaveAs)
+{
+  String safe = sanitizeFilename(requestedName);
+  if (safe.length() == 0)
+    safe = genAutoFilename();
+
+  int dot = safe.lastIndexOf('.');
+  String base = (dot > 0) ? safe.substring(0, dot) : safe;
+  String ext = (dot > 0) ? safe.substring(dot) : ".bin";
+  if (ext.length() == 0)
+    ext = ".bin";
+
+  String candidate = safe;
+  for (uint16_t idx = 0; idx < 10000; idx++)
+  {
+    if (idx > 0)
+      candidate = base + "[" + String(idx) + "]" + ext;
+
+    String path = "/rec/" + candidate;
+    if (!SD.exists(path))
+    {
+      resolvedSaveAs = candidate;
+      return path;
+    }
+
+    size_t existingSize = 0;
+    File f = SD.open(path, "r");
+    if (f)
+    {
+      existingSize = f.size();
+      f.close();
+    }
+    if (incomingSize > 0 && existingSize == incomingSize)
+    {
+      resolvedSaveAs = candidate;
+      return path;
+    }
+  }
+
+  // Fallback an toan neu da cham nguong lap.
+  resolvedSaveAs = base + "[" + String((uint32_t)millis()) + "]" + ext;
+  return "/rec/" + resolvedSaveAs;
 }
 
 // ── SD helpers ────────────────────────────────────────────────
@@ -1126,6 +1174,29 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs)
     if (!nodeEnabled)
       break;
 
+#if NODE_ID == 2
+    // Yêu cầu: dù đang ghi hay đang chờ ngưỡng đều check Phantom-1 mỗi 1 phút.
+    // Khi đang ghi, loop() ngoài bị block nên check tại đây với cùng chu kỳ.
+    if (!stopRecordingForSyncRequested &&
+        (millis() - lastNode2SyncCheckMs >= NODE2_SYNC_CHECK_INTERVAL_MS))
+    {
+      lastNode2SyncCheckMs = millis();
+      bool peerFound = ensureStaConnectedToPeerAP();
+      if (peerFound)
+      {
+        stopRecordingForSyncRequested = true;
+        node2SyncUploadRequested = true;
+        micArmed = false;
+        syncMsg = "recording: Phantom-1 found (1m check), stop and upload missing BIN";
+        Serial.println("[MIC] 1m check while recording: Phantom-1 found -> stop recording for upload");
+      }
+      else
+      {
+        Serial.println("[MIC] 1m check while recording: Phantom-1 not found");
+      }
+    }
+#endif
+
     if (stopRecordingForSyncRequested)
     {
       Serial.println("[MIC] Stop requested by peer sync -> finalize current recording");
@@ -1293,8 +1364,8 @@ void handleAutoMicRecord()
       bool encOk = aesGcmEncryptFile(wavPath, encPath, true);
       if (encOk)
       {
-        Serial.println("[FLOW] Encrypt done -> priority peer sync");
-        markLocalFileChanged("mic encrypted record " + encPath);
+        Serial.println("[FLOW] Encrypt done");
+        // Mic record flow: chi ma hoa va luu SD, khong kick check/sync ngay sau ghi.
       }
       else
       {
@@ -2765,8 +2836,9 @@ void handleFileUploadStream()
       }
     }
 
+    size_t incomingSize = (upload.totalSize > 0) ? (size_t)upload.totalSize : 0;
+    httpUploadPath = resolveRecUploadPathBySize(saveAs, incomingSize, saveAs);
     httpUploadFilename = "rec/" + saveAs;
-    httpUploadPath = "/rec/" + saveAs;
 
     if (SD.exists(httpUploadPath))
       SD.remove(httpUploadPath);
@@ -3369,6 +3441,38 @@ void handlePrioritySync()
   micArmed = false;
 }
 
+void handleNode2PeriodicSyncCheck()
+{
+#if NODE_ID != 2
+  return;
+#else
+  if (!sdReady)
+    return;
+
+  if (millis() - lastNode2SyncCheckMs < NODE2_SYNC_CHECK_INTERVAL_MS)
+    return;
+  lastNode2SyncCheckMs = millis();
+
+  if (syncInProgress || peerSyncRequestInProgress || httpUploadInProgress)
+    return;
+
+  if (recordingInProgress)
+    return;
+
+  bool connected = ensureStaConnectedToPeerAP();
+  if (!connected)
+  {
+    syncMsg = "node2 check: Phantom-1 not found";
+    Serial.println("[Node2Sync] Check tick -> Phantom-1 not found");
+    return;
+  }
+
+  node2SyncUploadRequested = true;
+  syncMsg = "node2 check: Phantom-1 found, upload missing BIN";
+  Serial.println("[Node2Sync] Check tick -> Phantom-1 found, schedule upload");
+#endif
+}
+
 void handleAutoSync()
 {
   if (millis() - lastAutoSyncMs < AUTO_SYNC_INTERVAL_MS)
@@ -3546,7 +3650,7 @@ void handleRawUpload(WiFiClient &cli)
   if (!SD.exists("/rec"))
     SD.mkdir("/rec");
 
-  String path = "/rec/" + saveAs;
+  String path = resolveRecUploadPathBySize(saveAs, (size_t)clen, saveAs);
   if (SD.exists(path))
     SD.remove(path);
 
@@ -3999,7 +4103,9 @@ bool uploadMissingLocalRecBinsToPeer()
       }
 
       long remoteSize = listAvailable ? extractFileSizeFromListJson(listJson, base) : -1;
-      if (listAvailable && remoteSize == (long)localSize)
+      bool remoteMissing = (remoteSize < 0);
+      bool remoteSameSize = (!remoteMissing && remoteSize == (long)localSize);
+      if (listAvailable && remoteSameSize)
       {
         skipped++;
       }
@@ -4023,6 +4129,13 @@ bool uploadMissingLocalRecBinsToPeer()
   announceStaIpToPeer();
 
   Serial.printf("[Node2Push] done uploaded=%d skipped=%d failed=%d\n", uploaded, skipped, failed);
+  // Theo yeu cau: da vao duoc 1 phien ket noi/upload voi Phantom-1 thi xoa /rec,
+  // khong phu thuoc uploaded/skipped/failed.
+  uint32_t deleted = deleteAllFilesInRec();
+  micFileCounter = 0;
+  lastMicWavFile = "none";
+  Serial.printf("[Node2Push] Session done -> cleared /rec (%lu files), reset counter to 0\n",
+                (unsigned long)deleted);
   return failed == 0;
 }
 
@@ -4054,10 +4167,10 @@ void setup()
 
   WiFi.setSleep(false);
 #if NODE_ID == 2
-  ensureStaConnectedToPeerAP();
-  announceStaIpToPeer();
-  delay(200);
-  Serial.printf("[STA] Connected to %s, local IP: %s\n", PEER_SSID, WiFi.localIP().toString().c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false);
+  Serial.printf("[STA] Node2 periodic check mode for %s (interval=%lus)\n",
+                PEER_SSID, (unsigned long)(NODE2_SYNC_CHECK_INTERVAL_MS / 1000UL));
 #else
   WiFi.mode(WIFI_AP_STA);
   IPAddress apIP;
@@ -4137,13 +4250,26 @@ void loop()
 {
   server.handleClient();
 #if NODE_ID == 2
-  if (WiFi.status() != WL_CONNECTED)
+  handleNode2PeriodicSyncCheck();
+  if (node2SyncUploadRequested && !recordingInProgress && !syncInProgress && !peerSyncRequestInProgress && !httpUploadInProgress)
   {
-    ensureStaConnectedToPeerAP();
-  }
-  if (WiFi.status() == WL_CONNECTED && (millis() - lastPeerRegisterMs > 10000UL))
-  {
-    announceStaIpToPeer();
+    node2SyncUploadRequested = false;
+    micArmed = false;
+    bool ok = uploadMissingLocalRecBinsToPeer();
+    if (ok)
+    {
+      syncDone = true;
+      syncFailed = false;
+      syncMsg = "ok: uploaded missing BIN to Phantom-1";
+    }
+    else
+    {
+      syncDone = false;
+      syncFailed = true;
+      syncMsg = "node2 check: upload failed";
+    }
+    micArmed = true;
+    lastMicTriggerMs = millis();
   }
 #endif
 

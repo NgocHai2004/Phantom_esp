@@ -353,6 +353,50 @@ String genAutoFilename()
   return String(buf);
 }
 
+String resolveRecUploadPathBySize(const String &requestedName, size_t incomingSize, String &resolvedSaveAs)
+{
+  String safe = sanitizeFilename(requestedName);
+  if (safe.length() == 0)
+    safe = genAutoFilename();
+
+  int dot = safe.lastIndexOf('.');
+  String base = (dot > 0) ? safe.substring(0, dot) : safe;
+  String ext = (dot > 0) ? safe.substring(dot) : ".bin";
+  if (ext.length() == 0)
+    ext = ".bin";
+
+  String candidate = safe;
+  for (uint16_t idx = 0; idx < 10000; idx++)
+  {
+    if (idx > 0)
+      candidate = base + "[" + String(idx) + "]" + ext;
+
+    String path = "/rec/" + candidate;
+    if (!SD.exists(path))
+    {
+      resolvedSaveAs = candidate;
+      return path;
+    }
+
+    size_t existingSize = 0;
+    File f = SD.open(path, "r");
+    if (f)
+    {
+      existingSize = f.size();
+      f.close();
+    }
+    if (incomingSize > 0 && existingSize == incomingSize)
+    {
+      resolvedSaveAs = candidate;
+      return path;
+    }
+  }
+
+  // Fallback an toan neu da cham nguong lap.
+  resolvedSaveAs = base + "[" + String((uint32_t)millis()) + "]" + ext;
+  return "/rec/" + resolvedSaveAs;
+}
+
 // ── SD helpers ────────────────────────────────────────────────
 bool sdHasFile(const String &path = AUDIO_WAV_PATH) { return SD.exists(path); }
 
@@ -2025,8 +2069,9 @@ void handleFileUploadStream()
       }
     }
 
+    size_t incomingSize = (upload.totalSize > 0) ? (size_t)upload.totalSize : 0;
+    httpUploadPath = resolveRecUploadPathBySize(saveAs, incomingSize, saveAs);
     httpUploadFilename = "rec/" + saveAs;
-    httpUploadPath = "/rec/" + saveAs;
 
     if (SD.exists(httpUploadPath))
       SD.remove(httpUploadPath);
@@ -2670,7 +2715,7 @@ void handleRawUpload(WiFiClient &cli)
   if (!SD.exists("/rec"))
     SD.mkdir("/rec");
 
-  String path = "/rec/" + saveAs;
+  String path = resolveRecUploadPathBySize(saveAs, (size_t)clen, saveAs);
   if (SD.exists(path))
     SD.remove(path);
 
