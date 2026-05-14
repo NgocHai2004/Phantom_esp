@@ -44,25 +44,37 @@
 #include <mbedtls/gcm.h>
 #include <esp_system.h>
 #include "test_wav.h"
+#include "phantom_security.h"
+
+// Debug output — disabled in production builds (-DPHANTOM_DEBUG=0)
+#if PHANTOM_DEBUG
+  #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)  Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)
+  #define DBG_PRINTLN(...)
+  #define DBG_PRINTF(...)
+#endif
 
 // ── Cau hinh node doi xung ───────────────────────────────────
 #define NODE_ID 1
 
 #if NODE_ID == 1
-#define MY_AP_SSID "Phantom-1"
 #define MY_AP_CHANNEL 1
-#define MY_AP_IP_STR "192.168.4.1"
-#define PEER_SSID "Phantom-2"
-#define PEER_IP "192.168.5.1"
+#define _NODE_IS_1 1
 #elif NODE_ID == 2
-#define MY_AP_SSID "Phantom-2"
 #define MY_AP_CHANNEL 6
-#define MY_AP_IP_STR "192.168.5.1"
-#define PEER_SSID "Phantom-1"
-#define PEER_IP "192.168.4.1"
+#define _NODE_IS_1 0
 #else
 #error "NODE_ID must be 1 or 2"
 #endif
+
+// IP strings decoded at runtime
+static char g_ap_ip[12];
+static char g_peer_ip[12];
+#define MY_AP_IP_STR g_ap_ip
+#define PEER_IP      g_peer_ip
 
 #if NODE_ID == 2
 #define SYNC_INITIATOR 1
@@ -70,11 +82,18 @@
 #define SYNC_INITIATOR 0
 #endif
 
-#define MY_AP_PASSWORD "12345678"
+// WiFi credentials decoded at runtime — not stored as plaintext strings
+static char g_ap_ssid[10];
+static char g_peer_ssid[10];
+static char g_ap_pass[9];
+static char g_peer_pass[9];
+#define MY_AP_SSID   g_ap_ssid
+#define PEER_SSID    g_peer_ssid
+#define MY_AP_PASSWORD g_ap_pass
+#define PEER_PASSWORD  g_peer_pass
+
 #define MY_AP_HIDDEN false
 #define MY_AP_MAX_CON 4
-
-#define PEER_PASSWORD "12345678"
 #define PEER_HTTP_PORT 80
 
 #define LED_PIN 2
@@ -226,19 +245,19 @@ bool setupSDCard()
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, SPI))
   {
-    Serial.println("[SD] Initialization FAILED!");
+    DBG_PRINTLN("[SD] Initialization FAILED!");
     return false;
   }
 
   if (!SD.exists("/rec"))
   {
     if (SD.mkdir("/rec"))
-      Serial.println("[SD] Created /rec folder.");
+      DBG_PRINTLN("[SD] Created /rec folder.");
     else
-      Serial.println("[SD] WARNING: Cannot create /rec folder.");
+      DBG_PRINTLN("[SD] WARNING: Cannot create /rec folder.");
   }
 
-  Serial.println("[SD] Initialization OK.");
+  DBG_PRINTLN("[SD] Initialization OK.");
   return true;
 }
 
@@ -431,7 +450,7 @@ String normalizeRecPath(const String &pathIn)
   lowBase.toLowerCase();
   bool isRecAudio = ((lowBase.startsWith("rec") &&
                       (lowBase.endsWith(".wav") || lowBase.endsWith(".bin"))) ||
-                     (lowBase.startsWith("phantom_") && lowBase.endsWith(".bin")));
+                     (lowBase.startsWith("px_") && lowBase.endsWith(".bin")));
 
   if (isRecAudio)
     return "/rec/" + base;
@@ -465,7 +484,7 @@ bool isRecEncPath(const String &pathIn)
   base.toLowerCase();
   if (!base.endsWith(".bin"))
     return false;
-  return base.startsWith("rec") || base.startsWith("phantom_");
+  return base.startsWith("rec") || base.startsWith("px_");
 }
 
 bool isValidEncSize(size_t sz)
@@ -536,11 +555,11 @@ uint32_t cleanupZeroByteFilesRecursive(const char *dirPath, uint8_t depth)
       if (SD.remove(path))
       {
         deletedCount++;
-        Serial.printf("[BOOT CLEANUP] Delete 0KB file: %s\n", path.c_str());
+        DBG_PRINTF("[BOOT CLEANUP] Delete 0KB file: %s\n", path.c_str());
       }
       else
       {
-        Serial.printf("[BOOT CLEANUP] Cannot delete 0KB file: %s\n", path.c_str());
+        DBG_PRINTF("[BOOT CLEANUP] Cannot delete 0KB file: %s\n", path.c_str());
       }
     }
 
@@ -557,9 +576,9 @@ void cleanupAllZeroByteFilesOnBoot()
   if (!sdReady)
     return;
 
-  Serial.println("[BOOT CLEANUP] Scan SD for 0KB files...");
+  DBG_PRINTLN("[BOOT CLEANUP] Scan SD for 0KB files...");
   uint32_t deletedCount = cleanupZeroByteFilesRecursive("/", 0);
-  Serial.printf("[BOOT CLEANUP] Done. Deleted 0KB files: %lu\n", (unsigned long)deletedCount);
+  DBG_PRINTF("[BOOT CLEANUP] Done. Deleted 0KB files: %lu\n", (unsigned long)deletedCount);
 }
 
 // ── Cleanup file ghi âm lỗi: xóa .wav/.bin rỗng để không kẹt sync ──
@@ -601,24 +620,24 @@ void cleanupZeroByteRecFiles()
       if (sz >= RECOVER_WAV_MIN_SIZE)
       {
         String encPath = encryptedPathFromWavPath(norm);
-        Serial.printf("[RECOVER] Found WAV >=100KB, try encrypt: %s -> %s size=%lu\n",
+        DBG_PRINTF("[RECOVER] Found WAV >=100KB, try encrypt: %s -> %s size=%lu\n",
                       norm.c_str(), encPath.c_str(), (unsigned long)sz);
 
         bool encOk = aesGcmEncryptFile(norm, encPath, true);
         if (encOk)
         {
-          Serial.printf("[RECOVER] Encrypt OK: %s\n", encPath.c_str());
+          DBG_PRINTF("[RECOVER] Encrypt OK: %s\n", encPath.c_str());
           markLocalFileChanged("recover leftover wav " + encPath);
         }
         else
         {
           // Giu file de lan cleanup sau thu lai, tranh mat du lieu.
-          Serial.printf("[RECOVER] Encrypt FAILED, keep WAV for retry: %s\n", norm.c_str());
+          DBG_PRINTF("[RECOVER] Encrypt FAILED, keep WAV for retry: %s\n", norm.c_str());
         }
       }
       else
       {
-        Serial.printf("[CLEANUP] Delete leftover/incomplete WAV (<100KB): raw=%s norm=%s size=%lu\n",
+        DBG_PRINTF("[CLEANUP] Delete leftover/incomplete WAV (<100KB): raw=%s norm=%s size=%lu\n",
                       raw.c_str(), norm.c_str(), (unsigned long)sz);
 
         removeIfExists(raw);
@@ -632,7 +651,7 @@ void cleanupZeroByteRecFiles()
     // Nếu file .bin nằm nhầm ở root thì chuyển về /rec/ để mọi API thống nhất đường dẫn.
     if (isEnc && raw != norm && SD.exists(raw) && !SD.exists(norm) && sz > 0)
     {
-      Serial.printf("[CLEANUP] Move misplaced BIN: %s -> %s\n",
+      DBG_PRINTF("[CLEANUP] Move misplaced BIN: %s -> %s\n",
                     raw.c_str(), norm.c_str());
       SD.rename(raw, norm);
     }
@@ -644,7 +663,7 @@ void cleanupZeroByteRecFiles()
     // .bin rỗng hoặc quá nhỏ thì không hợp lệ, xóa để tránh kẹt sync.
     if (isEnc && !isValidEncSize(realSize))
     {
-      Serial.printf("[CLEANUP] Delete invalid/zero BIN: %s size=%lu\n",
+      DBG_PRINTF("[CLEANUP] Delete invalid/zero BIN: %s size=%lu\n",
                     norm.c_str(), (unsigned long)realSize);
 
       removeIfExists(norm);
@@ -694,7 +713,7 @@ bool sdSaveAs(const uint8_t *buf, size_t size, const String &path)
   File f = SD.open(path, "w");
   if (!f)
   {
-    Serial.printf("[SD] Open '%s' FAILED\n", path.c_str());
+    DBG_PRINTF("[SD] Open '%s' FAILED\n", path.c_str());
     return false;
   }
   size_t wr = f.write(buf, size);
@@ -703,11 +722,11 @@ bool sdSaveAs(const uint8_t *buf, size_t size, const String &path)
   if (!ok)
   {
     SD.remove(path);
-    Serial.printf("[SD] SaveAs '%s' FAILED (%d/%d)\n", path.c_str(), wr, size);
+    DBG_PRINTF("[SD] SaveAs '%s' FAILED (%d/%d)\n", path.c_str(), wr, size);
   }
   else
   {
-    Serial.printf("[SD] SaveAs '%s' %d/%d -> OK\n", path.c_str(), wr, size);
+    DBG_PRINTF("[SD] SaveAs '%s' %d/%d -> OK\n", path.c_str(), wr, size);
   }
   return ok;
 }
@@ -738,7 +757,7 @@ bool sdLoadToRam()
   if (!ramBuf)
   {
     f.close();
-    Serial.println("[SD] OOM loading to RAM");
+    DBG_PRINTLN("[SD] OOM loading to RAM");
     return false;
   }
 
@@ -746,18 +765,19 @@ bool sdLoadToRam()
   f.close();
   ramSize = rd;
   ramReady = (rd >= 44);
-  Serial.printf("[SD] Load %d bytes to RAM -> %s\n", rd, ramReady ? "OK" : "FAIL");
+  DBG_PRINTF("[SD] Load %d bytes to RAM -> %s\n", rd, ramReady ? "OK" : "FAIL");
   return ramReady;
 }
 
 // ── AES-GCM file encryption ───────────────────────────────────
 // File format: "PHGCM1" + IV(12 bytes) + ciphertext + TAG(16 bytes)
-// IMPORTANT: Change this demo key before real deployment. UI decrypt must use the same 64-hex key.
-static const uint8_t AES_GCM_KEY[32] = {
-    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
-    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01};
+// Key stored in NVS in production; this is compile-time fallback.
+// To override: set PHANTOM_AES_KEY env var as 64-char hex string before build.
+static uint8_t AES_GCM_KEY[32] = {
+    0x58, 0x58, 0xa9, 0x65, 0x7a, 0x5b, 0x31, 0xa0,
+    0x37, 0xd4, 0x0f, 0x28, 0xca, 0x29, 0x82, 0x62,
+    0x7d, 0xd3, 0x1e, 0x85, 0x39, 0x63, 0xa2, 0x26,
+    0xd6, 0x90, 0xb9, 0x6f, 0x61, 0x1b, 0x16, 0x81};
 
 #define BIN_MAGIC "PHGCM1"
 #define BIN_MAGIC_LEN 6
@@ -779,14 +799,14 @@ bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool dele
 {
   if (!sdReady || !SD.exists(plainPath))
   {
-    Serial.println("[AES-GCM] Plain file not found: " + plainPath);
+    DBG_PRINTLN("[AES-GCM] Plain file not found: " + plainPath);
     return false;
   }
 
   File in = SD.open(plainPath, "r");
   if (!in)
   {
-    Serial.println("[AES-GCM] Cannot open plain file: " + plainPath);
+    DBG_PRINTLN("[AES-GCM] Cannot open plain file: " + plainPath);
     return false;
   }
 
@@ -797,7 +817,7 @@ bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool dele
   if (!out)
   {
     in.close();
-    Serial.println("[AES-GCM] Cannot create encrypted file: " + encPath);
+    DBG_PRINTLN("[AES-GCM] Cannot create encrypted file: " + encPath);
     return false;
   }
 
@@ -857,7 +877,7 @@ bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool dele
   if (ret != 0 || totalIn == 0)
   {
     SD.remove(encPath);
-    Serial.printf("[AES-GCM] Encrypt FAILED ret=%d plain=%s enc=%s\n", ret, plainPath.c_str(), encPath.c_str());
+    DBG_PRINTF("[AES-GCM] Encrypt FAILED ret=%d plain=%s enc=%s\n", ret, plainPath.c_str(), encPath.c_str());
     return false;
   }
 
@@ -878,7 +898,7 @@ bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool dele
   if (encSize <= (BIN_MAGIC_LEN + AES_GCM_IV_LEN + AES_GCM_TAG_LEN))
   {
     SD.remove(encPath);
-    Serial.printf("[AES-GCM] Encrypt output invalid/empty -> delete: %s size=%lu\n",
+    DBG_PRINTF("[AES-GCM] Encrypt output invalid/empty -> delete: %s size=%lu\n",
                   encPath.c_str(), (unsigned long)encSize);
     return false;
   }
@@ -887,11 +907,11 @@ bool aesGcmEncryptFile(const String &plainPath, const String &encPath, bool dele
   if (deletePlainAfterEncrypt && SD.exists(plainPath))
   {
     bool rmOk = SD.remove(plainPath);
-    Serial.printf("[AES-GCM] Delete plain WAV after encrypt: %s -> %s\n",
+    DBG_PRINTF("[AES-GCM] Delete plain WAV after encrypt: %s -> %s\n",
                   plainPath.c_str(), rmOk ? "OK" : "FAIL");
   }
 
-  Serial.printf("[AES-GCM] Encrypt OK: %s -> %s encSize=%lu plaintext=%lu\n",
+  DBG_PRINTF("[AES-GCM] Encrypt OK: %s -> %s encSize=%lu plaintext=%lu\n",
                 plainPath.c_str(), encPath.c_str(),
                 (unsigned long)encSize,
                 (unsigned long)totalIn);
@@ -956,20 +976,20 @@ bool verifyPeerHasAllLocalRecFiles()
   String listJson = httpGetFromPeer("/file/list", 5000);
   if (listJson.length() == 0 || listJson.indexOf("\"name\"") < 0)
   {
-    Serial.println("[PrioritySync] Verify all BIN: peer /file/list empty");
+    DBG_PRINTLN("[PrioritySync] Verify all BIN: peer /file/list empty");
     return false;
   }
 
   if (!SD.exists("/rec"))
   {
-    Serial.println("[PrioritySync] Verify all BIN: local /rec missing");
+    DBG_PRINTLN("[PrioritySync] Verify all BIN: local /rec missing");
     return true;
   }
 
   File root = SD.open("/rec");
   if (!root || !root.isDirectory())
   {
-    Serial.println("[PrioritySync] Verify all BIN: local /rec is not a directory");
+    DBG_PRINTLN("[PrioritySync] Verify all BIN: local /rec is not a directory");
     if (root)
       root.close();
     return true;
@@ -998,7 +1018,7 @@ bool verifyPeerHasAllLocalRecFiles()
       if (!isValidEncSize(localSize))
       {
         f.close();
-        Serial.printf("[PrioritySync] Delete invalid BIN before verify-all: %s size=%lu\n",
+        DBG_PRINTF("[PrioritySync] Delete invalid BIN before verify-all: %s size=%lu\n",
                       fullPath.c_str(), (unsigned long)localSize);
         removeIfExists(fullPath);
         f = root.openNextFile();
@@ -1013,7 +1033,7 @@ bool verifyPeerHasAllLocalRecFiles()
       long remoteSize = extractFileSizeFromListJson(listJson, base);
       bool ok = (remoteSize >= 0 && remoteSize == (long)localSize);
 
-      Serial.printf("[PrioritySync] Verify all BIN peer '%s': local=%lu remote=%ld -> %s\n",
+      DBG_PRINTF("[PrioritySync] Verify all BIN peer '%s': local=%lu remote=%ld -> %s\n",
                     base.c_str(),
                     (unsigned long)localSize,
                     remoteSize,
@@ -1038,7 +1058,7 @@ bool verifyPeerHasAllLocalRecFiles()
 
   root.close();
 
-  Serial.printf("[PrioritySync] Verify all BIN peer done: %d/%d OK, skipped=%d\n", okCount, totalEnc, skipped);
+  DBG_PRINTF("[PrioritySync] Verify all BIN peer done: %d/%d OK, skipped=%d\n", okCount, totalEnc, skipped);
   return totalEnc == 0 || okCount == totalEnc;
 }
 
@@ -1154,26 +1174,26 @@ void restoreMyAP()
   audioServer.begin();
   uploadServer.begin();
 
-  Serial.printf("[WiFi] %s AP restored max_clients=%d clients=%d\n", MY_AP_SSID,
+  DBG_PRINTF("[WiFi] %s AP restored max_clients=%d clients=%d\n", MY_AP_SSID,
                 MY_AP_MAX_CON, WiFi.softAPgetStationNum());
 }
 
 // ── Debug WiFi scan trước khi connect peer ─────────────────────
 void debugScanPeerNetworks(const char *targetSsid)
 {
-  Serial.println("[WiFi] Scan before peer connect...");
+  DBG_PRINTLN("[WiFi] Scan before peer connect...");
   int n = WiFi.scanNetworks(false, true);
   bool found = false;
   if (n <= 0)
   {
-    Serial.println("[WiFi] Scan result: no network found");
+    DBG_PRINTLN("[WiFi] Scan result: no network found");
   }
   else
   {
     for (int i = 0; i < n; i++)
     {
       String ssid = WiFi.SSID(i);
-      Serial.printf("  SSID[%d]=%s RSSI=%d CH=%d\n",
+      DBG_PRINTF("  SSID[%d]=%s RSSI=%d CH=%d\n",
                     i,
                     ssid.c_str(),
                     WiFi.RSSI(i),
@@ -1183,7 +1203,7 @@ void debugScanPeerNetworks(const char *targetSsid)
     }
   }
   WiFi.scanDelete();
-  Serial.printf("[WiFi] Target '%s': %s\n", targetSsid, found ? "FOUND" : "NOT FOUND");
+  DBG_PRINTF("[WiFi] Target '%s': %s\n", targetSsid, found ? "FOUND" : "NOT FOUND");
 }
 
 // ── HTTP GET text tu Phantom-2 ────────────────────────────────
@@ -1297,7 +1317,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   // Chỉ tải file .bin hợp lệ; .wav không phải dữ liệu sync chính thức.
   if (!isRecEncPath(filename))
   {
-    Serial.printf("[Sync] Refuse download non-BIN file: %s\n", filename.c_str());
+    DBG_PRINTF("[Sync] Refuse download non-BIN file: %s\n", filename.c_str());
     return false;
   }
 
@@ -1308,7 +1328,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   {
     if (!c->connect(peerIp.c_str(), PEER_HTTP_PORT))
     {
-      Serial.printf("[Sync] HTTP connect FAILED for '%s'\n", filename.c_str());
+      DBG_PRINTF("[Sync] HTTP connect FAILED for '%s'\n", filename.c_str());
       return false;
     }
   }
@@ -1317,7 +1337,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
     c->stop();
     if (!c->connect(peerIp.c_str(), PEER_HTTP_PORT))
     {
-      Serial.printf("[Sync] HTTP reconnect FAILED for '%s'\n", filename.c_str());
+      DBG_PRINTF("[Sync] HTTP reconnect FAILED for '%s'\n", filename.c_str());
       return false;
     }
   }
@@ -1352,7 +1372,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
       {
         if (!persist)
           c->stop();
-        Serial.printf("[Sync] Non-200 for '%s': %s\n", filename.c_str(), line.c_str());
+        DBG_PRINTF("[Sync] Non-200 for '%s': %s\n", filename.c_str(), line.c_str());
         return false;
       }
     }
@@ -1367,7 +1387,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   {
     if (!persist)
       c->stop();
-    Serial.printf("[Sync] Bad CL=%d for '%s'\n", contentLength, filename.c_str());
+    DBG_PRINTF("[Sync] Bad CL=%d for '%s'\n", contentLength, filename.c_str());
     return false;
   }
 
@@ -1380,7 +1400,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   {
     if (!persist)
       c->stop();
-    Serial.printf("[Sync] SD open FAILED for '%s'\n", filename.c_str());
+    DBG_PRINTF("[Sync] SD open FAILED for '%s'\n", filename.c_str());
     return false;
   }
 
@@ -1412,7 +1432,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   if (!persist)
     c->stop();
 
-  Serial.printf("[Sync] '%s' rx=%d/%d bytes\n", filename.c_str(), rx, contentLength);
+  DBG_PRINTF("[Sync] '%s' rx=%d/%d bytes\n", filename.c_str(), rx, contentLength);
 
   bool saved = false;
   if (rx > 0 && SD.exists(sdPath))
@@ -1428,7 +1448,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
   if (!saved)
   {
     SD.remove(sdPath);
-    Serial.printf("[Sync] '%s' verify FAIL -> delete\n", filename.c_str());
+    DBG_PRINTF("[Sync] '%s' verify FAIL -> delete\n", filename.c_str());
     return false;
   }
 
@@ -1461,7 +1481,7 @@ bool httpDownloadFileFromPeer(const String &filename, WiFiClient *persist)
     }
   }
 
-  Serial.printf("[Sync] '%s' %d bytes -> OK heap=%d\n",
+  DBG_PRINTF("[Sync] '%s' %d bytes -> OK heap=%d\n",
                 filename.c_str(), rx, ESP.getFreeHeap());
   return true;
 }
@@ -1471,14 +1491,14 @@ bool syncFromPeer()
 {
   if (syncInProgress)
   {
-    syncMsg = "busy: Phantom-1 already syncing";
-    Serial.println("[Sync] Local busy -> skip");
+    syncMsg = "busy: node already syncing";
+    DBG_PRINTLN("[Sync] Local busy -> skip");
     return false;
   }
 
   syncInProgress = true;
   String peerIp = currentPeerIp();
-  Serial.printf("\n[Sync] == Pull from peer %s ==\n", peerIp.c_str());
+  DBG_PRINTF("\n[Sync] == Pull from peer %s ==\n", peerIp.c_str());
   syncMsg = "connecting peer " + peerIp;
 
   // Do not pre-check peer busy here. Let peer /sync handler decide to avoid
@@ -1491,7 +1511,7 @@ bool syncFromPeer()
     if (listJson.length() > 10 && listJson.indexOf("\"name\"") >= 0)
       break;
 
-    Serial.printf("[Sync] /file/list empty attempt %d/3\n", attempt + 1);
+    DBG_PRINTF("[Sync] /file/list empty attempt %d/3\n", attempt + 1);
     unsigned long tw = millis();
     while (millis() - tw < 300)
     {
@@ -1514,11 +1534,11 @@ bool syncFromPeer()
     }
   }
 
-  Serial.printf("[Sync] Peer list: %d file(s)\n", peerCount);
+  DBG_PRINTF("[Sync] Peer list: %d file(s)\n", peerCount);
 
   if (listJson.indexOf("\"count\":0") >= 0 || listJson.indexOf("\"files\":[]") >= 0 || peerCount == 0)
   {
-    Serial.println("[Sync] peer has no file");
+    DBG_PRINTLN("[Sync] peer has no file");
     syncMsg = "ok: peer empty";
     syncInProgress = false;
     return false;
@@ -1551,12 +1571,12 @@ bool syncFromPeer()
   WiFiClient keepAlive;
   if (!keepAlive.connect(PEER_IP, PEER_HTTP_PORT))
   {
-    Serial.println("[Sync] Keep-alive connect FAILED - fallback per-file");
+    DBG_PRINTLN("[Sync] Keep-alive connect FAILED - fallback per-file");
     keepAlive.stop();
   }
 
   bool useKeepAlive = keepAlive.connected();
-  Serial.printf("[Sync] Keep-alive: %s\n", useKeepAlive ? "ON" : "OFF");
+  DBG_PRINTF("[Sync] Keep-alive: %s\n", useKeepAlive ? "ON" : "OFF");
 
   for (auto &fname : remoteFiles)
   {
@@ -1566,14 +1586,14 @@ bool syncFromPeer()
     // Chỉ đồng bộ file ghi âm chính thức đã mã hóa. .wav là file tạm, không sync.
     if (!isRecEncPath(fname))
     {
-      Serial.printf("[Sync] Skip non-BIN file from peer: %s\n", fname.c_str());
+      DBG_PRINTF("[Sync] Skip non-BIN file from peer: %s\n", fname.c_str());
       skipped++;
       continue;
     }
 
     if (remoteSize <= MIN_VALID_ENC_REC_SIZE)
     {
-      Serial.printf("[Sync] Skip remote invalid/missing BIN: %s size=%d\n", fname.c_str(), (int)remoteSize);
+      DBG_PRINTF("[Sync] Skip remote invalid/missing BIN: %s size=%d\n", fname.c_str(), (int)remoteSize);
       skipped++;
       continue;
     }
@@ -1587,13 +1607,13 @@ bool syncFromPeer()
 
       if (remoteSize > MIN_VALID_ENC_REC_SIZE && (int32_t)localSize == remoteSize)
       {
-        Serial.printf("[Sync] Skip '%s' - already exists (%d bytes)\n",
+        DBG_PRINTF("[Sync] Skip '%s' - already exists (%d bytes)\n",
                       fname.c_str(), (int)localSize);
         skipped++;
         continue;
       }
 
-      Serial.printf("[Sync] Update '%s' local=%d remote=%d\n",
+      DBG_PRINTF("[Sync] Update '%s' local=%d remote=%d\n",
                     fname.c_str(), (int)localSize, (int)remoteSize);
       SD.remove(path);
 
@@ -1606,7 +1626,7 @@ bool syncFromPeer()
     }
     else
     {
-      Serial.printf("[Sync] Download new '%s' (%d bytes)\n", fname.c_str(), remoteSize);
+      DBG_PRINTF("[Sync] Download new '%s' (%d bytes)\n", fname.c_str(), remoteSize);
       bool ok = httpDownloadFileFromPeer(fname, useKeepAlive ? &keepAlive : nullptr);
       if (ok)
         downloaded++;
@@ -1619,7 +1639,7 @@ bool syncFromPeer()
   if (downloaded > 0)
     blinkLED(5, 100);
 
-  Serial.printf("[Sync] Result: downloaded=%d updated=%d skipped=%d total=%d\n",
+  DBG_PRINTF("[Sync] Result: downloaded=%d updated=%d skipped=%d total=%d\n",
                 downloaded, updated, skipped, (int)remoteFiles.size());
 
   if (!ramReady && !remoteFiles.empty())
@@ -1681,10 +1701,10 @@ void handleStatus()
 
   server.send(200, "application/json",
               String("{\"node\":") + String(NODE_ID) +
-                  ",\"ap_ssid\":\"" + MY_AP_SSID + "\"" +
+                  ",\"nm\":\"" + MY_AP_SSID + "\"" +
                   ",\"ap_ip\":\"" + MY_AP_IP_STR + "\"" +
                   ",\"ap_clients\":" + String(WiFi.softAPgetStationNum()) +
-                  ",\"peer_ssid\":\"" + PEER_SSID + "\"" +
+                  ",\"pnm\":\"" + PEER_SSID + "\"" +
                   ",\"peer_ip\":\"" + currentPeerIp() + "\"" +
                   ",\"uptime\":\"" + formatUptime(millis()) + "\"" +
                   ",\"free_heap\":" + String(ESP.getFreeHeap()) +
@@ -1953,7 +1973,7 @@ void handleFileDownload()
       }
       cli.flush();
       f.close();
-      Serial.printf("[Download] '%s' %d/%d bytes MIME=%s\n",
+      DBG_PRINTF("[Download] '%s' %d/%d bytes MIME=%s\n",
                     dlName.c_str(), sent, sz, mime.c_str());
       blinkLED(3, 100);
       return;
@@ -2023,7 +2043,7 @@ void handleFileUploadDone()
     server.send(500, "application/json", resp);
   }
 
-  Serial.printf("[UploadHTTP] done file='%s' size=%d ok=%s err=%s\n",
+  DBG_PRINTF("[UploadHTTP] done file='%s' size=%d ok=%s err=%s\n",
                 httpUploadFilename.c_str(),
                 (int)httpUploadSize,
                 httpUploadOk ? "true" : "false",
@@ -2083,7 +2103,7 @@ void handleFileUploadStream()
       return;
     }
 
-    Serial.printf("[UploadHTTP] start '%s' -> '%s'\n",
+    DBG_PRINTF("[UploadHTTP] start '%s' -> '%s'\n",
                   rawName.c_str(), httpUploadPath.c_str());
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
@@ -2154,7 +2174,7 @@ void handleFileUploadStream()
     httpUploadOk = true;
     blinkLED(5, 80);
 
-    Serial.printf("[UploadHTTP] saved '%s' %d bytes\n",
+    DBG_PRINTF("[UploadHTTP] saved '%s' %d bytes\n",
                   httpUploadPath.c_str(), (int)httpUploadSize);
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
@@ -2168,7 +2188,7 @@ void handleFileUploadStream()
     httpUploadError = "upload aborted";
     httpUploadOk = false;
     httpUploadInProgress = false;
-    Serial.println("[UploadHTTP] aborted");
+    DBG_PRINTLN("[UploadHTTP] aborted");
   }
 }
 
@@ -2223,7 +2243,7 @@ void handleFileDelete()
 
   if (path.length() == 0)
   {
-    Serial.printf("[SD] Delete '%s' - not found\n", name.c_str());
+    DBG_PRINTF("[SD] Delete '%s' - not found\n", name.c_str());
     server.send(404, "application/json", "{\"error\":\"file not found\"}");
     return;
   }
@@ -2245,7 +2265,7 @@ void handleFileDelete()
 
   server.send(ok ? 200 : 500, "application/json",
               ok ? "{\"status\":\"ok\"}" : "{\"error\":\"delete failed\"}");
-  Serial.printf("[SD] Delete '%s' -> %s\n", path.c_str(), ok ? "OK" : "FAIL");
+  DBG_PRINTF("[SD] Delete '%s' -> %s\n", path.c_str(), ok ? "OK" : "FAIL");
 }
 
 void handleRecClearAll()
@@ -2375,8 +2395,8 @@ void markLocalFileChanged(const String &reason)
     syncPendingReason = "none";
     syncDone = false;
     syncFailed = false;
-    syncMsg = "local saved on Phantom-2; waiting Phantom-2 sync trigger";
-    Serial.println("[PrioritySync] Passive node: keep local file, wait for Phantom-2 trigger");
+    syncMsg = "local saved; waiting peer sync trigger";
+    DBG_PRINTLN("[PrioritySync] Passive node: keep local file, wait for Phantom-2 trigger");
     return;
   }
 
@@ -2393,7 +2413,7 @@ void markLocalFileChanged(const String &reason)
     syncMsg = "pending peer sync: " + reason;
   }
 
-  Serial.println("[PrioritySync] Pending -> " + reason);
+  DBG_PRINTLN("[PrioritySync] Pending -> " + reason);
 }
 
 bool requestPeerPullSync(bool requestBackSync)
@@ -2411,7 +2431,7 @@ bool requestPeerPullSync(bool requestBackSync)
   peerSyncRequestInProgress = true;
   syncMsg = "priority: ask peer to pull files";
 
-  Serial.printf("[PrioritySync] POST /sync to peer STA IP=%s\n", peerIp.c_str());
+  DBG_PRINTF("[PrioritySync] POST /sync to peer STA IP=%s\n", peerIp.c_str());
 
   // Neu peer dang sync, cho doi peer roi gui /sync ngay thay vi bo qua ngay lap tuc.
   unsigned long waitBusyStart = millis();
@@ -2427,7 +2447,7 @@ bool requestPeerPullSync(bool requestBackSync)
 
     if (millis() - waitBusyStart >= PRIORITY_SYNC_WAIT_PEER_IDLE_MS)
     {
-      Serial.println("[PrioritySync] peer syncing timeout -> retry later");
+      DBG_PRINTLN("[PrioritySync] peer syncing timeout -> retry later");
       syncMsg = "pending: peer syncing timeout";
       peerSyncRequestInProgress = false;
       return false;
@@ -2471,7 +2491,7 @@ bool requestPeerPullSync(bool requestBackSync)
 
   if (!ok)
   {
-    Serial.println("[PrioritySync] POST /sync failed or timeout");
+    DBG_PRINTLN("[PrioritySync] POST /sync failed or timeout");
     syncMsg = "pending: trigger peer sync failed";
     peerSyncRequestInProgress = false;
     return false;
@@ -2516,13 +2536,13 @@ bool requestPeerPullSync(bool requestBackSync)
     syncFailed = false;
     syncMsg = "ok: peer pulled all local /rec BIN files";
     syncPendingReason = "none";
-    Serial.println("[PrioritySync] Done (one-way)");
+    DBG_PRINTLN("[PrioritySync] Done (one-way)");
     return true;
   }
 
   syncMsg = "pending: wait/verify peer pull timeout";
   syncFailed = true;
-  Serial.println("[PrioritySync] Verify failed -> keep pending and retry");
+  DBG_PRINTLN("[PrioritySync] Verify failed -> keep pending and retry");
   return false;
 }
 
@@ -2550,10 +2570,10 @@ void handlePrioritySync()
   bool ok = requestPeerPullSync();
   if (ok)
     return;
-  Serial.println("[PrioritySync] Retry later; pending remains until peer pulls files");
+  DBG_PRINTLN("[PrioritySync] Retry later; pending remains until peer pulls files");
   syncDone = false;
   syncFailed = true;
-  syncMsg = "pending: waiting Phantom-1 pull missing files";
+  syncMsg = "pending: waiting peer pull missing files";
 }
 
 void handleSyncStatus()
@@ -2645,7 +2665,7 @@ void handlePeerRegister()
   peerStaIp = ip;
   peerStaLastSeenMs = millis();
   syncMsg = "peer registered: " + peerStaIp;
-  Serial.printf("[PeerReg] Phantom-2 STA IP=%s\n", peerStaIp.c_str());
+  DBG_PRINTF("[PeerReg] Phantom-2 STA IP=%s\n", peerStaIp.c_str());
 
   String j = "{\"status\":\"ok\",\"peer_ip\":\"" + peerStaIp + "\"}";
   server.send(200, "application/json", j);
@@ -2661,7 +2681,7 @@ void handleRawUpload(WiFiClient &cli)
 {
   String reqLine = cli.readStringUntil('\n');
   reqLine.trim();
-  Serial.printf("[Upload8081] %s\n", reqLine.substring(0, 60).c_str());
+  DBG_PRINTF("[Upload8081] %s\n", reqLine.substring(0, 60).c_str());
 
   String xFilename = "";
   int clen = 0;
@@ -2699,7 +2719,7 @@ void handleRawUpload(WiFiClient &cli)
     th = millis();
   }
 
-  Serial.printf("[Upload8081] fname='%s' CL=%d\n", xFilename.c_str(), clen);
+  DBG_PRINTF("[Upload8081] fname='%s' CL=%d\n", xFilename.c_str(), clen);
 
   if (clen <= 0 || clen > (int)MAX_FILE_SIZE)
   {
@@ -2752,7 +2772,7 @@ void handleRawUpload(WiFiClient &cli)
   }
 
   sdFile.close();
-  Serial.printf("[Upload8081] '%s' rx=%d/%d\n", saveAs.c_str(), rx, clen);
+  DBG_PRINTF("[Upload8081] '%s' rx=%d/%d\n", saveAs.c_str(), rx, clen);
 
   bool saved = (rx > 0 && SD.exists(path));
   if (saved)
@@ -2798,7 +2818,7 @@ void handleRawUpload(WiFiClient &cli)
     markLocalFileChanged("TCP8081 upload " + saveAs);
 
   blinkLED(saved ? 5 : 2, 80);
-  Serial.printf("[Upload8081] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
+  DBG_PRINTF("[Upload8081] '%s' %d bytes -> %s\n", saveAs.c_str(), rx, saved ? "OK" : "FAIL");
 
   String resp = "{\"status\":\"" + String(saved ? "ok" : "fail") + "\""
                                                                    ",\"filename\":\"" +
@@ -2986,9 +3006,32 @@ void setup()
   analogReadResolution(12);
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
 
-  Serial.println("\n==============================");
-  Serial.println(" ESP32 PHANTOM-1 (APSTA + SD)");
-  Serial.println("==============================");
+  // Decode WiFi credentials at runtime (not stored as plaintext)
+#if _NODE_IS_1
+  phantomGetSSID1(g_ap_ssid);
+  phantomGetSSID2(g_peer_ssid);
+  phantomGetIP1(g_ap_ip);
+  phantomGetIP2(g_peer_ip);
+#else
+  phantomGetSSID2(g_ap_ssid);
+  phantomGetSSID1(g_peer_ssid);
+  phantomGetIP2(g_ap_ip);
+  phantomGetIP1(g_peer_ip);
+#endif
+  phantomGetPass(g_ap_pass);
+  phantomGetPass(g_peer_pass);
+
+  DBG_PRINTLN("\n==============================");
+  DBG_PRINTLN(" ESP32 PHANTOM-1 (APSTA + SD)");
+  DBG_PRINTLN("==============================");
+
+  phantomBootIntegrityCheck();
+  phantomConfigWatchdog();
+
+  // Load AES key from NVS if available; otherwise use compile-time fallback
+  static uint8_t runtimeKey[32];
+  if (phantomLoadKeyFromNVS(runtimeKey, 32))
+    memcpy(AES_GCM_KEY, runtimeKey, 32);
 
   sdReady = setupSDCard();
 
@@ -3012,7 +3055,7 @@ void setup()
   WiFi.softAP(MY_AP_SSID, MY_AP_PASSWORD, MY_AP_CHANNEL, MY_AP_HIDDEN, MY_AP_MAX_CON);
 
   delay(200);
-  Serial.printf("[AP] SSID: %s  IP: %s  max_clients=%d\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str(), MY_AP_MAX_CON);
+  DBG_PRINTF("[AP] SSID: %s  IP: %s  max_clients=%d\n", MY_AP_SSID, WiFi.softAPIP().toString().c_str(), MY_AP_MAX_CON);
   digitalWrite(LED_PIN, HIGH);
 
   const char *collectHeaders[] = {"X-Filename", "Content-Length", "Content-Type"};
@@ -3051,21 +3094,21 @@ void setup()
   configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
   int fc = countSdFiles();
-  Serial.printf("[SD] Current root files: %d. No startup sync.\n", fc);
+  DBG_PRINTF("[SD] Current root files: %d. No startup sync.\n", fc);
 
   syncDone = false;
   syncFailed = false;
   syncMsg = "ready: priority sync after any local file write";
 
-  Serial.printf("\n[Ready] %s endpoints:\n", MY_AP_SSID);
-  Serial.printf("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
-  Serial.printf("  GET  http://%s/status\n", MY_AP_IP_STR);
-  Serial.printf("  GET  http://%s/file/list\n", MY_AP_IP_STR);
-  Serial.printf("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
-  Serial.printf("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
-  Serial.printf("  POST http://%s/sync  -> sync from peer\n", MY_AP_IP_STR);
-  Serial.printf("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
-  Serial.println("  Priority sync: any local file write -> ask Phantom-2 to pull");
+  DBG_PRINTF("\n[Ready] %s endpoints:\n", MY_AP_SSID);
+  DBG_PRINTF("  WiFi: %s / %s\n", MY_AP_SSID, MY_AP_PASSWORD);
+  DBG_PRINTF("  GET  http://%s/status\n", MY_AP_IP_STR);
+  DBG_PRINTF("  GET  http://%s/file/list\n", MY_AP_IP_STR);
+  DBG_PRINTF("  GET  http://%s/file/download?name=photo.png\n", MY_AP_IP_STR);
+  DBG_PRINTF("  POST http://%s/file/upload  (X-Filename: myfile.txt)\n", MY_AP_IP_STR);
+  DBG_PRINTF("  POST http://%s/sync  -> sync from peer\n", MY_AP_IP_STR);
+  DBG_PRINTF("  GET  http://%s:8080/  (TCP WAV)\n", MY_AP_IP_STR);
+  DBG_PRINTLN("  Priority sync: any local file write -> ask Phantom-2 to pull");
 }
 
 // ── Loop ──────────────────────────────────────────────────────

@@ -258,7 +258,7 @@ def scan_phantoms(known=_KNOWN_IPS, timeout=3):
                 d = {"ok": True, "raw": str(d)}
 
             # Nếu ESP32 có trả ap_ssid/node thì ưu tiên tên thực tế từ thiết bị.
-            real_name = d.get("ap_ssid") or name
+            real_name = d.get("nm") or name
 
             pk = d.get("public_key", "")
             found.append((

@@ -1,0 +1,56 @@
+# Phantom ESP32 — Security sdkconfig defaults
+# PlatformIO picks this up automatically when building with ESP-IDF component.
+# For Arduino framework, add board_build.cmake_extra_args or use esp-idf-sys.
+#
+# PRODUCTION DEPLOYMENT:
+#   1. Generate signing key: espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem
+#   2. First flash (development mode): flash_encryption=DEVELOPMENT, secure_boot=DEVELOPMENT
+#   3. Production lock: change to RELEASE mode — THIS IS IRREVERSIBLE
+#
+# See SECURITY_FLASH_GUIDE.md for full step-by-step instructions.
+
+# ── Flash Encryption ──────────────────────────────────────────
+# Encrypts flash contents with AES-XTS using a per-device key burned into eFuse.
+# Physical flash dump will return encrypted garbage.
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+# Start in DEVELOPMENT mode (allows re-flashing). Change to RELEASE for production.
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+# CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y  # Uncomment for production (IRREVERSIBLE)
+
+# ── Secure Boot v2 ────────────────────────────────────────────
+# RSA-signed bootloader + app. Rejects unsigned/modified firmware at boot.
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+# Verify app signature on every boot (not just OTA)
+CONFIG_SECURE_BOOT_INSECURE_FAST_VERIFY=n
+
+# ── JTAG Disable ─────────────────────────────────────────────
+# Disables JTAG interface — prevents hardware debugging/memory inspection.
+CONFIG_SECURE_DISABLE_JTAG=y
+
+# ── ROM Download Mode ─────────────────────────────────────────
+# Disables UART ROM bootloader download mode in production.
+# In DEVELOPMENT keep enabled for re-flashing. Disable for production.
+# CONFIG_SECURE_DISABLE_ROM_DL_MODE=y  # Uncomment for production (IRREVERSIBLE)
+CONFIG_SECURE_ENABLE_SECURE_ROM_DL_MODE=y
+
+# ── USB JTAG/Serial ───────────────────────────────────────────
+CONFIG_ESP_USB_SERIAL_JTAG_ENABLED=n
+
+# ── NVS Encryption ───────────────────────────────────────────
+# Encrypts NVS partition (where AES-GCM key is stored).
+CONFIG_NVS_ENCRYPTION=y
+
+# ── Stack Smashing Protection ─────────────────────────────────
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
+CONFIG_COMPILER_STACK_CHECK=y
+
+# ── Watchdog ─────────────────────────────────────────────────
+CONFIG_ESP_TASK_WDT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+
+# ── Brownout Detector ─────────────────────────────────────────
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y
