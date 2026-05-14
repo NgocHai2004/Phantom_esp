@@ -103,7 +103,7 @@
 #define MIC_I2S_READ_LEN 1024
 
 // ── Auto trigger record ───────────────────────────────────────
-#define AUTO_RECORD_MS 10000UL
+#define AUTO_RECORD_MS 3600000UL
 #define NODE2_SYNC_CHECK_INTERVAL_MS 60000UL
 
 // ── Human voice trigger tuning ────────────────────────────────
@@ -113,7 +113,7 @@
 
 // Nguong peak14 dung chung cho hai node de vai tro va logic giong nhau.
 // Neu moi truong qua on, tang len 4000-6000; neu kho bat tieng, ha xuong 1500-2500.
-#define MIC_TRIGGER_PEAK14_LEVEL 15000
+#define MIC_TRIGGER_PEAK14_LEVEL 5000
 
 // Các define cũ giữ lại để tránh lỗi tham chiếu, nhưng KHÔNG dùng để trigger nữa.
 // Các define cũ đã bỏ khỏi logic trigger để tiết kiệm CPU.
