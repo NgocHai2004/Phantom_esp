@@ -35,7 +35,7 @@
 #define MIC_TRIGGER_PEAK14_LEVEL 1000
 #define MIC_TRIGGER_FRAMES 4
 #define MIC_COOLDOWN_MS 3000UL
-#define AUTO_RECORD_MS 600000UL
+#define AUTO_RECORD_MS 60000UL
 #define MIC_SILENCE_STOP_MS 15000UL
 #define MIC_VOICE_CONFIRM_FRAMES 3
 
@@ -49,6 +49,7 @@
 #define AES_GCM_IV_LEN 12
 #define AES_GCM_TAG_LEN 16
 #define AES_GCM_BUF_LEN 4096
+#define UPLOAD_BUF_LEN 16384
 
 static const uint8_t AES_GCM_KEY[32] = {
     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
@@ -71,6 +72,7 @@ bool g_recordStopForUpload = false;
 static int32_t g_i2sRecordBuf[MIC_READ_LEN / 4];
 static uint8_t g_aesInBuf[AES_GCM_BUF_LEN];
 static uint8_t g_aesOutBuf[AES_GCM_BUF_LEN];
+static uint8_t g_uploadBuf[UPLOAD_BUF_LEN];
 
 struct MicVoiceStats {
   int peak14;
@@ -94,11 +96,9 @@ String normalizeRecPath(const String &path) {
 bool setupSDCard() {
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSpi, 25000000)) {
-    Serial.println("[SD] Initialization FAILED");
     return false;
   }
   if (!SD.exists("/rec")) SD.mkdir("/rec");
-  Serial.println("[SD] Initialization OK");
   return true;
 }
 
@@ -156,17 +156,14 @@ void setupI2SMic() {
   pin_config.data_in_num = I2S_SD;
 
   if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
-    Serial.println("[MIC] i2s_driver_install FAILED");
     return;
   }
   if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
-    Serial.println("[MIC] i2s_set_pin FAILED");
     return;
   }
   i2s_set_clk(I2S_PORT, MIC_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
   i2s_zero_dma_buffer(I2S_PORT);
   micReady = true;
-  Serial.println("[MIC] ready");
 }
 
 MicVoiceStats readMicVoiceStats() {
@@ -221,7 +218,6 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs) {
 
   File audioFile = SD.open(path, FILE_WRITE);
   if (!audioFile) {
-    Serial.printf("[MIC] open failed: %s\n", path);
     return false;
   }
 
@@ -229,9 +225,6 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs) {
   audioFile.write(emptyHeader, 44);
 
   recordingInProgress = true;
-  unsigned long recStartMs = millis();
-  unsigned long lastRecLogMs = recStartMs;
-  Serial.printf("[MIC] REC START: %s\n", path);
   uint32_t totalDataBytes = 0;
   uint32_t maxSamplesAllowed = ((MAX_FILE_SIZE - 44UL) / 2UL);
   uint32_t writtenSamples = 0;
@@ -267,28 +260,14 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs) {
       voiceConfirmFrames = 0;
     }
 
-    if ((millis() - lastVoiceMs) >= MIC_SILENCE_STOP_MS) {
-      Serial.printf("[MIC] silence >= %lus -> stop record\n", (unsigned long)(MIC_SILENCE_STOP_MS / 1000UL));
-      break;
-    }
+    // In fixed-interval mode, do not stop early by silence.
 
     if ((millis() - lastUploadProbeMs) >= UPLOAD_CHECK_INTERVAL_MS) {
       lastUploadProbeMs = millis();
       if (ensureStaConnectedToUploadAP()) {
-        Serial.println("[MIC] upload AP available during record -> stop record for encrypt/upload");
         g_recordStopForUpload = true;
         break;
       }
-    }
-
-    if ((millis() - lastRecLogMs) >= 2000UL) {
-      Serial.printf("[MIC] REC ... %lus size=%lu peak14=%d threshold=%d silence_s=%lu\n",
-                    (unsigned long)((millis() - recStartMs) / 1000UL),
-                    (unsigned long)totalDataBytes,
-                    peak,
-                    MIC_TRIGGER_PEAK14_LEVEL,
-                    (unsigned long)((millis() - lastVoiceMs) / 1000UL));
-      lastRecLogMs = millis();
     }
   }
 
@@ -296,10 +275,6 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs) {
   audioFile.close();
   recordingInProgress = false;
 
-  Serial.printf("[MIC] REC DONE: %s (%lu bytes, %lums)\n",
-                path,
-                (unsigned long)totalDataBytes,
-                (unsigned long)(millis() - recStartMs));
   return totalDataBytes > 0;
 }
 
@@ -398,7 +373,6 @@ bool ensureStaConnectedToUploadAP() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[WiFi] connected %s ip=%s\n", TARGET_SSID, WiFi.localIP().toString().c_str());
     return true;
   }
 
@@ -428,30 +402,45 @@ bool uploadFileToHttpApi(const String &localPath, const String &saveName) {
   size_t contentLength = pre.length() + total + post.length();
 
   WiFiClient c;
+  unsigned long t0 = millis();
   if (!c.connect(UPLOAD_HOST, UPLOAD_PORT)) {
     f.close();
     return false;
   }
-  unsigned long uploadStartMs = millis();
+  unsigned long tConnected = millis();
+  Serial.printf("[UPLOAD-STEP] tcp_connect file=%s ms=%lu\n", saveName.c_str(), (unsigned long)(tConnected - t0));
+
+  unsigned long uploadStartMs = tConnected;
 
   c.printf("POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
            UPLOAD_PATH, UPLOAD_HOST, UPLOAD_PORT, boundary, (int)contentLength);
+  unsigned long tHeader = millis();
+  Serial.printf("[UPLOAD-STEP] send_header file=%s ms=%lu\n", saveName.c_str(), (unsigned long)(tHeader - tConnected));
   c.print(pre);
+  unsigned long tPre = millis();
+  Serial.printf("[UPLOAD-STEP] send_multipart_preamble file=%s ms=%lu\n", saveName.c_str(), (unsigned long)(tPre - tHeader));
 
-  uint8_t buf[1024];
   size_t sent = 0;
   unsigned long t = millis();
   while (sent < total && c.connected() && (millis() - t) < 90000UL) {
-    size_t rd = f.read(buf, min((size_t)1024, total - sent));
+    size_t rd = f.read(g_uploadBuf, min((size_t)UPLOAD_BUF_LEN, total - sent));
     if (rd == 0) break;
-    size_t wr = c.write(buf, rd);
+    size_t wr = c.write(g_uploadBuf, rd);
     if (wr != rd) break;
     sent += wr;
     t = millis();
   }
   f.close();
+  unsigned long tBody = millis();
+  Serial.printf("[UPLOAD-STEP] send_body file=%s sent=%lu/%lu ms=%lu\n",
+                saveName.c_str(),
+                (unsigned long)sent,
+                (unsigned long)total,
+                (unsigned long)(tBody - tPre));
 
   if (sent == total) c.print(post);
+  unsigned long tPost = millis();
+  Serial.printf("[UPLOAD-STEP] send_multipart_end file=%s ms=%lu\n", saveName.c_str(), (unsigned long)(tPost - tBody));
 
   String resp;
   t = millis();
@@ -463,6 +452,8 @@ bool uploadFileToHttpApi(const String &localPath, const String &saveName) {
       delay(2);
     }
   }
+  unsigned long tResp = millis();
+  Serial.printf("[UPLOAD-STEP] wait_response file=%s ms=%lu\n", saveName.c_str(), (unsigned long)(tResp - tPost));
   c.stop();
   unsigned long uploadElapsedMs = millis() - uploadStartMs;
 
@@ -481,7 +472,6 @@ bool uploadFileToHttpApi(const String &localPath, const String &saveName) {
 bool uploadAllRecBins() {
   if (!sdReady) return false;
   if (!ensureStaConnectedToUploadAP()) {
-    Serial.println("[UPLOAD] target AP unavailable");
     return false;
   }
 
@@ -517,63 +507,23 @@ bool uploadAllRecBins() {
   }
   root.close();
 
-  Serial.printf("[UPLOAD] done uploaded=%d failed=%d\n", uploaded, failed);
   return failed == 0;
 }
 
 void handleAutoMicRecord() {
   if (!micReady || !sdReady || recordingInProgress) return;
+  if (millis() - lastMicTriggerMs < AUTO_RECORD_MS) return;
 
-  static int voiceFrames = 0;
-  static unsigned long lastMicIdleLogMs = 0;
-  MicVoiceStats st = readMicVoiceStats();
+  String wavPath = genMicFilename();
+  String encPath = encryptedPathFromWavPath(wavPath);
+  lastMicTriggerMs = millis();
 
-  if (!micArmed) {
-    if (millis() - lastMicIdleLogMs >= 1000UL) {
-      Serial.printf("[MIC] peak14=%d threshold=%d voice=%s\n",
-                    st.peak14,
-                    MIC_TRIGGER_PEAK14_LEVEL,
-                    st.voiceLike ? "yes" : "no");
-      lastMicIdleLogMs = millis();
-    }
-    if (st.peak14 < (MIC_TRIGGER_PEAK14_LEVEL / 2)) {
-      micArmed = true;
-      voiceFrames = 0;
-      Serial.println("[MIC] re-armed");
-    }
-    return;
-  }
-
-  if (millis() - lastMicTriggerMs < MIC_COOLDOWN_MS) return;
-
-  if (millis() - lastMicIdleLogMs >= 1000UL) {
-    Serial.printf("[MIC] peak14=%d threshold=%d voice=%s\n",
-                  st.peak14,
-                  MIC_TRIGGER_PEAK14_LEVEL,
-                  st.voiceLike ? "yes" : "no");
-    lastMicIdleLogMs = millis();
-  }
-
-  if (st.voiceLike) voiceFrames++;
-  else voiceFrames = 0;
-
-  if (voiceFrames >= MIC_TRIGGER_FRAMES) {
-    String wavPath = genMicFilename();
-    String encPath = encryptedPathFromWavPath(wavPath);
-
-    micArmed = false;
-    voiceFrames = 0;
-    lastMicTriggerMs = millis();
-
-    bool ok = recordTriggeredWavToSD(wavPath.c_str(), AUTO_RECORD_MS);
-    if (ok) {
-      bool encOk = aesGcmEncryptFile(wavPath, encPath, true);
-      Serial.println(encOk ? "[FLOW] encrypt done" : "[FLOW] encrypt failed");
-      if (encOk && g_recordStopForUpload) {
-        Serial.println("[FLOW] immediate upload after record-stop");
-        uploadAllRecBins();
-        g_recordStopForUpload = false;
-      }
+  bool ok = recordTriggeredWavToSD(wavPath.c_str(), AUTO_RECORD_MS);
+  if (ok) {
+    bool encOk = aesGcmEncryptFile(wavPath, encPath, true);
+    if (encOk && g_recordStopForUpload) {
+      uploadAllRecBins();
+      g_recordStopForUpload = false;
     }
   }
 }
@@ -592,9 +542,6 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial.println("\n==============================");
-  Serial.println(" ESP32 PHANTOM-2 MINIMAL");
-  Serial.println("==============================");
 
   sdReady = setupSDCard();
   syncMicCounterFromSd();
@@ -606,7 +553,6 @@ void setup() {
   setupI2SMic();
 
   digitalWrite(LED_PIN, HIGH);
-  Serial.printf("[Ready] target upload: http://%s:%d%s\n", UPLOAD_HOST, UPLOAD_PORT, UPLOAD_PATH);
 }
 
 void loop() {
