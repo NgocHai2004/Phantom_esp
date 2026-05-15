@@ -87,7 +87,7 @@
 #define UPLOAD_PORT 8081
 
 #define AUDIO_WAV_PATH "/audio.wav"
-#define MAX_FILE_SIZE 50000000
+#define MAX_FILE_SIZE 60000000
 #define AUTO_SYNC_INTERVAL_MS 60000UL // disabled: no 60s auto sync; priority sync only
 #define PRIORITY_SYNC_WAIT_PEER_IDLE_MS 30000UL
 #define UPLOAD_SYNC_DELAY_MS 5000UL
@@ -4058,12 +4058,9 @@ bool uploadMissingLocalRecBinsToPeer()
     return false;
   }
 
-  String listJson = httpGetFromPeer("/file/list", 6000);
-  bool listAvailable = (listJson.length() > 0 && listJson.indexOf("\"files\"") >= 0);
-  if (!listAvailable)
-    Serial.println("[Node2Push] Peer /file/list unavailable -> fallback upload all local BIN");
-  else if (listJson.indexOf("\"files\":[]") >= 0 || listJson.indexOf("\"count\":0") >= 0)
-    Serial.println("[Node2Push] Peer /file/list empty -> upload all local BIN");
+  // Theo yeu cau: khong phu thuoc GET /file/list (co the timeout),
+  // Node-2 ket noi duoc Phantom-1 la upload truc tiep tat ca local BIN hop le.
+  Serial.println("[Node2Push] Connected Phantom-1 -> direct upload all local BIN");
 
   if (!SD.exists("/rec"))
     return true;
@@ -4102,21 +4099,11 @@ bool uploadMissingLocalRecBinsToPeer()
         continue;
       }
 
-      long remoteSize = listAvailable ? extractFileSizeFromListJson(listJson, base) : -1;
-      bool remoteMissing = (remoteSize < 0);
-      bool remoteSameSize = (!remoteMissing && remoteSize == (long)localSize);
-      if (listAvailable && remoteSameSize)
-      {
-        skipped++;
-      }
+      bool upOk = uploadFileToPeer8081(fullPath, base);
+      if (upOk)
+        uploaded++;
       else
-      {
-        bool upOk = uploadFileToPeer8081(fullPath, base);
-        if (upOk)
-          uploaded++;
-        else
-          failed++;
-      }
+        failed++;
     }
 
     f.close();
@@ -4129,13 +4116,18 @@ bool uploadMissingLocalRecBinsToPeer()
   announceStaIpToPeer();
 
   Serial.printf("[Node2Push] done uploaded=%d skipped=%d failed=%d\n", uploaded, skipped, failed);
-  // Theo yeu cau: da vao duoc 1 phien ket noi/upload voi Phantom-1 thi xoa /rec,
-  // khong phu thuoc uploaded/skipped/failed.
-  uint32_t deleted = deleteAllFilesInRec();
-  micFileCounter = 0;
-  lastMicWavFile = "none";
-  Serial.printf("[Node2Push] Session done -> cleared /rec (%lu files), reset counter to 0\n",
-                (unsigned long)deleted);
+  if (failed == 0)
+  {
+    uint32_t deleted = deleteAllFilesInRec();
+    micFileCounter = 0;
+    lastMicWavFile = "none";
+    Serial.printf("[Node2Push] Session done -> cleared /rec (%lu files), reset counter to 0\n",
+                  (unsigned long)deleted);
+  }
+  else
+  {
+    Serial.println("[Node2Push] Upload not complete -> keep all local files in /rec");
+  }
   return failed == 0;
 }
 
