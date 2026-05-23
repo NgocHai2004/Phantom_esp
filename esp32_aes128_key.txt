@@ -1,0 +1,10 @@
+# ESP32 record decrypt key (AES-128-CTR)
+# Format: PHA128 + IV(16 bytes) + CIPHERTEXT(raw PCM16LE mono)
+# PCM format after decrypt: 16-bit signed little-endian, mono, 16000 Hz
+#
+# WARNING:
+# - This key matches current hardcoded AES128_KEY in esp32_client/src/main.cpp
+# - Keep this file private. Anyone with this key can decrypt your recordings.
+
+AES128_KEY_HEX=00112233445566778899AABBCCDDEEFF
+

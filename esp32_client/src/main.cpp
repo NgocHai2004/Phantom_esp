@@ -32,7 +32,7 @@
 #define MIC_BITS 16
 #define MIC_READ_LEN 1024
 
-#define MIC_TRIGGER_PEAK14_LEVEL 1000
+#define MIC_TRIGGER_PEAK14_LEVEL 3000
 #define MIC_TRIGGER_FRAMES 4
 #define MIC_COOLDOWN_MS 3000UL
 #define AUTO_RECORD_MS 60000UL
@@ -139,8 +139,8 @@ void setupI2SMic() {
   i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
   i2s_config.sample_rate = MIC_SAMPLE_RATE;
   i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
-  // Read both channels so it still works regardless of mic L/R strap.
-  i2s_config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  // Read a single channel to reduce duplicated channel noise.
+  i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
   i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   i2s_config.dma_buf_count = 8;
@@ -161,7 +161,7 @@ void setupI2SMic() {
   if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
     return;
   }
-  i2s_set_clk(I2S_PORT, MIC_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+  i2s_set_clk(I2S_PORT, MIC_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
   i2s_zero_dma_buffer(I2S_PORT);
   micReady = true;
 }
@@ -176,8 +176,16 @@ MicVoiceStats readMicVoiceStats() {
 
   int peak = 0;
   int samples = bytesRead / 4;
+  if (samples <= 0) return st;
+
+  // Remove frame DC offset to reduce constant hiss/floor bias from MEMS + I2S chain.
+  int64_t dcSum = 0;
+  for (int i = 0; i < samples; i++) dcSum += i2sData[i];
+  int32_t dc = (int32_t)(dcSum / samples);
+
   for (int i = 0; i < samples; i++) {
-    int16_t s16 = (int16_t)(i2sData[i] >> 14);
+    int32_t centered = i2sData[i] - dc;
+    int16_t s16 = (int16_t)(centered >> 14);
     int a = abs((int)s16);
     if (a > peak) peak = a;
   }
@@ -240,8 +248,16 @@ bool recordTriggeredWavToSD(const char *path, uint32_t durationMs) {
 
     int peak = 0;
     int samples = bytesRead / 4;
+    if (samples <= 0) continue;
+
+    // Remove per-frame DC offset before scaling to 16-bit PCM.
+    int64_t dcSum = 0;
+    for (int i = 0; i < samples; i++) dcSum += g_i2sRecordBuf[i];
+    int32_t dc = (int32_t)(dcSum / samples);
+
     for (int i = 0; i < samples; i++) {
-      int16_t s16 = (int16_t)(g_i2sRecordBuf[i] >> 14);
+      int32_t centered = g_i2sRecordBuf[i] - dc;
+      int16_t s16 = (int16_t)(centered >> 14);
       int a = abs((int)s16);
       if (a > peak) peak = a;
       audioFile.write((uint8_t *)&s16, sizeof(s16));
@@ -551,6 +567,9 @@ void setup() {
   WiFi.disconnect(false);
 
   setupI2SMic();
+
+  // Start first 1-minute recording immediately after boot.
+  lastMicTriggerMs = millis() - AUTO_RECORD_MS;
 
   digitalWrite(LED_PIN, HIGH);
 }

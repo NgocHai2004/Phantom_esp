@@ -11,6 +11,12 @@ Supports firmware file format:
 
 Input:  .bin or .enc
 Output: .wav
+
+Note:
+    Firmware mới mã hóa Opus trước khi upload.
+    Tool này hỗ trợ cả:
+    - BIN chứa WAV cũ  -> giải mã ra WAV
+    - BIN chứa Opus mới -> giải mã Opus rồi tự convert ra WAV bằng ffmpeg
 """
 
 import os
@@ -19,6 +25,7 @@ import sys
 import time
 import threading
 import subprocess
+import tempfile
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -85,8 +92,73 @@ def extract_hex_key_from_text(content: str) -> str:
     return matches[-1]
 
 
+def convert_opus_bytes_to_wav(opus_data: bytes, output_path: str) -> int:
+    """
+    Firmware mới lưu âm thanh dạng Opus/Ogg rồi mới AES-GCM.
+    Hàm này ghi Opus tạm ra file .opus và dùng ffmpeg convert thành WAV.
+    """
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_opus_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".opus",
+            prefix="phantom_decrypted_",
+            dir=str(out_path.parent),
+            delete=False,
+        ) as tmp:
+            tmp.write(opus_data)
+            tmp_opus_path = tmp.name
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", tmp_opus_path,
+            "-acodec", "pcm_s16le",
+            str(out_path),
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=180,
+            check=False,
+        )
+
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            raise RuntimeError(
+                "Không convert được Opus sang WAV. "
+                "Hãy cài ffmpeg: https://ffmpeg.org/ hoặc chạy: sudo apt install ffmpeg. "
+                f"Chi tiết: {err}"
+            )
+
+        if not out_path.exists() or out_path.stat().st_size <= 44:
+            raise RuntimeError("Convert Opus xong nhưng file WAV rỗng/không hợp lệ.")
+
+        return out_path.stat().st_size
+
+    finally:
+        if tmp_opus_path:
+            try:
+                Path(tmp_opus_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def decrypt_phantom_file(input_path: str, output_path: str, key: bytes) -> int:
-    """Decrypt Phantom AES-GCM .bin/.enc to WAV. Return output byte size."""
+    """
+    Decrypt Phantom AES-GCM .bin/.enc to WAV. Return output byte size.
+
+    Hỗ trợ 2 kiểu payload sau khi giải mã:
+    1) WAV cũ:  PHGCM1 + IV + AES_GCM(WAV)
+    2) Opus mới: PHGCM1 + IV + AES_GCM(OPUS/OGG)
+       Tool sẽ tự convert Opus -> WAV bằng ffmpeg.
+    """
     if AESGCM is None:
         raise RuntimeError("Thiếu thư viện cryptography. Cài: pip install cryptography")
 
@@ -108,17 +180,25 @@ def decrypt_phantom_file(input_path: str, output_path: str, key: bytes) -> int:
         raise ValueError("File thiếu IV/ciphertext/tag. Có thể file ghi dở hoặc lỗi.")
 
     try:
-        wav = AESGCM(key).decrypt(iv, encrypted_plus_tag, None)
+        plain = AESGCM(key).decrypt(iv, encrypted_plus_tag, None)
     except Exception:
         raise ValueError("Giải mã thất bại. Có thể sai key hoặc file bị hỏng.")
 
-    if not wav.startswith(b"RIFF") or b"WAVE" not in wav[:16]:
-        raise ValueError("Giải mã xong nhưng không phải WAV. Có thể sai key/file lỗi.")
+    # Case 1: firmware cũ mã hóa trực tiếp WAV.
+    if plain.startswith(b"RIFF") and b"WAVE" in plain[:16]:
+        with open(output_path, "wb") as f:
+            f.write(plain)
+        return len(plain)
 
-    with open(output_path, "wb") as f:
-        f.write(wav)
+    # Case 2: firmware mới nén Opus/Ogg trước rồi mới mã hóa.
+    # File Ogg Opus thường bắt đầu bằng OggS và có OpusHead gần đầu file.
+    if plain.startswith(b"OggS") or b"OpusHead" in plain[:128]:
+        return convert_opus_bytes_to_wav(plain, output_path)
 
-    return len(wav)
+    raise ValueError(
+        "Giải mã xong nhưng payload không phải WAV hoặc Opus/Ogg. "
+        "Có thể sai key, file lỗi, hoặc firmware đang dùng định dạng khác."
+    )
 
 
 def fmt_size(n: int) -> str:
@@ -194,7 +274,7 @@ class PhantomDecryptPro(ctk.CTk):
 
         self._build_ui()
         self._write_log("PHANTOM Decrypt Pro ready")
-        self._write_log("Chọn file .bin/.enc và file key HEX để giải mã ra WAV")
+        self._write_log("Chọn file .bin/.enc và file key HEX để giải mã ra WAV. Hỗ trợ BIN chứa WAV cũ hoặc Opus mới.")
         if AESGCM is None:
             self._write_log("⚠ Thiếu cryptography: pip install cryptography", error=True)
 
@@ -279,7 +359,7 @@ class PhantomDecryptPro(ctk.CTk):
         ctk.CTkFrame(parent, fg_color="transparent").pack(expand=True, fill="both")
         ctk.CTkLabel(
             parent,
-            text="Format: PHGCM1 + IV + CIPHERTEXT + TAG",
+            text="Format: PHGCM1 + IV + CIPHERTEXT + TAG · Payload: WAV hoặc Opus",
             font=mono(10),
             text_color=C_TEXT3,
         ).pack(fill="x", padx=22, pady=(0, 16))
@@ -290,7 +370,7 @@ class PhantomDecryptPro(ctk.CTk):
         top.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(top, text="Decrypt Dashboard", font=font(26, "bold"), text_color=C_TEXT).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(top, text="Giải mã file ghi âm Phantom .bin/.enc thành WAV", font=font(13), text_color=C_TEXT2).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ctk.CTkLabel(top, text="Giải mã file Phantom .bin/.enc thành WAV, kể cả BIN mã hóa Opus", font=font(13), text_color=C_TEXT2).grid(row=1, column=0, sticky="w", pady=(3, 0))
 
         self.status_badge = ctk.CTkLabel(
             top,
