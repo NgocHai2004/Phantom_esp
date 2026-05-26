@@ -5,19 +5,29 @@
 #include <SD.h>
 #include <FS.h>
 
-// ================== microSD PIN ==================
-#define SD_CS    3
-#define SD_SCK   23
-#define SD_MOSI  24
-#define SD_MISO  25
-#define SD_FORMAT_IF_EMPTY true
+// ================== microSD PIN - ESP32-C6 DevKitC-1-N8 ==================
+// Noi module microSD SPI:
+// VCC  -> 3V3
+// GND  -> GND
+// SCK  -> GPIO19
+// MOSI -> GPIO18
+// MISO -> GPIO20
+// CS   -> GPIO23
+#define SD_CS 23
+#define SD_SCK 19
+#define SD_MOSI 18
+#define SD_MISO 20
+
+// Khuyen dung false de tranh format nham the nho.
+// Neu the moi/loi mount va ban chap nhan format, co the doi thanh true.
+#define SD_FORMAT_IF_EMPTY false
 
 SPIClass spiSD(FSPI);
 
 // ================== WIFI AP CONFIG ==================
 // Giữ đúng SSID/password theo code Python client cũ
-const char* AP_SSID = "7068616e746f6d303030303030300002";
-const char* AP_PASS = "12345678";
+const char *AP_SSID = "7068616e746f6d303030303030300002";
+const char *AP_PASS = "12345678";
 
 // Cho giống server cũ: http://10.42.0.1:8765
 IPAddress local_IP(10, 42, 0, 1);
@@ -49,70 +59,90 @@ String uploadError = "";
 uint64_t uploadBytes = 0;
 
 // ================== UTILS ==================
-String humanSize(uint64_t bytes) {
-  if (bytes < 1024) return String((unsigned long long)bytes) + " B";
-  if (bytes < 1024ULL * 1024ULL) return String((double)bytes / 1024.0, 1) + " KB";
+String humanSize(uint64_t bytes)
+{
+  if (bytes < 1024)
+    return String((unsigned long long)bytes) + " B";
+  if (bytes < 1024ULL * 1024ULL)
+    return String((double)bytes / 1024.0, 1) + " KB";
   return String((double)bytes / 1024.0 / 1024.0, 2) + " MB";
 }
 
-String jsonEscape(const String& s) {
+String jsonEscape(const String &s)
+{
   String out = "";
-  for (size_t i = 0; i < s.length(); i++) {
+  for (size_t i = 0; i < s.length(); i++)
+  {
     char c = s[i];
-    if (c == '"') out += "\\\"";
-    else if (c == '\\') out += "\\\\";
-    else if (c == '\n') out += "\\n";
-    else if (c == '\r') out += "\\r";
-    else out += c;
+    if (c == '"')
+      out += "\\\"";
+    else if (c == '\\')
+      out += "\\\\";
+    else if (c == '\n')
+      out += "\\n";
+    else if (c == '\r')
+      out += "\\r";
+    else
+      out += c;
   }
   return out;
 }
 
-String safeFileName(String name) {
+String safeFileName(String name)
+{
   name.replace("\\", "/");
 
   int slash = name.lastIndexOf('/');
-  if (slash >= 0) {
+  if (slash >= 0)
+  {
     name = name.substring(slash + 1);
   }
 
   String safe = "";
-  for (size_t i = 0; i < name.length(); i++) {
+  for (size_t i = 0; i < name.length(); i++)
+  {
     char c = name[i];
 
     if (
-      (c >= 'a' && c <= 'z') ||
-      (c >= 'A' && c <= 'Z') ||
-      (c >= '0' && c <= '9') ||
-      c == '.' || c == '_' || c == '-'
-    ) {
+        (c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '.' || c == '_' || c == '-')
+    {
       safe += c;
-    } else {
+    }
+    else
+    {
       safe += "_";
     }
   }
 
-  if (safe.length() == 0) {
+  if (safe.length() == 0)
+  {
     safe = "upload.bin";
   }
 
-  if (safe.length() > 80) {
+  if (safe.length() > 80)
+  {
     safe = safe.substring(safe.length() - 80);
   }
 
   return safe;
 }
 
-bool initSDWithFallback() {
+bool initSDWithFallback()
+{
   const uint32_t freqs[] = {1000000, 400000, 8000000};
 
-  for (size_t i = 0; i < (sizeof(freqs) / sizeof(freqs[0])); i++) {
+  for (size_t i = 0; i < (sizeof(freqs) / sizeof(freqs[0])); i++)
+  {
     uint32_t hz = freqs[i];
 
     SD.end();
     Serial.printf("[SD] Thu SD.begin o %lu Hz...\n", (unsigned long)hz);
 
-    if (SD.begin(SD_CS, spiSD, hz, "/sd", 8, SD_FORMAT_IF_EMPTY)) {
+    if (SD.begin(SD_CS, spiSD, hz, "/sd", 8, SD_FORMAT_IF_EMPTY))
+    {
       Serial.printf("[SD] OK: Mount SD thanh cong o %lu Hz\n", (unsigned long)hz);
       return true;
     }
@@ -121,42 +151,52 @@ bool initSDWithFallback() {
   return false;
 }
 
-bool ensureUploadDir() {
-  if (!SD.exists("/uploads")) {
+bool ensureUploadDir()
+{
+  if (!SD.exists("/uploads"))
+  {
     return SD.mkdir("/uploads");
   }
   return true;
 }
 
-uint64_t getUsedBytes() {
+uint64_t getUsedBytes()
+{
   return SD.usedBytes();
 }
 
-uint64_t getTotalBytes() {
+uint64_t getTotalBytes()
+{
   return SD.totalBytes();
 }
 
-void startUploadBlink() {
+void startUploadBlink()
+{
   blinkActive = true;
   blinkTogglesLeft = BLINK_COUNT_PER_UPLOAD * 2;
   lastBlinkMs = millis();
 }
 
-void updateStatusLed() {
-  if (!blinkActive) return;
+void updateStatusLed()
+{
+  if (!blinkActive)
+    return;
 
   unsigned long now = millis();
-  if (now - lastBlinkMs < BLINK_INTERVAL_MS) return;
+  if (now - lastBlinkMs < BLINK_INTERVAL_MS)
+    return;
 
   lastBlinkMs = now;
   ledState = !ledState;
   digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
 
-  if (blinkTogglesLeft > 0) {
+  if (blinkTogglesLeft > 0)
+  {
     blinkTogglesLeft--;
   }
 
-  if (blinkTogglesLeft == 0) {
+  if (blinkTogglesLeft == 0)
+  {
     blinkActive = false;
     ledState = false;
     digitalWrite(STATUS_LED_PIN, LOW);
@@ -164,9 +204,10 @@ void updateStatusLed() {
 }
 
 // ================== API HANDLERS ==================
-void handleRoot() {
+void handleRoot()
+{
   String msg = "";
-  msg += "ESP32-C5 microSD Upload Server\n";
+  msg += "ESP32-C6 microSD Upload Server\n";
   msg += "AP SSID: ";
   msg += AP_SSID;
   msg += "\n";
@@ -189,14 +230,19 @@ void handleRoot() {
   server.send(200, "text/plain", msg);
 }
 
-void handleStatus() {
+void handleStatus()
+{
   uint8_t cardType = SD.cardType();
 
   String card = "UNKNOWN";
-  if (cardType == CARD_NONE) card = "NONE";
-  else if (cardType == CARD_MMC) card = "MMC";
-  else if (cardType == CARD_SD) card = "SDSC";
-  else if (cardType == CARD_SDHC) card = "SDHC/SDXC";
+  if (cardType == CARD_NONE)
+    card = "NONE";
+  else if (cardType == CARD_MMC)
+    card = "MMC";
+  else if (cardType == CARD_SD)
+    card = "SDSC";
+  else if (cardType == CARD_SDHC)
+    card = "SDHC/SDXC";
 
   String json = "{";
   json += "\"ok\":true,";
@@ -214,10 +260,12 @@ void handleStatus() {
   server.send(200, "application/json", json);
 }
 
-void handleFileList() {
+void handleFileList()
+{
   File dir = SD.open("/uploads");
 
-  if (!dir || !dir.isDirectory()) {
+  if (!dir || !dir.isDirectory())
+  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
     return;
   }
@@ -229,22 +277,27 @@ void handleFileList() {
 
   bool first = true;
 
-  while (true) {
+  while (true)
+  {
     File file = dir.openNextFile();
-    if (!file) break;
+    if (!file)
+      break;
 
-    if (!file.isDirectory()) {
+    if (!file.isDirectory())
+    {
       String fullName = String(file.name());
 
       int slash = fullName.lastIndexOf('/');
       String name = fullName;
-      if (slash >= 0) {
+      if (slash >= 0)
+      {
         name = fullName.substring(slash + 1);
       }
 
       uint64_t size = file.size();
 
-      if (!first) json += ",";
+      if (!first)
+        json += ",";
       first = false;
 
       json += "{";
@@ -266,28 +319,34 @@ void handleFileList() {
   server.send(200, "application/json", json);
 }
 
-String getNameArg() {
-  if (!server.hasArg("name")) return "";
+String getNameArg()
+{
+  if (!server.hasArg("name"))
+    return "";
   return safeFileName(server.arg("name"));
 }
 
-void handleDownload() {
+void handleDownload()
+{
   String name = getNameArg();
 
-  if (name.length() == 0) {
+  if (name.length() == 0)
+  {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_name\"}");
     return;
   }
 
   String path = "/uploads/" + name;
 
-  if (!SD.exists(path)) {
+  if (!SD.exists(path))
+  {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"file_not_found\"}");
     return;
   }
 
   File file = SD.open(path, FILE_READ);
-  if (!file) {
+  if (!file)
+  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_file\"}");
     return;
   }
@@ -297,35 +356,43 @@ void handleDownload() {
   file.close();
 }
 
-void handleDelete() {
+void handleDelete()
+{
   String name = getNameArg();
 
-  if (name.length() == 0) {
+  if (name.length() == 0)
+  {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_name\"}");
     return;
   }
 
   String path = "/uploads/" + name;
 
-  if (!SD.exists(path)) {
+  if (!SD.exists(path))
+  {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"file_not_found\"}");
     return;
   }
 
   bool ok = SD.remove(path);
 
-  if (ok) {
+  if (ok)
+  {
     String json = "{\"ok\":true,\"deleted\":\"" + jsonEscape(name) + "\"}";
     server.send(200, "application/json", json);
-  } else {
+  }
+  else
+  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"delete_failed\"}");
   }
 }
 
-void handleDeleteAll() {
+void handleDeleteAll()
+{
   File dir = SD.open("/uploads");
 
-  if (!dir || !dir.isDirectory()) {
+  if (!dir || !dir.isDirectory())
+  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
     return;
   }
@@ -333,28 +400,37 @@ void handleDeleteAll() {
   uint32_t deleted = 0;
   uint32_t failed = 0;
 
-  while (true) {
+  while (true)
+  {
     File file = dir.openNextFile();
-    if (!file) break;
+    if (!file)
+      break;
 
-    if (!file.isDirectory()) {
+    if (!file.isDirectory())
+    {
       String fullName = String(file.name());
       String name = fullName;
 
       int slash = fullName.lastIndexOf('/');
-      if (slash >= 0) {
+      if (slash >= 0)
+      {
         name = fullName.substring(slash + 1);
       }
 
       file.close();
 
       String path = "/uploads/" + name;
-      if (SD.remove(path)) {
+      if (SD.remove(path))
+      {
         deleted++;
-      } else {
+      }
+      else
+      {
         failed++;
       }
-    } else {
+    }
+    else
+    {
       file.close();
     }
   }
@@ -375,8 +451,10 @@ void handleDeleteAll() {
   server.send(failed == 0 ? 200 : 500, "application/json", json);
 }
 
-void handleUploadResponse() {
-  if (uploadOK) {
+void handleUploadResponse()
+{
+  if (uploadOK)
+  {
     String json = "{";
     json += "\"ok\":true,";
     json += "\"name\":\"" + jsonEscape(uploadFileName) + "\",";
@@ -386,7 +464,9 @@ void handleUploadResponse() {
     json += "}";
 
     server.send(200, "application/json", json);
-  } else {
+  }
+  else
+  {
     String json = "{";
     json += "\"ok\":false,";
     json += "\"error\":\"" + jsonEscape(uploadError) + "\"";
@@ -396,10 +476,12 @@ void handleUploadResponse() {
   }
 }
 
-void handleFileUpload() {
-  HTTPUpload& upload = server.upload();
+void handleFileUpload()
+{
+  HTTPUpload &upload = server.upload();
 
-  if (upload.status == UPLOAD_FILE_START) {
+  if (upload.status == UPLOAD_FILE_START)
+  {
     uploadOK = false;
     uploadError = "";
     uploadBytes = 0;
@@ -409,60 +491,75 @@ void handleFileUpload() {
 
     Serial.printf("[UPLOAD] START name=%s path=%s\n", uploadFileName.c_str(), uploadFilePath.c_str());
 
-    if (!ensureUploadDir()) {
+    if (!ensureUploadDir())
+    {
       uploadError = "cannot_create_uploads_dir";
       Serial.println("[UPLOAD] FAIL cannot create /uploads");
       return;
     }
 
-    if (SD.exists(uploadFilePath)) {
+    if (SD.exists(uploadFilePath))
+    {
       SD.remove(uploadFilePath);
     }
 
     uploadFile = SD.open(uploadFilePath, FILE_WRITE);
-    if (!uploadFile) {
+    if (!uploadFile)
+    {
       uploadError = "cannot_open_file_for_write";
       Serial.println("[UPLOAD] FAIL open file write");
       return;
     }
   }
 
-  else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) {
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (uploadFile)
+    {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadBytes += written;
 
-      if (written != upload.currentSize) {
+      if (written != upload.currentSize)
+      {
         uploadError = "sd_write_failed";
         Serial.printf("[UPLOAD] WRITE FAIL written=%u expected=%u\n",
                       (unsigned)written,
                       (unsigned)upload.currentSize);
       }
-    } else {
+    }
+    else
+    {
       uploadError = "upload_file_not_open";
     }
   }
 
-  else if (upload.status == UPLOAD_FILE_END) {
-    if (uploadFile) {
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    if (uploadFile)
+    {
       uploadFile.flush();
       uploadFile.close();
     }
 
-    if (uploadError.length() == 0 && uploadBytes > 0) {
+    if (uploadError.length() == 0 && uploadBytes > 0)
+    {
       uploadOK = true;
       startUploadBlink();
       Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
                     (unsigned long long)uploadBytes);
-    } else {
+    }
+    else
+    {
       uploadOK = false;
 
-      if (uploadError.length() == 0) {
+      if (uploadError.length() == 0)
+      {
         uploadError = "empty_upload";
       }
 
-      if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath)) {
+      if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
+      {
         SD.remove(uploadFilePath);
       }
 
@@ -472,12 +569,15 @@ void handleFileUpload() {
     }
   }
 
-  else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (uploadFile) {
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    if (uploadFile)
+    {
       uploadFile.close();
     }
 
-    if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath)) {
+    if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
+    {
       SD.remove(uploadFilePath);
     }
 
@@ -488,7 +588,8 @@ void handleFileUpload() {
   }
 }
 
-void handleNotFound() {
+void handleNotFound()
+{
   String json = "{";
   json += "\"ok\":false,";
   json += "\"error\":\"not_found\",";
@@ -499,34 +600,39 @@ void handleNotFound() {
 }
 
 // ================== SETUP ==================
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(1500);
 
   Serial.println();
-  Serial.println("=== ESP32-C5 microSD WIFI SERVER ===");
+  Serial.println("=== ESP32-C6 microSD WIFI SERVER ===");
 
   Serial.println("[SD] Khoi tao SPI...");
   spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
   Serial.println("[SD] Dang khoi tao the nho...");
-  if (!initSDWithFallback()) {
+  if (!initSDWithFallback())
+  {
     Serial.println("[SD] FAIL: Khong nhan duoc the nho!");
     Serial.println("Kiem tra day:");
     Serial.println("VCC  -> 3V3");
     Serial.println("GND  -> GND");
-    Serial.println("SCK  -> GPIO23");
-    Serial.println("MOSI -> GPIO24");
-    Serial.println("MISO -> GPIO25");
-    Serial.println("CS   -> GPIO3");
-    while (true) {
+    Serial.println("SCK  -> GPIO19");
+    Serial.println("MOSI -> GPIO18");
+    Serial.println("MISO -> GPIO20");
+    Serial.println("CS   -> GPIO23");
+    while (true)
+    {
       delay(1000);
     }
   }
 
-  if (!ensureUploadDir()) {
+  if (!ensureUploadDir())
+  {
     Serial.println("[SD] FAIL: Khong tao duoc /uploads");
-    while (true) {
+    while (true)
+    {
       delay(1000);
     }
   }
@@ -535,10 +641,14 @@ void setup() {
 
   uint8_t cardType = SD.cardType();
   Serial.print("[SD] Loai the: ");
-  if (cardType == CARD_MMC) Serial.println("MMC");
-  else if (cardType == CARD_SD) Serial.println("SDSC");
-  else if (cardType == CARD_SDHC) Serial.println("SDHC/SDXC");
-  else Serial.println("UNKNOWN");
+  if (cardType == CARD_MMC)
+    Serial.println("MMC");
+  else if (cardType == CARD_SD)
+    Serial.println("SDSC");
+  else if (cardType == CARD_SDHC)
+    Serial.println("SDHC/SDXC");
+  else
+    Serial.println("UNKNOWN");
 
   Serial.printf("[SD] Total: %s\n", humanSize(SD.totalBytes()).c_str());
   Serial.printf("[SD] Used : %s\n", humanSize(SD.usedBytes()).c_str());
@@ -558,9 +668,11 @@ void setup() {
 
   bool apOK = WiFi.softAP(AP_SSID, AP_PASS, channel, hidden, max_connection);
 
-  if (!apOK) {
+  if (!apOK)
+  {
     Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
-    while (true) {
+    while (true)
+    {
       delay(1000);
     }
   }
@@ -583,11 +695,10 @@ void setup() {
   server.on("/api/delete-all", HTTP_DELETE, handleDeleteAll);
 
   server.on(
-    "/api/upload",
-    HTTP_POST,
-    handleUploadResponse,
-    handleFileUpload
-  );
+      "/api/upload",
+      HTTP_POST,
+      handleUploadResponse,
+      handleFileUpload);
 
   server.onNotFound(handleNotFound);
 
@@ -598,7 +709,8 @@ void setup() {
 }
 
 // ================== LOOP ==================
-void loop() {
+void loop()
+{
   server.handleClient();
   updateStatusLed();
 }
