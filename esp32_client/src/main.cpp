@@ -27,6 +27,19 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
+// ================== ONBOARD LED ==================
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 8
+#endif
+
+const int STATUS_LED_PIN = LED_BUILTIN;
+const uint8_t BLINK_COUNT_PER_UPLOAD = 3;
+const uint16_t BLINK_INTERVAL_MS = 120;
+bool ledState = false;
+bool blinkActive = false;
+uint8_t blinkTogglesLeft = 0;
+unsigned long lastBlinkMs = 0;
+
 // ================== UPLOAD STATE ==================
 File uploadFile;
 String uploadFileName = "";
@@ -123,6 +136,33 @@ uint64_t getTotalBytes() {
   return SD.totalBytes();
 }
 
+void startUploadBlink() {
+  blinkActive = true;
+  blinkTogglesLeft = BLINK_COUNT_PER_UPLOAD * 2;
+  lastBlinkMs = millis();
+}
+
+void updateStatusLed() {
+  if (!blinkActive) return;
+
+  unsigned long now = millis();
+  if (now - lastBlinkMs < BLINK_INTERVAL_MS) return;
+
+  lastBlinkMs = now;
+  ledState = !ledState;
+  digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
+
+  if (blinkTogglesLeft > 0) {
+    blinkTogglesLeft--;
+  }
+
+  if (blinkTogglesLeft == 0) {
+    blinkActive = false;
+    ledState = false;
+    digitalWrite(STATUS_LED_PIN, LOW);
+  }
+}
+
 // ================== API HANDLERS ==================
 void handleRoot() {
   String msg = "";
@@ -143,6 +183,8 @@ void handleRoot() {
   msg += "GET  /api/download?name=filename.bin\n";
   msg += "GET  /api/delete?name=filename.bin\n";
   msg += "POST /api/delete?name=filename.bin\n";
+  msg += "POST /api/delete-all\n";
+  msg += "DELETE /api/delete-all\n";
 
   server.send(200, "text/plain", msg);
 }
@@ -280,6 +322,59 @@ void handleDelete() {
   }
 }
 
+void handleDeleteAll() {
+  File dir = SD.open("/uploads");
+
+  if (!dir || !dir.isDirectory()) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
+    return;
+  }
+
+  uint32_t deleted = 0;
+  uint32_t failed = 0;
+
+  while (true) {
+    File file = dir.openNextFile();
+    if (!file) break;
+
+    if (!file.isDirectory()) {
+      String fullName = String(file.name());
+      String name = fullName;
+
+      int slash = fullName.lastIndexOf('/');
+      if (slash >= 0) {
+        name = fullName.substring(slash + 1);
+      }
+
+      file.close();
+
+      String path = "/uploads/" + name;
+      if (SD.remove(path)) {
+        deleted++;
+      } else {
+        failed++;
+      }
+    } else {
+      file.close();
+    }
+  }
+
+  dir.close();
+
+  String json = "{";
+  json += "\"ok\":";
+  json += (failed == 0 ? "true" : "false");
+  json += ",";
+  json += "\"deleted\":";
+  json += String(deleted);
+  json += ",";
+  json += "\"failed\":";
+  json += String(failed);
+  json += "}";
+
+  server.send(failed == 0 ? 200 : 500, "application/json", json);
+}
+
 void handleUploadResponse() {
   if (uploadOK) {
     String json = "{";
@@ -356,6 +451,7 @@ void handleFileUpload() {
 
     if (uploadError.length() == 0 && uploadBytes > 0) {
       uploadOK = true;
+      startUploadBlink();
       Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
                     (unsigned long long)uploadBytes);
@@ -451,7 +547,11 @@ void setup() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(local_IP, gateway, subnet);
 
-  // hidden = true để khớp client cũ đang connect WiFi ẩn
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
+  Serial.printf("[LED] STATUS PIN: GPIO%d\n", STATUS_LED_PIN);
+
+  // Phát WiFi ẩn SSID
   bool hidden = true;
   int channel = 6;
   int max_connection = 4;
@@ -479,6 +579,8 @@ void setup() {
   server.on("/api/delete", HTTP_GET, handleDelete);
   server.on("/api/delete", HTTP_POST, handleDelete);
   server.on("/api/delete", HTTP_DELETE, handleDelete);
+  server.on("/api/delete-all", HTTP_POST, handleDeleteAll);
+  server.on("/api/delete-all", HTTP_DELETE, handleDeleteAll);
 
   server.on(
     "/api/upload",
@@ -498,4 +600,5 @@ void setup() {
 // ================== LOOP ==================
 void loop() {
   server.handleClient();
+  updateStatusLed();
 }
