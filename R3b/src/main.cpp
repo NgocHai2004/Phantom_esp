@@ -24,12 +24,15 @@
 
 SPIClass spiSD(FSPI);
 
+// Luu toc do SPI da mount thanh cong de hien thi trong /api/status
+uint32_t mountedSDFreq = 0;
+
 // ================== WIFI AP CONFIG ==================
-// Giữ đúng SSID/password theo code Python client cũ
+// Giu dung SSID/password theo code Python client cu
 const char *AP_SSID = "7068616e746f6d303030303030300002";
 const char *AP_PASS = "12345678";
 
-// Cho giống server cũ: http://10.42.0.1:8765
+// Cho giong server cu: http://10.42.0.1:8765
 IPAddress local_IP(10, 42, 0, 1);
 IPAddress gateway(10, 42, 0, 1);
 IPAddress subnet(255, 255, 255, 0);
@@ -57,6 +60,13 @@ String uploadFilePath = "";
 bool uploadOK = false;
 String uploadError = "";
 uint64_t uploadBytes = 0;
+
+// ================== UPLOAD ALL STATE ==================
+bool uploadAllActive = false;
+uint32_t uploadAllOK = 0;
+uint32_t uploadAllFailed = 0;
+uint64_t uploadAllBytes = 0;
+String uploadAllErrors = "";
 
 // ================== UTILS ==================
 String humanSize(uint64_t bytes)
@@ -103,8 +113,7 @@ String safeFileName(String name)
   {
     char c = name[i];
 
-    if (
-        (c >= 'a' && c <= 'z') ||
+    if ((c >= 'a' && c <= 'z') ||
         (c >= 'A' && c <= 'Z') ||
         (c >= '0' && c <= '9') ||
         c == '.' || c == '_' || c == '-')
@@ -132,7 +141,9 @@ String safeFileName(String name)
 
 bool initSDWithFallback()
 {
-  const uint32_t freqs[] = {1000000, 400000, 8000000};
+  // Thu toc do cao truoc de tranh bi ket o 1MHz lam upload rat cham.
+  // Neu day/microSD khong on, code se tu fallback xuong toc do thap hon.
+  const uint32_t freqs[] = {20000000, 16000000, 10000000, 8000000, 4000000, 1000000, 400000};
 
   for (size_t i = 0; i < (sizeof(freqs) / sizeof(freqs[0])); i++)
   {
@@ -143,6 +154,7 @@ bool initSDWithFallback()
 
     if (SD.begin(SD_CS, spiSD, hz, "/sd", 8, SD_FORMAT_IF_EMPTY))
     {
+      mountedSDFreq = hz;
       Serial.printf("[SD] OK: Mount SD thanh cong o %lu Hz\n", (unsigned long)hz);
       return true;
     }
@@ -207,7 +219,7 @@ void updateStatusLed()
 void handleRoot()
 {
   String msg = "";
-  msg += "ESP32-C6 microSD Upload Server\n";
+  msg += "ESP32-C6 microSD Upload Server FAST\n";
   msg += "AP SSID: ";
   msg += AP_SSID;
   msg += "\n";
@@ -218,13 +230,15 @@ void handleRoot()
   msg += String(SERVER_PORT);
   msg += "\n\n";
   msg += "API:\n";
-  msg += "GET  /api/status\n";
-  msg += "GET  /api/filelist\n";
-  msg += "POST /api/upload    form-data key=file\n";
-  msg += "GET  /api/download?name=filename.bin\n";
-  msg += "GET  /api/delete?name=filename.bin\n";
-  msg += "POST /api/delete?name=filename.bin\n";
-  msg += "POST /api/delete-all\n";
+  msg += "GET    /api/status\n";
+  msg += "GET    /api/filelist\n";
+  msg += "POST   /api/upload     form-data key=file\n";
+  msg += "POST   /api/upload-all form-data key=files, support multi files\n";
+  msg += "GET    /api/download?name=filename.bin\n";
+  msg += "GET    /api/delete?name=filename.bin\n";
+  msg += "POST   /api/delete?name=filename.bin\n";
+  msg += "DELETE /api/delete?name=filename.bin\n";
+  msg += "POST   /api/delete-all\n";
   msg += "DELETE /api/delete-all\n";
 
   server.send(200, "text/plain", msg);
@@ -251,6 +265,8 @@ void handleStatus()
   json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
   json += "\"port\":" + String(SERVER_PORT) + ",";
   json += "\"sd_card_type\":\"" + card + "\",";
+  json += "\"sd_spi_hz\":" + String((unsigned long)mountedSDFreq) + ",";
+  json += "\"sd_spi_mhz\":\"" + String((double)mountedSDFreq / 1000000.0, 1) + "\",";
   json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
   json += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
   json += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
@@ -588,6 +604,187 @@ void handleFileUpload()
   }
 }
 
+// ================== UPLOAD ALL HANDLERS ==================
+void resetUploadAllState()
+{
+  uploadAllActive = true;
+  uploadAllOK = 0;
+  uploadAllFailed = 0;
+  uploadAllBytes = 0;
+  uploadAllErrors = "";
+}
+
+void handleUploadAllResponse()
+{
+  if (!uploadAllActive)
+  {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"no_files_uploaded\"}");
+    return;
+  }
+
+  String json = "{";
+  json += "\"ok\":";
+  json += (uploadAllFailed == 0 ? "true" : "false");
+  json += ",";
+  json += "\"uploaded\":";
+  json += String(uploadAllOK);
+  json += ",";
+  json += "\"failed\":";
+  json += String(uploadAllFailed);
+  json += ",";
+  json += "\"total_bytes\":";
+  json += String((unsigned long long)uploadAllBytes);
+  json += ",";
+  json += "\"total_human\":\"";
+  json += humanSize(uploadAllBytes);
+  json += "\"";
+
+  if (uploadAllErrors.length() > 0)
+  {
+    json += ",\"errors\":\"";
+    json += jsonEscape(uploadAllErrors);
+    json += "\"";
+  }
+
+  json += "}";
+
+  uploadAllActive = false;
+
+  server.send(uploadAllFailed == 0 ? 200 : 500, "application/json", json);
+}
+
+void handleFileUploadAll()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    if (!uploadAllActive)
+    {
+      resetUploadAllState();
+    }
+
+    uploadOK = false;
+    uploadError = "";
+    uploadBytes = 0;
+
+    uploadFileName = safeFileName(upload.filename);
+    uploadFilePath = "/uploads/" + uploadFileName;
+
+    Serial.printf("[UPLOAD-ALL] START name=%s path=%s\n",
+                  uploadFileName.c_str(),
+                  uploadFilePath.c_str());
+
+    if (!ensureUploadDir())
+    {
+      uploadError = "cannot_create_uploads_dir";
+      uploadAllFailed++;
+      uploadAllErrors += uploadFileName + ": cannot_create_uploads_dir; ";
+      Serial.println("[UPLOAD-ALL] FAIL cannot create /uploads");
+      return;
+    }
+
+    if (SD.exists(uploadFilePath))
+    {
+      SD.remove(uploadFilePath);
+    }
+
+    uploadFile = SD.open(uploadFilePath, FILE_WRITE);
+    if (!uploadFile)
+    {
+      uploadError = "cannot_open_file_for_write";
+      uploadAllFailed++;
+      uploadAllErrors += uploadFileName + ": cannot_open_file_for_write; ";
+      Serial.println("[UPLOAD-ALL] FAIL open file write");
+      return;
+    }
+  }
+
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (uploadFile)
+    {
+      size_t written = uploadFile.write(upload.buf, upload.currentSize);
+      uploadBytes += written;
+
+      if (written != upload.currentSize)
+      {
+        uploadError = "sd_write_failed";
+        Serial.printf("[UPLOAD-ALL] WRITE FAIL written=%u expected=%u\n",
+                      (unsigned)written,
+                      (unsigned)upload.currentSize);
+      }
+    }
+    else
+    {
+      uploadError = "upload_file_not_open";
+    }
+  }
+
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    if (uploadFile)
+    {
+      uploadFile.flush();
+      uploadFile.close();
+    }
+
+    if (uploadError.length() == 0 && uploadBytes > 0)
+    {
+      uploadOK = true;
+      uploadAllOK++;
+      uploadAllBytes += uploadBytes;
+      startUploadBlink();
+
+      Serial.printf("[UPLOAD-ALL] OK name=%s size=%llu\n",
+                    uploadFileName.c_str(),
+                    (unsigned long long)uploadBytes);
+    }
+    else
+    {
+      uploadOK = false;
+
+      if (uploadError.length() == 0)
+      {
+        uploadError = "empty_upload";
+      }
+
+      uploadAllFailed++;
+      uploadAllErrors += uploadFileName + ": " + uploadError + "; ";
+
+      if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
+      {
+        SD.remove(uploadFilePath);
+      }
+
+      Serial.printf("[UPLOAD-ALL] FAIL name=%s err=%s\n",
+                    uploadFileName.c_str(),
+                    uploadError.c_str());
+    }
+  }
+
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    if (uploadFile)
+    {
+      uploadFile.close();
+    }
+
+    if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
+    {
+      SD.remove(uploadFilePath);
+    }
+
+    uploadOK = false;
+    uploadError = "upload_aborted";
+
+    uploadAllFailed++;
+    uploadAllErrors += uploadFileName + ": upload_aborted; ";
+
+    Serial.printf("[UPLOAD-ALL] ABORTED name=%s\n", uploadFileName.c_str());
+  }
+}
+
 void handleNotFound()
 {
   String json = "{";
@@ -606,7 +803,7 @@ void setup()
   delay(1500);
 
   Serial.println();
-  Serial.println("=== ESP32-C6 microSD WIFI SERVER ===");
+  Serial.println("=== ESP32-C6 microSD WIFI SERVER FAST ===");
 
   Serial.println("[SD] Khoi tao SPI...");
   spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -655,16 +852,28 @@ void setup()
 
   Serial.println("[WIFI] Cau hinh IP AP...");
   WiFi.mode(WIFI_AP);
+
+  // Giam do tre/rot ket noi khi upload file trong cung phong
+  WiFi.setSleep(false);
+
+  // Tang cong suat phat len muc cao de test on dinh trong phong kin
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
   WiFi.softAPConfig(local_IP, gateway, subnet);
 
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
   Serial.printf("[LED] STATUS PIN: GPIO%d\n", STATUS_LED_PIN);
 
-  // Phát WiFi ẩn SSID
-  bool hidden = true;
-  int channel = 6;
-  int max_connection = 4;
+  // De hien SSID khi test de ket noi on dinh hon.
+  // Neu can an SSID lai, doi hidden = true.
+  bool hidden = false;
+
+  // Thu 1 / 6 / 11 de tim kenh it nhieu nhieu nhat.
+  int channel = 1;
+
+  // Gioi han toi da 2 client ket noi cung luc.
+  int max_connection = 2;
 
   bool apOK = WiFi.softAP(AP_SSID, AP_PASS, channel, hidden, max_connection);
 
@@ -681,6 +890,9 @@ void setup()
   Serial.printf("[WIFI] SSID: %s\n", AP_SSID);
   Serial.printf("[WIFI] PASS: %s\n", AP_PASS);
   Serial.printf("[WIFI] IP  : %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("[WIFI] CH  : %d\n", channel);
+  Serial.printf("[WIFI] HIDDEN: %s\n", hidden ? "YES" : "NO");
+  Serial.printf("[WIFI] MAX CLIENT: %d\n", max_connection);
   Serial.printf("[HTTP] PORT: %d\n", SERVER_PORT);
 
   server.on("/", HTTP_GET, handleRoot);
@@ -691,6 +903,7 @@ void setup()
   server.on("/api/delete", HTTP_GET, handleDelete);
   server.on("/api/delete", HTTP_POST, handleDelete);
   server.on("/api/delete", HTTP_DELETE, handleDelete);
+
   server.on("/api/delete-all", HTTP_POST, handleDeleteAll);
   server.on("/api/delete-all", HTTP_DELETE, handleDeleteAll);
 
@@ -699,6 +912,12 @@ void setup()
       HTTP_POST,
       handleUploadResponse,
       handleFileUpload);
+
+  server.on(
+      "/api/upload-all",
+      HTTP_POST,
+      handleUploadAllResponse,
+      handleFileUploadAll);
 
   server.onNotFound(handleNotFound);
 
@@ -714,3 +933,4 @@ void loop()
   server.handleClient();
   updateStatusLed();
 }
+
