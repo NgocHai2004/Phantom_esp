@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <Adafruit_NeoPixel.h>
 
 // ================== microSD PIN - ESP32-C6 DevKitC-1-N8 ==================
 // Noi module microSD SPI:
@@ -40,18 +41,31 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
-// ================== ONBOARD LED ==================
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 8
-#endif
+// ================== ONBOARD RGB LED ==================
+// ESP32-C6 DevKitC-1 onboard RGB LED: GPIO8
+#define RGB_LED_PIN 8
+#define RGB_LED_COUNT 1
 
-const int STATUS_LED_PIN = LED_BUILTIN;
+Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
 const uint8_t BLINK_COUNT_PER_UPLOAD = 3;
 const uint16_t BLINK_INTERVAL_MS = 120;
+
+// Mau LED
+const uint8_t WIFI_OK_R = 0;
+const uint8_t WIFI_OK_G = 255;
+const uint8_t WIFI_OK_B = 0;
+
+const uint8_t UPLOAD_BLINK_R = 0;
+const uint8_t UPLOAD_BLINK_G = 0;
+const uint8_t UPLOAD_BLINK_B = 255;
+
 bool ledState = false;
 bool blinkActive = false;
 uint8_t blinkTogglesLeft = 0;
 unsigned long lastBlinkMs = 0;
+uint32_t blinkColor = 0;
+uint8_t lastClientCount = 0;
 
 // ================== UPLOAD STATE ==================
 File uploadFile;
@@ -182,36 +196,93 @@ uint64_t getTotalBytes()
   return SD.totalBytes();
 }
 
-void startUploadBlink()
+void setLedColor(uint8_t r, uint8_t g, uint8_t b)
 {
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
+}
+
+void ledOff()
+{
+  setLedColor(0, 0, 0);
+}
+
+void setWifiLedByClient()
+{
+  uint8_t clientCount = WiFi.softAPgetStationNum();
+
+  if (clientCount > 0)
+  {
+    // Co thiet bi ket noi vao WiFi AP -> xanh la
+    setLedColor(WIFI_OK_R, WIFI_OK_G, WIFI_OK_B);
+  }
+  else
+  {
+    // Chua co thiet bi ket noi -> tat LED
+    ledOff();
+  }
+
+  lastClientCount = clientCount;
+}
+
+void startUploadBlink(uint8_t r, uint8_t g, uint8_t b)
+{
+  blinkColor = rgbLed.Color(r, g, b);
   blinkActive = true;
+  ledState = false;
   blinkTogglesLeft = BLINK_COUNT_PER_UPLOAD * 2;
   lastBlinkMs = millis();
 }
 
+void startUploadBlinkBlue()
+{
+  startUploadBlink(UPLOAD_BLINK_R, UPLOAD_BLINK_G, UPLOAD_BLINK_B);
+}
+
 void updateStatusLed()
 {
-  if (!blinkActive)
-    return;
-
-  unsigned long now = millis();
-  if (now - lastBlinkMs < BLINK_INTERVAL_MS)
-    return;
-
-  lastBlinkMs = now;
-  ledState = !ledState;
-  digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
-
-  if (blinkTogglesLeft > 0)
+  if (blinkActive)
   {
-    blinkTogglesLeft--;
+    unsigned long now = millis();
+    if (now - lastBlinkMs < BLINK_INTERVAL_MS)
+      return;
+
+    lastBlinkMs = now;
+    ledState = !ledState;
+
+    if (ledState)
+    {
+      rgbLed.setPixelColor(0, blinkColor);
+    }
+    else
+    {
+      rgbLed.setPixelColor(0, 0);
+    }
+
+    rgbLed.show();
+
+    if (blinkTogglesLeft > 0)
+    {
+      blinkTogglesLeft--;
+    }
+
+    if (blinkTogglesLeft == 0)
+    {
+      blinkActive = false;
+      ledState = false;
+
+      // Nhay upload xong thi quay lai trang thai WiFi
+      setWifiLedByClient();
+    }
+
+    return;
   }
 
-  if (blinkTogglesLeft == 0)
+  // Khi khong blink, cap nhat LED neu so client WiFi thay doi
+  uint8_t clientCount = WiFi.softAPgetStationNum();
+  if (clientCount != lastClientCount)
   {
-    blinkActive = false;
-    ledState = false;
-    digitalWrite(STATUS_LED_PIN, LOW);
+    setWifiLedByClient();
   }
 }
 
@@ -560,7 +631,7 @@ void handleFileUpload()
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
-      startUploadBlink();
+      startUploadBlinkBlue();
       Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
                     (unsigned long long)uploadBytes);
@@ -734,7 +805,7 @@ void handleFileUploadAll()
       uploadOK = true;
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
-      startUploadBlink();
+      startUploadBlinkBlue();
 
       Serial.printf("[UPLOAD-ALL] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
@@ -861,9 +932,10 @@ void setup()
 
   WiFi.softAPConfig(local_IP, gateway, subnet);
 
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, LOW);
-  Serial.printf("[LED] STATUS PIN: GPIO%d\n", STATUS_LED_PIN);
+  rgbLed.begin();
+  rgbLed.clear();
+  rgbLed.show();
+  Serial.printf("[RGB LED] STATUS PIN: GPIO%d\n", RGB_LED_PIN);
 
   // De hien SSID khi test de ket noi on dinh hon.
   // Neu can an SSID lai, doi hidden = true.
@@ -894,6 +966,9 @@ void setup()
   Serial.printf("[WIFI] HIDDEN: %s\n", hidden ? "YES" : "NO");
   Serial.printf("[WIFI] MAX CLIENT: %d\n", max_connection);
   Serial.printf("[HTTP] PORT: %d\n", SERVER_PORT);
+
+  // Ban dau chua co client ket noi thi LED tat. Khi co client ket noi se tu chuyen xanh la.
+  setWifiLedByClient();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -933,4 +1008,3 @@ void loop()
   server.handleClient();
   updateStatusLed();
 }
-

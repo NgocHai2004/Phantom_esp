@@ -1,0 +1,1 @@
+python -m platformio run -e esp32-c6-devkitc-1 -t upload --upload-port COM6                                     
