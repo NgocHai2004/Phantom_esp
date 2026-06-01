@@ -48,23 +48,25 @@ WebServer server(SERVER_PORT);
 
 Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
-const uint8_t BLINK_COUNT_PER_UPLOAD = 3;
-const uint16_t BLINK_INTERVAL_MS = 120;
-
-// Mau LED
+// ================== LED CONFIG ==================
+// Co thiet bi ket noi WiFi AP -> xanh la
 const uint8_t WIFI_OK_R = 0;
 const uint8_t WIFI_OK_G = 255;
 const uint8_t WIFI_OK_B = 0;
 
-const uint8_t UPLOAD_BLINK_R = 0;
-const uint8_t UPLOAD_BLINK_G = 0;
-const uint8_t UPLOAD_BLINK_B = 255;
+// Upload thanh cong -> xanh duong
+const uint8_t UPLOAD_LED_R = 0;
+const uint8_t UPLOAD_LED_G = 0;
+const uint8_t UPLOAD_LED_B = 255;
 
-bool ledState = false;
-bool blinkActive = false;
-uint8_t blinkTogglesLeft = 0;
-unsigned long lastBlinkMs = 0;
-uint32_t blinkColor = 0;
+// Moi API upload thanh cong se cong them thoi gian sang xanh duong
+// 1 API = 500ms
+// 10 API lien tiep = khoang 5000ms = 5 giay
+const uint16_t UPLOAD_LED_HOLD_MS = 500;
+
+bool uploadLedActive = false;
+unsigned long uploadLedUntilMs = 0;
+
 uint8_t lastClientCount = 0;
 
 // ================== UPLOAD STATE ==================
@@ -155,8 +157,6 @@ String safeFileName(String name)
 
 bool initSDWithFallback()
 {
-  // Thu toc do cao truoc de tranh bi ket o 1MHz lam upload rat cham.
-  // Neu day/microSD khong on, code se tu fallback xuong toc do thap hon.
   const uint32_t freqs[] = {20000000, 16000000, 10000000, 8000000, 4000000, 1000000, 400000};
 
   for (size_t i = 0; i < (sizeof(freqs) / sizeof(freqs[0])); i++)
@@ -196,6 +196,7 @@ uint64_t getTotalBytes()
   return SD.totalBytes();
 }
 
+// ================== LED FUNCTIONS ==================
 void setLedColor(uint8_t r, uint8_t g, uint8_t b)
 {
   rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
@@ -225,60 +226,47 @@ void setWifiLedByClient()
   lastClientCount = clientCount;
 }
 
-void startUploadBlink(uint8_t r, uint8_t g, uint8_t b)
-{
-  blinkColor = rgbLed.Color(r, g, b);
-  blinkActive = true;
-  ledState = false;
-  blinkTogglesLeft = BLINK_COUNT_PER_UPLOAD * 2;
-  lastBlinkMs = millis();
-}
-
 void startUploadBlinkBlue()
 {
-  startUploadBlink(UPLOAD_BLINK_R, UPLOAD_BLINK_G, UPLOAD_BLINK_B);
+  unsigned long now = millis();
+
+  uploadLedActive = true;
+
+  // Neu LED upload da het han hoac chua chay, bat dau tinh tu hien tai
+  if ((int32_t)(uploadLedUntilMs - now) <= 0)
+  {
+    uploadLedUntilMs = now + UPLOAD_LED_HOLD_MS;
+  }
+  else
+  {
+    // Neu dang sang xanh duong, moi API upload thanh cong se cong them 500ms
+    uploadLedUntilMs += UPLOAD_LED_HOLD_MS;
+  }
+
+  // Bat xanh duong ngay lap tuc
+  setLedColor(UPLOAD_LED_R, UPLOAD_LED_G, UPLOAD_LED_B);
 }
 
 void updateStatusLed()
 {
-  if (blinkActive)
+  unsigned long now = millis();
+
+  // Neu dang trong thoi gian bao upload thi giu LED xanh duong
+  if (uploadLedActive)
   {
-    unsigned long now = millis();
-    if (now - lastBlinkMs < BLINK_INTERVAL_MS)
+    if ((int32_t)(uploadLedUntilMs - now) > 0)
+    {
+      setLedColor(UPLOAD_LED_R, UPLOAD_LED_G, UPLOAD_LED_B);
       return;
-
-    lastBlinkMs = now;
-    ledState = !ledState;
-
-    if (ledState)
-    {
-      rgbLed.setPixelColor(0, blinkColor);
-    }
-    else
-    {
-      rgbLed.setPixelColor(0, 0);
     }
 
-    rgbLed.show();
-
-    if (blinkTogglesLeft > 0)
-    {
-      blinkTogglesLeft--;
-    }
-
-    if (blinkTogglesLeft == 0)
-    {
-      blinkActive = false;
-      ledState = false;
-
-      // Nhay upload xong thi quay lai trang thai WiFi
-      setWifiLedByClient();
-    }
-
+    // Het thoi gian bao upload thi quay lai trang thai WiFi
+    uploadLedActive = false;
+    setWifiLedByClient();
     return;
   }
 
-  // Khi khong blink, cap nhat LED neu so client WiFi thay doi
+  // Khi khong upload, cap nhat LED neu so client WiFi thay doi
   uint8_t clientCount = WiFi.softAPgetStationNum();
   if (clientCount != lastClientCount)
   {
@@ -631,7 +619,11 @@ void handleFileUpload()
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
+
+      // Upload thanh cong -> LED xanh duong sang them 500ms
+      // Neu nhieu API upload lien tiep, thoi gian se duoc cong don
       startUploadBlinkBlue();
+
       Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
                     (unsigned long long)uploadBytes);
@@ -805,6 +797,8 @@ void handleFileUploadAll()
       uploadOK = true;
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
+
+      // Moi file trong upload-all thanh cong cung cong them 500ms LED xanh duong
       startUploadBlinkBlue();
 
       Serial.printf("[UPLOAD-ALL] OK name=%s size=%llu\n",
