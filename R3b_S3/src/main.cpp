@@ -4,36 +4,33 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
-#include <Adafruit_NeoPixel.h>
 
-// ================== microSD PIN - ESP32-C6 DevKitC-1-N8 ==================
-// Noi module microSD SPI:
-// VCC  -> 3V3
-// GND  -> GND
-// SCK  -> GPIO19
-// MOSI -> GPIO18
-// MISO -> GPIO20
-// CS   -> GPIO23
-#define SD_CS 23
-#define SD_SCK 19
-#define SD_MOSI 18
-#define SD_MISO 20
+// ================== microSD PIN - ESP32-S3 ==================
+#define SD_CS 10
+#define SD_SCK 12
+#define SD_MOSI 11
+#define SD_MISO 13
 
-// Khuyen dung false de tranh format nham the nho.
-// Neu the moi/loi mount va ban chap nhan format, co the doi thanh true.
 #define SD_FORMAT_IF_EMPTY false
 
 SPIClass spiSD(FSPI);
 
-// Luu toc do SPI da mount thanh cong de hien thi trong /api/status
 uint32_t mountedSDFreq = 0;
 
+// ================== I2S MIC PIN (reserved) ==================
+#define I2S_BCLK 4
+#define I2S_WS 5
+#define I2S_SD 6
+
+// ================== LED PIN - ESP32-S3 ==================
+#define LED_RED 21
+#define LED_GREEN 47
+#define LED_WHITE 48
+
 // ================== WIFI AP CONFIG ==================
-// Giu dung SSID/password theo code Python client cu
 const char *AP_SSID = "7068616e746f6d303030303030300002";
 const char *AP_PASS = "12345678";
 
-// Cho giong server cu: http://10.42.0.1:8765
 IPAddress local_IP(10, 42, 0, 1);
 IPAddress gateway(10, 42, 0, 1);
 IPAddress subnet(255, 255, 255, 0);
@@ -41,31 +38,10 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
-// ================== ONBOARD RGB LED ==================
-// ESP32-C6 DevKitC-1 onboard RGB LED: GPIO8
-#define RGB_LED_PIN 8
-#define RGB_LED_COUNT 1
-
-Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// ================== LED CONFIG ==================
-// Co thiet bi ket noi WiFi AP -> xanh la
-const uint8_t WIFI_OK_R = 0;
-const uint8_t WIFI_OK_G = 255;
-const uint8_t WIFI_OK_B = 0;
-
-// Upload thanh cong -> xanh duong
-const uint8_t UPLOAD_LED_R = 0;
-const uint8_t UPLOAD_LED_G = 0;
-const uint8_t UPLOAD_LED_B = 255;
-
-// Moi API upload thanh cong se cong them thoi gian sang xanh duong
-// 1 API = 500ms
-// 10 API lien tiep = khoang 5000ms = 5 giay
-const uint16_t UPLOAD_LED_HOLD_MS = 500;
-
+// ================== LED STATE ==================
 bool uploadLedActive = false;
 unsigned long uploadLedUntilMs = 0;
+const uint16_t UPLOAD_LED_HOLD_MS = 500;
 
 uint8_t lastClientCount = 0;
 
@@ -197,15 +173,26 @@ uint64_t getTotalBytes()
 }
 
 // ================== LED FUNCTIONS ==================
-void setLedColor(uint8_t r, uint8_t g, uint8_t b)
+void ledAllOff()
 {
-  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
-  rgbLed.show();
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_WHITE, LOW);
 }
 
-void ledOff()
+void ledRed(bool on)
 {
-  setLedColor(0, 0, 0);
+  digitalWrite(LED_RED, on ? HIGH : LOW);
+}
+
+void ledGreen(bool on)
+{
+  digitalWrite(LED_GREEN, on ? HIGH : LOW);
+}
+
+void ledWhite(bool on)
+{
+  digitalWrite(LED_WHITE, on ? HIGH : LOW);
 }
 
 void setWifiLedByClient()
@@ -214,59 +201,52 @@ void setWifiLedByClient()
 
   if (clientCount > 0)
   {
-    // Co thiet bi ket noi vao WiFi AP -> xanh la
-    setLedColor(WIFI_OK_R, WIFI_OK_G, WIFI_OK_B);
+    ledGreen(true);
   }
   else
   {
-    // Chua co thiet bi ket noi -> tat LED
-    ledOff();
+    ledGreen(false);
   }
 
   lastClientCount = clientCount;
 }
 
-void startUploadBlinkBlue()
+void startUploadBlinkWhite()
 {
   unsigned long now = millis();
 
   uploadLedActive = true;
 
-  // Neu LED upload da het han hoac chua chay, bat dau tinh tu hien tai
   if ((int32_t)(uploadLedUntilMs - now) <= 0)
   {
     uploadLedUntilMs = now + UPLOAD_LED_HOLD_MS;
   }
   else
   {
-    // Neu dang sang xanh duong, moi API upload thanh cong se cong them 500ms
     uploadLedUntilMs += UPLOAD_LED_HOLD_MS;
   }
 
-  // Bat xanh duong ngay lap tuc
-  setLedColor(UPLOAD_LED_R, UPLOAD_LED_G, UPLOAD_LED_B);
+  ledWhite(true);
 }
 
 void updateStatusLed()
 {
   unsigned long now = millis();
 
-  // Neu dang trong thoi gian bao upload thi giu LED xanh duong
   if (uploadLedActive)
   {
     if ((int32_t)(uploadLedUntilMs - now) > 0)
     {
-      setLedColor(UPLOAD_LED_R, UPLOAD_LED_G, UPLOAD_LED_B);
+      ledWhite(true);
       return;
     }
 
-    // Het thoi gian bao upload thi quay lai trang thai WiFi
     uploadLedActive = false;
+    ledWhite(false);
     setWifiLedByClient();
     return;
   }
 
-  // Khi khong upload, cap nhat LED neu so client WiFi thay doi
   uint8_t clientCount = WiFi.softAPgetStationNum();
   if (clientCount != lastClientCount)
   {
@@ -278,7 +258,7 @@ void updateStatusLed()
 void handleRoot()
 {
   String msg = "";
-  msg += "ESP32-C6 microSD Upload Server FAST\n";
+  msg += "ESP32-S3 microSD Upload Server\n";
   msg += "AP SSID: ";
   msg += AP_SSID;
   msg += "\n";
@@ -319,6 +299,7 @@ void handleStatus()
 
   String json = "{";
   json += "\"ok\":true,";
+  json += "\"board\":\"ESP32-S3\",";
   json += "\"wifi_mode\":\"AP\",";
   json += "\"ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
   json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -619,10 +600,7 @@ void handleFileUpload()
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
-
-      // Upload thanh cong -> LED xanh duong sang them 500ms
-      // Neu nhieu API upload lien tiep, thoi gian se duoc cong don
-      startUploadBlinkBlue();
+      startUploadBlinkWhite();
 
       Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
@@ -798,8 +776,7 @@ void handleFileUploadAll()
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
 
-      // Moi file trong upload-all thanh cong cung cong them 500ms LED xanh duong
-      startUploadBlinkBlue();
+      startUploadBlinkWhite();
 
       Serial.printf("[UPLOAD-ALL] OK name=%s size=%llu\n",
                     uploadFileName.c_str(),
@@ -868,7 +845,14 @@ void setup()
   delay(1500);
 
   Serial.println();
-  Serial.println("=== ESP32-C6 microSD WIFI SERVER FAST ===");
+  Serial.println("=== ESP32-S3 microSD WIFI SERVER ===");
+
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_WHITE, OUTPUT);
+  ledAllOff();
+
+  ledRed(true);
 
   Serial.println("[SD] Khoi tao SPI...");
   spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -880,13 +864,16 @@ void setup()
     Serial.println("Kiem tra day:");
     Serial.println("VCC  -> 3V3");
     Serial.println("GND  -> GND");
-    Serial.println("SCK  -> GPIO19");
-    Serial.println("MOSI -> GPIO18");
-    Serial.println("MISO -> GPIO20");
-    Serial.println("CS   -> GPIO23");
+    Serial.println("SCK  -> GPIO12");
+    Serial.println("MOSI -> GPIO11");
+    Serial.println("MISO -> GPIO13");
+    Serial.println("CS   -> GPIO10");
     while (true)
     {
-      delay(1000);
+      ledRed(true);
+      delay(300);
+      ledRed(false);
+      delay(300);
     }
   }
 
@@ -895,7 +882,10 @@ void setup()
     Serial.println("[SD] FAIL: Khong tao duoc /uploads");
     while (true)
     {
-      delay(1000);
+      ledRed(true);
+      delay(100);
+      ledRed(false);
+      delay(100);
     }
   }
 
@@ -917,28 +907,12 @@ void setup()
 
   Serial.println("[WIFI] Cau hinh IP AP...");
   WiFi.mode(WIFI_AP);
-
-  // Giam do tre/rot ket noi khi upload file trong cung phong
   WiFi.setSleep(false);
-
-  // Tang cong suat phat len muc cao de test on dinh trong phong kin
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
-
   WiFi.softAPConfig(local_IP, gateway, subnet);
 
-  rgbLed.begin();
-  rgbLed.clear();
-  rgbLed.show();
-  Serial.printf("[RGB LED] STATUS PIN: GPIO%d\n", RGB_LED_PIN);
-
-  // De hien SSID khi test de ket noi on dinh hon.
-  // Neu can an SSID lai, doi hidden = true.
   bool hidden = false;
-
-  // Thu 1 / 6 / 11 de tim kenh it nhieu nhieu nhat.
   int channel = 1;
-
-  // Gioi han toi da 2 client ket noi cung luc.
   int max_connection = 2;
 
   bool apOK = WiFi.softAP(AP_SSID, AP_PASS, channel, hidden, max_connection);
@@ -948,9 +922,14 @@ void setup()
     Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
     while (true)
     {
-      delay(1000);
+      ledRed(true);
+      delay(500);
+      ledRed(false);
+      delay(500);
     }
   }
+
+  ledRed(false);
 
   Serial.println("[WIFI] OK: Da phat WiFi AP");
   Serial.printf("[WIFI] SSID: %s\n", AP_SSID);
@@ -960,8 +939,8 @@ void setup()
   Serial.printf("[WIFI] HIDDEN: %s\n", hidden ? "YES" : "NO");
   Serial.printf("[WIFI] MAX CLIENT: %d\n", max_connection);
   Serial.printf("[HTTP] PORT: %d\n", SERVER_PORT);
+  Serial.printf("[LED] RED: GPIO%d | GREEN: GPIO%d | WHITE: GPIO%d\n", LED_RED, LED_GREEN, LED_WHITE);
 
-  // Ban dau chua co client ket noi thi LED tat. Khi co client ket noi se tu chuyen xanh la.
   setWifiLedByClient();
 
   server.on("/", HTTP_GET, handleRoot);
