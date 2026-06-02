@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
+#include <driver/i2s_std.h>
 
 // ================== microSD PIN - ESP32-S3 ==================
 #define SD_CS 10
@@ -17,10 +18,24 @@ SPIClass spiSD(FSPI);
 
 uint32_t mountedSDFreq = 0;
 
-// ================== I2S MIC PIN (reserved) ==================
+// ================== I2S MIC PIN - ICS-43434 ==================
 #define I2S_BCLK 4
 #define I2S_WS 5
 #define I2S_SD 6
+
+#define REC_SAMPLE_RATE 16000
+#define REC_BITS 16
+#define REC_CHANNELS 1
+#define REC_DURATION_SEC 30
+#define REC_DMA_BUF_COUNT 4
+#define REC_DMA_BUF_LEN 256
+
+i2s_chan_handle_t i2s_rx_handle = NULL;
+bool recActive = false;
+uint32_t recFileIndex = 0;
+
+static int32_t i2sBuf[REC_DMA_BUF_LEN];
+static int16_t pcmBuf[REC_DMA_BUF_LEN];
 
 // ================== LED PIN - ESP32-S3 ==================
 #define LED_RED 21
@@ -251,6 +266,248 @@ void updateStatusLed()
   if (clientCount != lastClientCount)
   {
     setWifiLedByClient();
+  }
+}
+
+// ================== I2S RECORDING ==================
+bool initI2SMic()
+{
+  i2s_chan_config_t chan_cfg = {
+      .id = I2S_NUM_0,
+      .role = I2S_ROLE_MASTER,
+      .dma_desc_num = REC_DMA_BUF_COUNT,
+      .dma_frame_num = REC_DMA_BUF_LEN,
+      .auto_clear_after_cb = true,
+      .auto_clear_before_cb = false,
+      .intr_priority = 0,
+  };
+
+  if (i2s_new_channel(&chan_cfg, NULL, &i2s_rx_handle) != ESP_OK)
+  {
+    Serial.println("[MIC] FAIL: i2s_new_channel");
+    return false;
+  }
+
+  i2s_std_config_t std_cfg = {
+      .clk_cfg = {
+          .sample_rate_hz = REC_SAMPLE_RATE,
+          .clk_src = I2S_CLK_SRC_DEFAULT,
+          .ext_clk_freq_hz = 0,
+          .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+      },
+      .slot_cfg = {
+          .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+          .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+          .slot_mode = I2S_SLOT_MODE_MONO,
+          .slot_mask = I2S_STD_SLOT_LEFT,
+          .ws_width = I2S_DATA_BIT_WIDTH_32BIT,
+          .ws_pol = false,
+          .bit_shift = true,
+          .left_align = true,
+          .big_endian = false,
+          .bit_order_lsb = false,
+      },
+      .gpio_cfg = {
+          .mclk = I2S_GPIO_UNUSED,
+          .bclk = (gpio_num_t)I2S_BCLK,
+          .ws = (gpio_num_t)I2S_WS,
+          .dout = I2S_GPIO_UNUSED,
+          .din = (gpio_num_t)I2S_SD,
+          .invert_flags = {
+              .mclk_inv = false,
+              .bclk_inv = false,
+              .ws_inv = false,
+          },
+      },
+  };
+
+  if (i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg) != ESP_OK)
+  {
+    Serial.println("[MIC] FAIL: i2s_channel_init_std_mode");
+    i2s_del_channel(i2s_rx_handle);
+    i2s_rx_handle = NULL;
+    return false;
+  }
+
+  Serial.println("[MIC] I2S init OK (ICS-43434, 16kHz mono)");
+  return true;
+}
+
+void writeWavHeader(File &f, uint32_t dataSize)
+{
+  uint16_t bitsPerSample = REC_BITS;
+  uint16_t numChannels = REC_CHANNELS;
+  uint32_t sampleRate = REC_SAMPLE_RATE;
+  uint16_t blockAlign = numChannels * (bitsPerSample / 8);
+  uint32_t byteRate = sampleRate * blockAlign;
+  uint32_t chunkSize = 36 + dataSize;
+
+  f.write((const uint8_t *)"RIFF", 4);
+  f.write((const uint8_t *)&chunkSize, 4);
+  f.write((const uint8_t *)"WAVE", 4);
+  f.write((const uint8_t *)"fmt ", 4);
+  uint32_t subchunk1Size = 16;
+  f.write((const uint8_t *)&subchunk1Size, 4);
+  uint16_t audioFormat = 1; // PCM
+  f.write((const uint8_t *)&audioFormat, 2);
+  f.write((const uint8_t *)&numChannels, 2);
+  f.write((const uint8_t *)&sampleRate, 4);
+  f.write((const uint8_t *)&byteRate, 4);
+  f.write((const uint8_t *)&blockAlign, 2);
+  f.write((const uint8_t *)&bitsPerSample, 2);
+  f.write((const uint8_t *)"data", 4);
+  f.write((const uint8_t *)&dataSize, 4);
+}
+
+void doRecording()
+{
+  if (recActive)
+  {
+    Serial.println("[REC] Dang ghi am, gui 'stop' de dung.");
+    return;
+  }
+
+  if (!i2s_rx_handle)
+  {
+    if (!initI2SMic())
+    {
+      Serial.println("[REC] Khong khoi tao duoc I2S mic!");
+      return;
+    }
+  }
+
+  recFileIndex++;
+  String fileName = "/uploads/rec_" + String(recFileIndex) + ".wav";
+
+  if (!ensureUploadDir())
+  {
+    Serial.println("[REC] Khong tao duoc /uploads");
+    return;
+  }
+
+  File wavFile = SD.open(fileName, FILE_WRITE);
+  if (!wavFile)
+  {
+    Serial.println("[REC] Khong mo duoc file: " + fileName);
+    return;
+  }
+
+  uint32_t totalSamples = REC_SAMPLE_RATE * REC_DURATION_SEC;
+  uint32_t expectedDataSize = totalSamples * REC_CHANNELS * (REC_BITS / 8);
+
+  writeWavHeader(wavFile, expectedDataSize);
+
+  if (i2s_channel_enable(i2s_rx_handle) != ESP_OK)
+  {
+    Serial.println("[REC] FAIL: i2s_channel_enable");
+    wavFile.close();
+    SD.remove(fileName);
+    return;
+  }
+
+  recActive = true;
+  Serial.println("[REC] === BAT DAU GHI AM ===");
+  Serial.printf("[REC] File: %s\n", fileName.c_str());
+  Serial.printf("[REC] %d Hz, %d-bit, mono, %d giay\n", REC_SAMPLE_RATE, REC_BITS, REC_DURATION_SEC);
+  Serial.println("[REC] Gui 'stop' de dung som.");
+
+  ledAllOff();
+
+  uint32_t samplesWritten = 0;
+  size_t bytesRead = 0;
+  unsigned long startMs = millis();
+  unsigned long lastProgressMs = startMs;
+  bool stopped = false;
+
+  while (samplesWritten < totalSamples)
+  {
+    if (((millis() - startMs) / 500) % 2 == 0)
+      ledWhite(true);
+    else
+      ledWhite(false);
+
+    if (i2s_channel_read(i2s_rx_handle, i2sBuf, sizeof(i2sBuf), &bytesRead, 100) != ESP_OK)
+    {
+      continue;
+    }
+
+    size_t samplesRead = bytesRead / sizeof(int32_t);
+
+    for (size_t i = 0; i < samplesRead; i++)
+    {
+      pcmBuf[i] = (int16_t)(i2sBuf[i] >> 14);
+    }
+
+    uint32_t samplesToWrite = samplesRead;
+    if (samplesWritten + samplesToWrite > totalSamples)
+    {
+      samplesToWrite = totalSamples - samplesWritten;
+    }
+
+    wavFile.write((const uint8_t *)pcmBuf, samplesToWrite * sizeof(int16_t));
+    samplesWritten += samplesToWrite;
+
+    if (millis() - lastProgressMs >= 5000)
+    {
+      wavFile.flush();
+      uint32_t elapsed = (millis() - startMs) / 1000;
+      Serial.printf("[REC] %lu/%d giay (%lu samples)\n", (unsigned long)elapsed, REC_DURATION_SEC, (unsigned long)samplesWritten);
+      lastProgressMs = millis();
+    }
+
+    if (Serial.available())
+    {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd == "stop")
+      {
+        stopped = true;
+        break;
+      }
+    }
+  }
+
+  i2s_channel_disable(i2s_rx_handle);
+  recActive = false;
+
+  uint32_t actualDataSize = samplesWritten * REC_CHANNELS * (REC_BITS / 8);
+  wavFile.seek(0);
+  writeWavHeader(wavFile, actualDataSize);
+  wavFile.close();
+
+  ledWhite(false);
+  ledGreen(true);
+  delay(1000);
+  ledGreen(false);
+  setWifiLedByClient();
+
+  float duration = (float)samplesWritten / REC_SAMPLE_RATE;
+  Serial.println("[REC] === HOAN THANH ===");
+  Serial.printf("[REC] File: %s\n", fileName.c_str());
+  Serial.printf("[REC] Thoi luong: %.1f giay\n", duration);
+  Serial.printf("[REC] Kich thuoc: %s\n", humanSize(actualDataSize + 44).c_str());
+  if (stopped)
+    Serial.println("[REC] (Dung som boi lenh 'stop')");
+}
+
+void handleSerialCommand()
+{
+  if (!Serial.available())
+    return;
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd == "rec" || cmd == "record")
+  {
+    doRecording();
+  }
+  else if (cmd == "help")
+  {
+    Serial.println("=== SERIAL COMMANDS ===");
+    Serial.println("rec    - Ghi am 30 giay tu mic ICS-43434 vao SD");
+    Serial.println("stop   - Dung ghi am som");
+    Serial.println("help   - Hien thi menu nay");
   }
 }
 
@@ -973,6 +1230,8 @@ void setup()
 
   Serial.println("[HTTP] Server started");
   Serial.println("=== READY ===");
+  Serial.println("[REC] Tu dong ghi am 30 giay...");
+  doRecording();
 }
 
 // ================== LOOP ==================
@@ -980,4 +1239,5 @@ void loop()
 {
   server.handleClient();
   updateStatusLed();
+  handleSerialCommand();
 }
