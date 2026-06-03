@@ -1,10 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
-#include <driver/i2s_std.h>
 
 // ================== microSD PIN - ESP32-S3 ==================
 #define SD_CS 10
@@ -17,25 +17,6 @@
 SPIClass spiSD(FSPI);
 
 uint32_t mountedSDFreq = 0;
-
-// ================== I2S MIC PIN - ICS-43434 ==================
-#define I2S_BCLK 4
-#define I2S_WS 5
-#define I2S_SD 6
-
-#define REC_SAMPLE_RATE 16000
-#define REC_BITS 16
-#define REC_CHANNELS 1
-#define REC_DURATION_SEC 30
-#define REC_DMA_BUF_COUNT 4
-#define REC_DMA_BUF_LEN 256
-
-i2s_chan_handle_t i2s_rx_handle = NULL;
-bool recActive = false;
-uint32_t recFileIndex = 0;
-
-static int32_t i2sBuf[REC_DMA_BUF_LEN];
-static int16_t pcmBuf[REC_DMA_BUF_LEN];
 
 // ================== LED PIN - ESP32-S3 ==================
 #define LED_RED 21
@@ -53,12 +34,26 @@ IPAddress subnet(255, 255, 255, 0);
 #define SERVER_PORT 8765
 WebServer server(SERVER_PORT);
 
+// ================== TRUSTED WIFI CONFIG ==================
+#define TRUSTED_SSID "7068616e746f6d303030303030300001"
+#define TRUSTED_PASS "12345678"
+#define SCAN_INTERVAL_MS 10000UL
+#define STA_CONNECT_TIMEOUT_MS 10000UL
+#define AP_CHANNEL 1
+#define AP_HIDDEN true
+#define AP_MAX_CONN 2
+
 // ================== LED STATE ==================
 bool uploadLedActive = false;
 unsigned long uploadLedUntilMs = 0;
 const uint16_t UPLOAD_LED_HOLD_MS = 500;
 
 uint8_t lastClientCount = 0;
+
+// ================== WIFI MODE STATE ==================
+enum WifiMode { MODE_AP, MODE_STA };
+WifiMode currentMode = MODE_AP;
+unsigned long lastScanMs = 0;
 
 // ================== UPLOAD STATE ==================
 File uploadFile;
@@ -111,37 +106,26 @@ String safeFileName(String name)
 
   int slash = name.lastIndexOf('/');
   if (slash >= 0)
-  {
     name = name.substring(slash + 1);
-  }
 
   String safe = "";
   for (size_t i = 0; i < name.length(); i++)
   {
     char c = name[i];
-
     if ((c >= 'a' && c <= 'z') ||
         (c >= 'A' && c <= 'Z') ||
         (c >= '0' && c <= '9') ||
         c == '.' || c == '_' || c == '-')
-    {
       safe += c;
-    }
     else
-    {
       safe += "_";
-    }
   }
 
   if (safe.length() == 0)
-  {
     safe = "upload.bin";
-  }
 
   if (safe.length() > 80)
-  {
     safe = safe.substring(safe.length() - 80);
-  }
 
   return safe;
 }
@@ -153,10 +137,8 @@ bool initSDWithFallback()
   for (size_t i = 0; i < (sizeof(freqs) / sizeof(freqs[0])); i++)
   {
     uint32_t hz = freqs[i];
-
     SD.end();
     Serial.printf("[SD] Thu SD.begin o %lu Hz...\n", (unsigned long)hz);
-
     if (SD.begin(SD_CS, spiSD, hz, "/sd", 8, SD_FORMAT_IF_EMPTY))
     {
       mountedSDFreq = hz;
@@ -164,28 +146,18 @@ bool initSDWithFallback()
       return true;
     }
   }
-
   return false;
 }
 
 bool ensureUploadDir()
 {
   if (!SD.exists("/uploads"))
-  {
     return SD.mkdir("/uploads");
-  }
   return true;
 }
 
-uint64_t getUsedBytes()
-{
-  return SD.usedBytes();
-}
-
-uint64_t getTotalBytes()
-{
-  return SD.totalBytes();
-}
+uint64_t getUsedBytes()  { return SD.usedBytes(); }
+uint64_t getTotalBytes() { return SD.totalBytes(); }
 
 // ================== LED FUNCTIONS ==================
 void ledAllOff()
@@ -195,52 +167,26 @@ void ledAllOff()
   digitalWrite(LED_WHITE, LOW);
 }
 
-void ledRed(bool on)
-{
-  digitalWrite(LED_RED, on ? HIGH : LOW);
-}
-
-void ledGreen(bool on)
-{
-  digitalWrite(LED_GREEN, on ? HIGH : LOW);
-}
-
-void ledWhite(bool on)
-{
-  digitalWrite(LED_WHITE, on ? HIGH : LOW);
-}
+void ledRed(bool on)   { digitalWrite(LED_RED,   on ? HIGH : LOW); }
+void ledGreen(bool on) { digitalWrite(LED_GREEN, on ? HIGH : LOW); }
+void ledWhite(bool on) { digitalWrite(LED_WHITE, on ? HIGH : LOW); }
+void ledPink(bool on)  { digitalWrite(LED_RED, on ? HIGH : LOW); digitalWrite(LED_WHITE, on ? HIGH : LOW); }
 
 void setWifiLedByClient()
 {
   uint8_t clientCount = WiFi.softAPgetStationNum();
-
-  if (clientCount > 0)
-  {
-    ledGreen(true);
-  }
-  else
-  {
-    ledGreen(false);
-  }
-
+  ledGreen(clientCount > 0);
   lastClientCount = clientCount;
 }
 
 void startUploadBlinkWhite()
 {
   unsigned long now = millis();
-
   uploadLedActive = true;
-
   if ((int32_t)(uploadLedUntilMs - now) <= 0)
-  {
     uploadLedUntilMs = now + UPLOAD_LED_HOLD_MS;
-  }
   else
-  {
     uploadLedUntilMs += UPLOAD_LED_HOLD_MS;
-  }
-
   ledWhite(true);
 }
 
@@ -255,315 +201,70 @@ void updateStatusLed()
       ledWhite(true);
       return;
     }
-
     uploadLedActive = false;
     ledWhite(false);
-    setWifiLedByClient();
+    if (currentMode == MODE_STA)
+    {
+      ledPink(true);
+    }
+    else
+    {
+      setWifiLedByClient();
+    }
+    return;
+  }
+
+  if (currentMode == MODE_STA)
+  {
+    ledPink(true);
     return;
   }
 
   uint8_t clientCount = WiFi.softAPgetStationNum();
   if (clientCount != lastClientCount)
-  {
     setWifiLedByClient();
-  }
-}
-
-// ================== I2S RECORDING ==================
-bool initI2SMic()
-{
-  i2s_chan_config_t chan_cfg = {
-      .id = I2S_NUM_0,
-      .role = I2S_ROLE_MASTER,
-      .dma_desc_num = REC_DMA_BUF_COUNT,
-      .dma_frame_num = REC_DMA_BUF_LEN,
-      .auto_clear_after_cb = true,
-      .auto_clear_before_cb = false,
-      .intr_priority = 0,
-  };
-
-  if (i2s_new_channel(&chan_cfg, NULL, &i2s_rx_handle) != ESP_OK)
-  {
-    Serial.println("[MIC] FAIL: i2s_new_channel");
-    return false;
-  }
-
-  i2s_std_config_t std_cfg = {
-      .clk_cfg = {
-          .sample_rate_hz = REC_SAMPLE_RATE,
-          .clk_src = I2S_CLK_SRC_DEFAULT,
-          .ext_clk_freq_hz = 0,
-          .mclk_multiple = I2S_MCLK_MULTIPLE_256,
-      },
-      .slot_cfg = {
-          .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
-          .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
-          .slot_mode = I2S_SLOT_MODE_MONO,
-          .slot_mask = I2S_STD_SLOT_LEFT,
-          .ws_width = I2S_DATA_BIT_WIDTH_32BIT,
-          .ws_pol = false,
-          .bit_shift = true,
-          .left_align = true,
-          .big_endian = false,
-          .bit_order_lsb = false,
-      },
-      .gpio_cfg = {
-          .mclk = I2S_GPIO_UNUSED,
-          .bclk = (gpio_num_t)I2S_BCLK,
-          .ws = (gpio_num_t)I2S_WS,
-          .dout = I2S_GPIO_UNUSED,
-          .din = (gpio_num_t)I2S_SD,
-          .invert_flags = {
-              .mclk_inv = false,
-              .bclk_inv = false,
-              .ws_inv = false,
-          },
-      },
-  };
-
-  if (i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg) != ESP_OK)
-  {
-    Serial.println("[MIC] FAIL: i2s_channel_init_std_mode");
-    i2s_del_channel(i2s_rx_handle);
-    i2s_rx_handle = NULL;
-    return false;
-  }
-
-  Serial.println("[MIC] I2S init OK (ICS-43434, 16kHz mono)");
-  return true;
-}
-
-void writeWavHeader(File &f, uint32_t dataSize)
-{
-  uint16_t bitsPerSample = REC_BITS;
-  uint16_t numChannels = REC_CHANNELS;
-  uint32_t sampleRate = REC_SAMPLE_RATE;
-  uint16_t blockAlign = numChannels * (bitsPerSample / 8);
-  uint32_t byteRate = sampleRate * blockAlign;
-  uint32_t chunkSize = 36 + dataSize;
-
-  f.write((const uint8_t *)"RIFF", 4);
-  f.write((const uint8_t *)&chunkSize, 4);
-  f.write((const uint8_t *)"WAVE", 4);
-  f.write((const uint8_t *)"fmt ", 4);
-  uint32_t subchunk1Size = 16;
-  f.write((const uint8_t *)&subchunk1Size, 4);
-  uint16_t audioFormat = 1; // PCM
-  f.write((const uint8_t *)&audioFormat, 2);
-  f.write((const uint8_t *)&numChannels, 2);
-  f.write((const uint8_t *)&sampleRate, 4);
-  f.write((const uint8_t *)&byteRate, 4);
-  f.write((const uint8_t *)&blockAlign, 2);
-  f.write((const uint8_t *)&bitsPerSample, 2);
-  f.write((const uint8_t *)"data", 4);
-  f.write((const uint8_t *)&dataSize, 4);
-}
-
-void doRecording()
-{
-  if (recActive)
-  {
-    Serial.println("[REC] Dang ghi am, gui 'stop' de dung.");
-    return;
-  }
-
-  if (!i2s_rx_handle)
-  {
-    if (!initI2SMic())
-    {
-      Serial.println("[REC] Khong khoi tao duoc I2S mic!");
-      return;
-    }
-  }
-
-  recFileIndex++;
-  String fileName = "/uploads/rec_" + String(recFileIndex) + ".wav";
-
-  if (!ensureUploadDir())
-  {
-    Serial.println("[REC] Khong tao duoc /uploads");
-    return;
-  }
-
-  File wavFile = SD.open(fileName, FILE_WRITE);
-  if (!wavFile)
-  {
-    Serial.println("[REC] Khong mo duoc file: " + fileName);
-    return;
-  }
-
-  uint32_t totalSamples = REC_SAMPLE_RATE * REC_DURATION_SEC;
-  uint32_t expectedDataSize = totalSamples * REC_CHANNELS * (REC_BITS / 8);
-
-  writeWavHeader(wavFile, expectedDataSize);
-
-  if (i2s_channel_enable(i2s_rx_handle) != ESP_OK)
-  {
-    Serial.println("[REC] FAIL: i2s_channel_enable");
-    wavFile.close();
-    SD.remove(fileName);
-    return;
-  }
-
-  recActive = true;
-  Serial.println("[REC] === BAT DAU GHI AM ===");
-  Serial.printf("[REC] File: %s\n", fileName.c_str());
-  Serial.printf("[REC] %d Hz, %d-bit, mono, %d giay\n", REC_SAMPLE_RATE, REC_BITS, REC_DURATION_SEC);
-  Serial.println("[REC] Gui 'stop' de dung som.");
-
-  ledAllOff();
-
-  uint32_t samplesWritten = 0;
-  size_t bytesRead = 0;
-  unsigned long startMs = millis();
-  unsigned long lastProgressMs = startMs;
-  bool stopped = false;
-
-  while (samplesWritten < totalSamples)
-  {
-    if (((millis() - startMs) / 500) % 2 == 0)
-      ledWhite(true);
-    else
-      ledWhite(false);
-
-    if (i2s_channel_read(i2s_rx_handle, i2sBuf, sizeof(i2sBuf), &bytesRead, 100) != ESP_OK)
-    {
-      continue;
-    }
-
-    size_t samplesRead = bytesRead / sizeof(int32_t);
-
-    for (size_t i = 0; i < samplesRead; i++)
-    {
-      pcmBuf[i] = (int16_t)(i2sBuf[i] >> 14);
-    }
-
-    uint32_t samplesToWrite = samplesRead;
-    if (samplesWritten + samplesToWrite > totalSamples)
-    {
-      samplesToWrite = totalSamples - samplesWritten;
-    }
-
-    wavFile.write((const uint8_t *)pcmBuf, samplesToWrite * sizeof(int16_t));
-    samplesWritten += samplesToWrite;
-
-    if (millis() - lastProgressMs >= 5000)
-    {
-      wavFile.flush();
-      uint32_t elapsed = (millis() - startMs) / 1000;
-      Serial.printf("[REC] %lu/%d giay (%lu samples)\n", (unsigned long)elapsed, REC_DURATION_SEC, (unsigned long)samplesWritten);
-      lastProgressMs = millis();
-    }
-
-    if (Serial.available())
-    {
-      String cmd = Serial.readStringUntil('\n');
-      cmd.trim();
-      if (cmd == "stop")
-      {
-        stopped = true;
-        break;
-      }
-    }
-  }
-
-  i2s_channel_disable(i2s_rx_handle);
-  recActive = false;
-
-  uint32_t actualDataSize = samplesWritten * REC_CHANNELS * (REC_BITS / 8);
-  wavFile.seek(0);
-  writeWavHeader(wavFile, actualDataSize);
-  wavFile.close();
-
-  ledWhite(false);
-  ledGreen(true);
-  delay(1000);
-  ledGreen(false);
-  setWifiLedByClient();
-
-  float duration = (float)samplesWritten / REC_SAMPLE_RATE;
-  Serial.println("[REC] === HOAN THANH ===");
-  Serial.printf("[REC] File: %s\n", fileName.c_str());
-  Serial.printf("[REC] Thoi luong: %.1f giay\n", duration);
-  Serial.printf("[REC] Kich thuoc: %s\n", humanSize(actualDataSize + 44).c_str());
-  if (stopped)
-    Serial.println("[REC] (Dung som boi lenh 'stop')");
-}
-
-void handleSerialCommand()
-{
-  if (!Serial.available())
-    return;
-
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-
-  if (cmd == "rec" || cmd == "record")
-  {
-    doRecording();
-  }
-  else if (cmd == "help")
-  {
-    Serial.println("=== SERIAL COMMANDS ===");
-    Serial.println("rec    - Ghi am 30 giay tu mic ICS-43434 vao SD");
-    Serial.println("stop   - Dung ghi am som");
-    Serial.println("help   - Hien thi menu nay");
-  }
 }
 
 // ================== API HANDLERS ==================
 void handleRoot()
 {
-  String msg = "";
-  msg += "ESP32-S3 microSD Upload Server\n";
-  msg += "AP SSID: ";
-  msg += AP_SSID;
-  msg += "\n";
-  msg += "IP: ";
-  msg += WiFi.softAPIP().toString();
-  msg += "\n";
-  msg += "Port: ";
-  msg += String(SERVER_PORT);
-  msg += "\n\n";
+  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String msg = "ESP32-S3 microSD WiFi Server\n";
+  msg += "Mode: ";
+  msg += (currentMode == MODE_STA) ? "STA" : "AP";
+  msg += "\nIP: " + ip + "\nPort: " + String(SERVER_PORT) + "\n\n";
   msg += "API:\n";
   msg += "GET    /api/status\n";
   msg += "GET    /api/filelist\n";
   msg += "POST   /api/upload     form-data key=file\n";
-  msg += "POST   /api/upload-all form-data key=files, support multi files\n";
+  msg += "POST   /api/upload-all form-data key=files\n";
   msg += "GET    /api/download?name=filename.bin\n";
-  msg += "GET    /api/delete?name=filename.bin\n";
-  msg += "POST   /api/delete?name=filename.bin\n";
   msg += "DELETE /api/delete?name=filename.bin\n";
-  msg += "POST   /api/delete-all\n";
   msg += "DELETE /api/delete-all\n";
-
   server.send(200, "text/plain", msg);
 }
 
 void handleStatus()
 {
   uint8_t cardType = SD.cardType();
-
   String card = "UNKNOWN";
-  if (cardType == CARD_NONE)
-    card = "NONE";
-  else if (cardType == CARD_MMC)
-    card = "MMC";
-  else if (cardType == CARD_SD)
-    card = "SDSC";
-  else if (cardType == CARD_SDHC)
-    card = "SDHC/SDXC";
+  if (cardType == CARD_NONE)       card = "NONE";
+  else if (cardType == CARD_MMC)   card = "MMC";
+  else if (cardType == CARD_SD)    card = "SDSC";
+  else if (cardType == CARD_SDHC)  card = "SDHC/SDXC";
+
+  String ip = (currentMode == MODE_STA) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
 
   String json = "{";
   json += "\"ok\":true,";
   json += "\"board\":\"ESP32-S3\",";
-  json += "\"wifi_mode\":\"AP\",";
-  json += "\"ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
-  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"wifi_mode\":\"" + String(currentMode == MODE_STA ? "STA" : "AP") + "\",";
+  json += "\"ip\":\"" + ip + "\",";
   json += "\"port\":" + String(SERVER_PORT) + ",";
+  json += "\"ap_ssid\":\"" + jsonEscape(String(AP_SSID)) + "\",";
+  json += "\"ap_pass\":\"" + jsonEscape(String(AP_PASS)) + "\",";
   json += "\"sd_card_type\":\"" + card + "\",";
   json += "\"sd_spi_hz\":" + String((unsigned long)mountedSDFreq) + ",";
-  json += "\"sd_spi_mhz\":\"" + String((double)mountedSDFreq / 1000000.0, 1) + "\",";
   json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
   json += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
   json += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
@@ -576,73 +277,54 @@ void handleStatus()
 void handleFileList()
 {
   File dir = SD.open("/uploads");
-
   if (!dir || !dir.isDirectory())
   {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
     return;
   }
 
-  String json = "{";
-  json += "\"ok\":true,";
-  json += "\"dir\":\"/uploads\",";
-  json += "\"files\":[";
-
+  String json = "{\"ok\":true,\"dir\":\"/uploads\",\"files\":[";
   bool first = true;
 
   while (true)
   {
     File file = dir.openNextFile();
-    if (!file)
-      break;
+    if (!file) break;
 
     if (!file.isDirectory())
     {
       String fullName = String(file.name());
-
       int slash = fullName.lastIndexOf('/');
-      String name = fullName;
-      if (slash >= 0)
-      {
-        name = fullName.substring(slash + 1);
-      }
-
+      String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
       uint64_t size = file.size();
 
-      if (!first)
-        json += ",";
+      if (!first) json += ",";
       first = false;
 
       json += "{";
       json += "\"name\":\"" + jsonEscape(name) + "\",";
-      json += "\"path\":\"/uploads/" + jsonEscape(name) + "\",";
       json += "\"size\":" + String((unsigned long long)size) + ",";
       json += "\"size_human\":\"" + humanSize(size) + "\",";
       json += "\"download\":\"/api/download?name=" + jsonEscape(name) + "\"";
       json += "}";
     }
-
     file.close();
   }
-
   dir.close();
 
   json += "]}";
-
   server.send(200, "application/json", json);
 }
 
 String getNameArg()
 {
-  if (!server.hasArg("name"))
-    return "";
+  if (!server.hasArg("name")) return "";
   return safeFileName(server.arg("name"));
 }
 
 void handleDownload()
 {
   String name = getNameArg();
-
   if (name.length() == 0)
   {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_name\"}");
@@ -650,7 +332,6 @@ void handleDownload()
   }
 
   String path = "/uploads/" + name;
-
   if (!SD.exists(path))
   {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"file_not_found\"}");
@@ -672,7 +353,6 @@ void handleDownload()
 void handleDelete()
 {
   String name = getNameArg();
-
   if (name.length() == 0)
   {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_name\"}");
@@ -680,87 +360,56 @@ void handleDelete()
   }
 
   String path = "/uploads/" + name;
-
   if (!SD.exists(path))
   {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"file_not_found\"}");
     return;
   }
 
-  bool ok = SD.remove(path);
-
-  if (ok)
-  {
-    String json = "{\"ok\":true,\"deleted\":\"" + jsonEscape(name) + "\"}";
-    server.send(200, "application/json", json);
-  }
+  if (SD.remove(path))
+    server.send(200, "application/json", "{\"ok\":true,\"deleted\":\"" + jsonEscape(name) + "\"}");
   else
-  {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"delete_failed\"}");
-  }
 }
 
 void handleDeleteAll()
 {
   File dir = SD.open("/uploads");
-
   if (!dir || !dir.isDirectory())
   {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"cannot_open_uploads_dir\"}");
     return;
   }
 
-  uint32_t deleted = 0;
-  uint32_t failed = 0;
+  uint32_t deleted = 0, failed = 0;
 
   while (true)
   {
     File file = dir.openNextFile();
-    if (!file)
-      break;
+    if (!file) break;
 
     if (!file.isDirectory())
     {
       String fullName = String(file.name());
-      String name = fullName;
-
       int slash = fullName.lastIndexOf('/');
-      if (slash >= 0)
-      {
-        name = fullName.substring(slash + 1);
-      }
-
+      String name = (slash >= 0) ? fullName.substring(slash + 1) : fullName;
       file.close();
 
-      String path = "/uploads/" + name;
-      if (SD.remove(path))
-      {
+      if (SD.remove("/uploads/" + name))
         deleted++;
-      }
       else
-      {
         failed++;
-      }
     }
     else
     {
       file.close();
     }
   }
-
   dir.close();
 
-  String json = "{";
-  json += "\"ok\":";
+  String json = "{\"ok\":";
   json += (failed == 0 ? "true" : "false");
-  json += ",";
-  json += "\"deleted\":";
-  json += String(deleted);
-  json += ",";
-  json += "\"failed\":";
-  json += String(failed);
-  json += "}";
-
+  json += ",\"deleted\":" + String(deleted) + ",\"failed\":" + String(failed) + "}";
   server.send(failed == 0 ? 200 : 500, "application/json", json);
 }
 
@@ -768,24 +417,16 @@ void handleUploadResponse()
 {
   if (uploadOK)
   {
-    String json = "{";
-    json += "\"ok\":true,";
+    String json = "{\"ok\":true,";
     json += "\"name\":\"" + jsonEscape(uploadFileName) + "\",";
-    json += "\"path\":\"" + jsonEscape(uploadFilePath) + "\",";
     json += "\"size\":" + String((unsigned long long)uploadBytes) + ",";
-    json += "\"size_human\":\"" + humanSize(uploadBytes) + "\"";
-    json += "}";
-
+    json += "\"size_human\":\"" + humanSize(uploadBytes) + "\"}";
     server.send(200, "application/json", json);
   }
   else
   {
-    String json = "{";
-    json += "\"ok\":false,";
-    json += "\"error\":\"" + jsonEscape(uploadError) + "\"";
-    json += "}";
-
-    server.send(500, "application/json", json);
+    server.send(500, "application/json",
+      "{\"ok\":false,\"error\":\"" + jsonEscape(uploadError) + "\"}");
   }
 }
 
@@ -798,107 +439,53 @@ void handleFileUpload()
     uploadOK = false;
     uploadError = "";
     uploadBytes = 0;
-
     uploadFileName = safeFileName(upload.filename);
     uploadFilePath = "/uploads/" + uploadFileName;
 
-    Serial.printf("[UPLOAD] START name=%s path=%s\n", uploadFileName.c_str(), uploadFilePath.c_str());
+    Serial.printf("[UPLOAD] START %s\n", uploadFileName.c_str());
 
-    if (!ensureUploadDir())
-    {
-      uploadError = "cannot_create_uploads_dir";
-      Serial.println("[UPLOAD] FAIL cannot create /uploads");
-      return;
-    }
-
-    if (SD.exists(uploadFilePath))
-    {
-      SD.remove(uploadFilePath);
-    }
+    if (!ensureUploadDir()) { uploadError = "cannot_create_uploads_dir"; return; }
+    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
 
     uploadFile = SD.open(uploadFilePath, FILE_WRITE);
-    if (!uploadFile)
-    {
-      uploadError = "cannot_open_file_for_write";
-      Serial.println("[UPLOAD] FAIL open file write");
-      return;
-    }
+    if (!uploadFile) { uploadError = "cannot_open_file_for_write"; return; }
   }
-
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
     if (uploadFile)
     {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadBytes += written;
-
-      if (written != upload.currentSize)
-      {
-        uploadError = "sd_write_failed";
-        Serial.printf("[UPLOAD] WRITE FAIL written=%u expected=%u\n",
-                      (unsigned)written,
-                      (unsigned)upload.currentSize);
-      }
+      if (written != upload.currentSize) uploadError = "sd_write_failed";
     }
     else
     {
       uploadError = "upload_file_not_open";
     }
   }
-
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (uploadFile)
-    {
-      uploadFile.flush();
-      uploadFile.close();
-    }
+    if (uploadFile) { uploadFile.flush(); uploadFile.close(); }
 
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
       startUploadBlinkWhite();
-
-      Serial.printf("[UPLOAD] OK name=%s size=%llu\n",
-                    uploadFileName.c_str(),
-                    (unsigned long long)uploadBytes);
+      Serial.printf("[UPLOAD] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
     }
     else
     {
-      uploadOK = false;
-
-      if (uploadError.length() == 0)
-      {
-        uploadError = "empty_upload";
-      }
-
-      if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
-      {
-        SD.remove(uploadFilePath);
-      }
-
-      Serial.printf("[UPLOAD] FAIL name=%s err=%s\n",
-                    uploadFileName.c_str(),
-                    uploadError.c_str());
+      if (uploadError.length() == 0) uploadError = "empty_upload";
+      if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+      Serial.printf("[UPLOAD] FAIL %s err=%s\n", uploadFileName.c_str(), uploadError.c_str());
     }
   }
-
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
-    if (uploadFile)
-    {
-      uploadFile.close();
-    }
-
-    if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
-    {
-      SD.remove(uploadFilePath);
-    }
-
+    if (uploadFile) uploadFile.close();
+    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
     uploadOK = false;
     uploadError = "upload_aborted";
-
-    Serial.printf("[UPLOAD] ABORTED name=%s\n", uploadFileName.c_str());
   }
 }
 
@@ -920,34 +507,17 @@ void handleUploadAllResponse()
     return;
   }
 
-  String json = "{";
-  json += "\"ok\":";
+  String json = "{\"ok\":";
   json += (uploadAllFailed == 0 ? "true" : "false");
-  json += ",";
-  json += "\"uploaded\":";
-  json += String(uploadAllOK);
-  json += ",";
-  json += "\"failed\":";
-  json += String(uploadAllFailed);
-  json += ",";
-  json += "\"total_bytes\":";
-  json += String((unsigned long long)uploadAllBytes);
-  json += ",";
-  json += "\"total_human\":\"";
-  json += humanSize(uploadAllBytes);
-  json += "\"";
-
+  json += ",\"uploaded\":" + String(uploadAllOK);
+  json += ",\"failed\":" + String(uploadAllFailed);
+  json += ",\"total_bytes\":" + String((unsigned long long)uploadAllBytes);
+  json += ",\"total_human\":\"" + humanSize(uploadAllBytes) + "\"";
   if (uploadAllErrors.length() > 0)
-  {
-    json += ",\"errors\":\"";
-    json += jsonEscape(uploadAllErrors);
-    json += "\"";
-  }
-
+    json += ",\"errors\":\"" + jsonEscape(uploadAllErrors) + "\"";
   json += "}";
 
   uploadAllActive = false;
-
   server.send(uploadAllFailed == 0 ? 200 : 500, "application/json", json);
 }
 
@@ -957,35 +527,25 @@ void handleFileUploadAll()
 
   if (upload.status == UPLOAD_FILE_START)
   {
-    if (!uploadAllActive)
-    {
-      resetUploadAllState();
-    }
+    if (!uploadAllActive) resetUploadAllState();
 
     uploadOK = false;
     uploadError = "";
     uploadBytes = 0;
-
     uploadFileName = safeFileName(upload.filename);
     uploadFilePath = "/uploads/" + uploadFileName;
 
-    Serial.printf("[UPLOAD-ALL] START name=%s path=%s\n",
-                  uploadFileName.c_str(),
-                  uploadFilePath.c_str());
+    Serial.printf("[UPLOAD-ALL] START %s\n", uploadFileName.c_str());
 
     if (!ensureUploadDir())
     {
       uploadError = "cannot_create_uploads_dir";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": cannot_create_uploads_dir; ";
-      Serial.println("[UPLOAD-ALL] FAIL cannot create /uploads");
       return;
     }
 
-    if (SD.exists(uploadFilePath))
-    {
-      SD.remove(uploadFilePath);
-    }
+    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
 
     uploadFile = SD.open(uploadFilePath, FILE_WRITE);
     if (!uploadFile)
@@ -993,105 +553,159 @@ void handleFileUploadAll()
       uploadError = "cannot_open_file_for_write";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": cannot_open_file_for_write; ";
-      Serial.println("[UPLOAD-ALL] FAIL open file write");
       return;
     }
   }
-
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
     if (uploadFile)
     {
       size_t written = uploadFile.write(upload.buf, upload.currentSize);
       uploadBytes += written;
-
-      if (written != upload.currentSize)
-      {
-        uploadError = "sd_write_failed";
-        Serial.printf("[UPLOAD-ALL] WRITE FAIL written=%u expected=%u\n",
-                      (unsigned)written,
-                      (unsigned)upload.currentSize);
-      }
+      if (written != upload.currentSize) uploadError = "sd_write_failed";
     }
     else
     {
       uploadError = "upload_file_not_open";
     }
   }
-
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (uploadFile)
-    {
-      uploadFile.flush();
-      uploadFile.close();
-    }
+    if (uploadFile) { uploadFile.flush(); uploadFile.close(); }
 
     if (uploadError.length() == 0 && uploadBytes > 0)
     {
       uploadOK = true;
       uploadAllOK++;
       uploadAllBytes += uploadBytes;
-
       startUploadBlinkWhite();
-
-      Serial.printf("[UPLOAD-ALL] OK name=%s size=%llu\n",
-                    uploadFileName.c_str(),
-                    (unsigned long long)uploadBytes);
+      Serial.printf("[UPLOAD-ALL] OK %s %llu bytes\n", uploadFileName.c_str(), (unsigned long long)uploadBytes);
     }
     else
     {
-      uploadOK = false;
-
-      if (uploadError.length() == 0)
-      {
-        uploadError = "empty_upload";
-      }
-
+      if (uploadError.length() == 0) uploadError = "empty_upload";
       uploadAllFailed++;
       uploadAllErrors += uploadFileName + ": " + uploadError + "; ";
-
-      if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
-      {
-        SD.remove(uploadFilePath);
-      }
-
-      Serial.printf("[UPLOAD-ALL] FAIL name=%s err=%s\n",
-                    uploadFileName.c_str(),
-                    uploadError.c_str());
+      if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
+      Serial.printf("[UPLOAD-ALL] FAIL %s err=%s\n", uploadFileName.c_str(), uploadError.c_str());
     }
   }
-
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
-    if (uploadFile)
-    {
-      uploadFile.close();
-    }
-
-    if (uploadFilePath.length() > 0 && SD.exists(uploadFilePath))
-    {
-      SD.remove(uploadFilePath);
-    }
-
+    if (uploadFile) uploadFile.close();
+    if (SD.exists(uploadFilePath)) SD.remove(uploadFilePath);
     uploadOK = false;
     uploadError = "upload_aborted";
-
     uploadAllFailed++;
     uploadAllErrors += uploadFileName + ": upload_aborted; ";
+  }
+}
 
-    Serial.printf("[UPLOAD-ALL] ABORTED name=%s\n", uploadFileName.c_str());
+// ================== WIFI SWITCHING ==================
+void notifyTrustedHost()
+{
+  String ip = WiFi.localIP().toString();
+  String gw = WiFi.gatewayIP().toString();
+  String payload = "{\"ip\":\"" + ip + "\",\"type\":\"B\"}";
+  String url = "http://" + gw + ":" + String(SERVER_PORT) + "/api/device/connection";
+
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(payload);
+  Serial.printf("[NOTIFY] POST %s -> %d\n", url.c_str(), code);
+  http.end();
+}
+void startAP()
+{
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  delay(300);
+  ledAllOff();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+
+  currentMode = MODE_AP;
+  lastClientCount = 0;
+  Serial.printf("[WIFI] AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  server.begin();
+}
+
+bool connectToTrusted()
+{
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  delay(300);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
+
+  Serial.printf("[WIFI] Dang ket noi %s...\n", TRUSTED_SSID);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    if (millis() - t > STA_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println("[WIFI] Ket noi that bai, quay ve AP.");
+      startAP();
+      return false;
+    }
+    delay(200);
+  }
+
+  currentMode = MODE_STA;
+  Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+  notifyTrustedHost();
+  server.begin();
+  return true;
+}
+
+void doWifiScan()
+{
+  Serial.println("[SCAN] Quet WiFi tim trusted AP...");
+  int n = WiFi.scanNetworks(false, true);
+  bool found = false;
+
+  for (int i = 0; i < n; i++)
+  {
+    if (WiFi.SSID(i) == TRUSTED_SSID)
+    {
+      found = true;
+      break;
+    }
+  }
+  WiFi.scanDelete();
+
+  if (found)
+  {
+    Serial.println("[SCAN] Tim thay trusted AP, chuyen sang STA.");
+    connectToTrusted();
+  }
+  else
+  {
+    Serial.println("[SCAN] Khong tim thay, giu AP.");
+  }
+}
+
+void checkSTAConnection()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[WIFI] Mat ket noi STA, quay ve AP.");
+    startAP();
   }
 }
 
 void handleNotFound()
 {
-  String json = "{";
-  json += "\"ok\":false,";
-  json += "\"error\":\"not_found\",";
-  json += "\"uri\":\"" + jsonEscape(server.uri()) + "\"";
-  json += "}";
-
+  String json = "{\"ok\":false,\"error\":\"not_found\",\"uri\":\"" + jsonEscape(server.uri()) + "\"}";
   server.send(404, "application/json", json);
 }
 
@@ -1108,7 +722,6 @@ void setup()
   pinMode(LED_GREEN, OUTPUT);
   pinMode(LED_WHITE, OUTPUT);
   ledAllOff();
-
   ledRed(true);
 
   Serial.println("[SD] Khoi tao SPI...");
@@ -1118,85 +731,80 @@ void setup()
   if (!initSDWithFallback())
   {
     Serial.println("[SD] FAIL: Khong nhan duoc the nho!");
-    Serial.println("Kiem tra day:");
-    Serial.println("VCC  -> 3V3");
-    Serial.println("GND  -> GND");
-    Serial.println("SCK  -> GPIO12");
-    Serial.println("MOSI -> GPIO11");
-    Serial.println("MISO -> GPIO13");
-    Serial.println("CS   -> GPIO10");
-    while (true)
-    {
-      ledRed(true);
-      delay(300);
-      ledRed(false);
-      delay(300);
-    }
+    while (true) { ledRed(true); delay(300); ledRed(false); delay(300); }
   }
 
   if (!ensureUploadDir())
   {
     Serial.println("[SD] FAIL: Khong tao duoc /uploads");
-    while (true)
-    {
-      ledRed(true);
-      delay(100);
-      ledRed(false);
-      delay(100);
-    }
+    while (true) { ledRed(true); delay(100); ledRed(false); delay(100); }
   }
-
-  Serial.println("[SD] OK");
 
   uint8_t cardType = SD.cardType();
   Serial.print("[SD] Loai the: ");
-  if (cardType == CARD_MMC)
-    Serial.println("MMC");
-  else if (cardType == CARD_SD)
-    Serial.println("SDSC");
-  else if (cardType == CARD_SDHC)
-    Serial.println("SDHC/SDXC");
-  else
-    Serial.println("UNKNOWN");
+  if (cardType == CARD_MMC)        Serial.println("MMC");
+  else if (cardType == CARD_SD)    Serial.println("SDSC");
+  else if (cardType == CARD_SDHC)  Serial.println("SDHC/SDXC");
+  else                             Serial.println("UNKNOWN");
 
-  Serial.printf("[SD] Total: %s\n", humanSize(SD.totalBytes()).c_str());
-  Serial.printf("[SD] Used : %s\n", humanSize(SD.usedBytes()).c_str());
+  Serial.printf("[SD] Total: %s  Used: %s\n",
+    humanSize(SD.totalBytes()).c_str(), humanSize(SD.usedBytes()).c_str());
 
-  Serial.println("[WIFI] Cau hinh IP AP...");
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-
-  bool hidden = false;
-  int channel = 1;
-  int max_connection = 2;
-
-  bool apOK = WiFi.softAP(AP_SSID, AP_PASS, channel, hidden, max_connection);
-
-  if (!apOK)
+  Serial.println("[WIFI] Quet WiFi tim trusted AP...");
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, true);
+  bool trustedFound = false;
+  for (int i = 0; i < n; i++)
   {
-    Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
-    while (true)
+    if (WiFi.SSID(i) == TRUSTED_SSID)
     {
-      ledRed(true);
-      delay(500);
+      trustedFound = true;
+      break;
+    }
+  }
+  WiFi.scanDelete();
+
+  if (trustedFound)
+  {
+    Serial.println("[WIFI] Tim thay trusted AP, ket noi STA...");
+    WiFi.setSleep(false);
+    WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
+    unsigned long t = millis();
+    bool connected = false;
+    while (millis() - t < STA_CONNECT_TIMEOUT_MS)
+    {
+      if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+      delay(200);
+    }
+    if (connected)
+    {
+      currentMode = MODE_STA;
       ledRed(false);
-      delay(500);
+      Serial.printf("[WIFI] STA connected. IP: %s\n", WiFi.localIP().toString().c_str());
+      notifyTrustedHost();
+    }
+    else
+    {
+      Serial.println("[WIFI] Ket noi STA that bai, chuyen sang AP.");
     }
   }
 
-  ledRed(false);
-
-  Serial.println("[WIFI] OK: Da phat WiFi AP");
-  Serial.printf("[WIFI] SSID: %s\n", AP_SSID);
-  Serial.printf("[WIFI] PASS: %s\n", AP_PASS);
-  Serial.printf("[WIFI] IP  : %s\n", WiFi.softAPIP().toString().c_str());
-  Serial.printf("[WIFI] CH  : %d\n", channel);
-  Serial.printf("[WIFI] HIDDEN: %s\n", hidden ? "YES" : "NO");
-  Serial.printf("[WIFI] MAX CLIENT: %d\n", max_connection);
-  Serial.printf("[HTTP] PORT: %d\n", SERVER_PORT);
-  Serial.printf("[LED] RED: GPIO%d | GREEN: GPIO%d | WHITE: GPIO%d\n", LED_RED, LED_GREEN, LED_WHITE);
+  if (currentMode != MODE_STA)
+  {
+    Serial.println("[WIFI] Cau hinh IP AP...");
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.softAPConfig(local_IP, gateway, subnet);
+    if (!WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN))
+    {
+      Serial.println("[WIFI] FAIL: Khong phat duoc WiFi AP");
+      while (true) { ledRed(true); delay(500); ledRed(false); delay(500); }
+    }
+    ledRed(false);
+    Serial.printf("[WIFI] SSID: %s  IP: %s  PORT: %d\n",
+      AP_SSID, WiFi.softAPIP().toString().c_str(), SERVER_PORT);
+  }
 
   setWifiLedByClient();
 
@@ -1205,33 +813,23 @@ void setup()
   server.on("/api/filelist", HTTP_GET, handleFileList);
   server.on("/api/download", HTTP_GET, handleDownload);
 
-  server.on("/api/delete", HTTP_GET, handleDelete);
-  server.on("/api/delete", HTTP_POST, handleDelete);
+  server.on("/api/delete", HTTP_GET,    handleDelete);
+  server.on("/api/delete", HTTP_POST,   handleDelete);
   server.on("/api/delete", HTTP_DELETE, handleDelete);
 
-  server.on("/api/delete-all", HTTP_POST, handleDeleteAll);
+  server.on("/api/delete-all", HTTP_POST,   handleDeleteAll);
   server.on("/api/delete-all", HTTP_DELETE, handleDeleteAll);
 
-  server.on(
-      "/api/upload",
-      HTTP_POST,
-      handleUploadResponse,
-      handleFileUpload);
-
-  server.on(
-      "/api/upload-all",
-      HTTP_POST,
-      handleUploadAllResponse,
-      handleFileUploadAll);
+  server.on("/api/upload",     HTTP_POST, handleUploadResponse, handleFileUpload);
+  server.on("/api/upload-all", HTTP_POST, handleUploadAllResponse, handleFileUploadAll);
 
   server.onNotFound(handleNotFound);
 
   server.begin();
+  lastScanMs = millis();
 
   Serial.println("[HTTP] Server started");
   Serial.println("=== READY ===");
-  Serial.println("[REC] Tu dong ghi am 30 giay...");
-  doRecording();
 }
 
 // ================== LOOP ==================
@@ -1239,5 +837,16 @@ void loop()
 {
   server.handleClient();
   updateStatusLed();
-  handleSerialCommand();
+
+  unsigned long now = millis();
+
+  if (currentMode == MODE_STA)
+  {
+    checkSTAConnection();
+  }
+  else if (now - lastScanMs >= SCAN_INTERVAL_MS)
+  {
+    lastScanMs = now;
+    doWifiScan();
+  }
 }
