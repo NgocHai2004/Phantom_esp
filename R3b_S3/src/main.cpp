@@ -348,6 +348,9 @@ void handleDownload()
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
   server.streamFile(file, "application/octet-stream");
   file.close();
+
+  SD.remove(path);
+  Serial.printf("[DOWNLOAD] Xoa file sau download: %s\n", name.c_str());
 }
 
 void handleDelete()
@@ -606,7 +609,7 @@ void notifyTrustedHost()
 {
   String ip = WiFi.localIP().toString();
   String gw = WiFi.gatewayIP().toString();
-  String payload = "{\"ip\":\"" + ip + "\",\"type\":\"B\"}";
+  String payload = "{\"ip\":\"" + ip + "\",\"type\":\"PhantomR3b\"}";
   String url = "http://" + gw + ":" + String(SERVER_PORT) + "/api/device/connection";
 
   HTTPClient http;
@@ -644,6 +647,7 @@ bool connectToTrusted()
   delay(300);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PhantomR3b");
   WiFi.setSleep(false);
   WiFi.begin(TRUSTED_SSID, TRUSTED_PASS);
 
@@ -752,6 +756,7 @@ void setup()
 
   Serial.println("[WIFI] Quet WiFi tim trusted AP...");
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname("PhantomR3b");
   int n = WiFi.scanNetworks(false, true);
   bool trustedFound = false;
   for (int i = 0; i < n; i++)
