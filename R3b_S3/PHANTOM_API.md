@@ -210,6 +210,85 @@ Form field: files = <binary 2>
 
 ---
 
+### GET /api/dinh-danh
+
+Lấy thông tin định danh hiện tại từ RAM (được load từ SD khi boot).
+
+**Response 200**
+```json
+{
+  "ok": true,
+  "ma_id": "BN-0001",
+  "ho_ten": "Nguyen Van A",
+  "nam_sinh": 1990,
+  "dia_chi": "Ha Noi",
+  "ngay_cap_dinh_danh": "2026-05-30",
+  "ten_thiet_bi": "Pi Zero 2W",
+  "id_thiet_bi": "DEVICE-0001",
+  "dia_chi_thiet_bi": "Ha Noi"
+}
+```
+
+---
+
+### GET /api/device-info
+
+Lấy `id_thiet_bi` và MAC address của node. Chỉ có nghĩa khi node đang ở chế độ STA (kết nối `...0001`).
+
+**Response 200**
+```json
+{
+  "ok": true,
+  "id_thiet_bi": "DEVICE-0001",
+  "mac": "AA:BB:CC:DD:EE:FF"
+}
+```
+
+---
+
+### POST /api/dinh-danh
+
+Cập nhật thông tin định danh. Chỉ cần gửi các field muốn thay đổi — field không gửi giữ nguyên giá trị cũ. Cập nhật RAM ngay lập tức và ghi xuống `/dinh_danh.json` trên SD để bền vững qua reboot.
+
+```
+POST /api/dinh-danh
+Content-Type: application/json
+```
+
+**Body** (tất cả field đều optional):
+```json
+{
+  "ma_id": "BN-0001",
+  "ho_ten": "Nguyen Van A",
+  "nam_sinh": 1990,
+  "dia_chi": "Ha Noi",
+  "ngay_cap_dinh_danh": "2026-05-30",
+  "ten_thiet_bi": "Pi Zero 2W",
+  "id_thiet_bi": "DEVICE-0001",
+  "dia_chi_thiet_bi": "Ha Noi"
+}
+```
+
+**Response 200** — trả lại toàn bộ định danh sau khi cập nhật (giống GET)
+
+**Response 400** — body rỗng
+```json
+{ "ok": false, "error": "empty body" }
+```
+
+**Response 500** — ghi SD thất bại
+```json
+{ "ok": false, "error": "sd_write_failed" }
+```
+
+| Lưu ý | Chi tiết |
+|-------|----------|
+| RAM   | Cập nhật ngay, `GET /api/dinh-danh` và `GET /api/status` phản ánh giá trị mới ngay sau POST |
+| SD    | Ghi vào `/dinh_danh.json` — giá trị tồn tại qua reboot |
+| Boot  | ESP đọc `/dinh_danh.json` một lần vào RAM, nếu file chưa có thì dùng giá trị default |
+
+---
+
 ## Mã lỗi
 
 | error                        | Mô tả                              |

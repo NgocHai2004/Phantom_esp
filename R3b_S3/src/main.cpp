@@ -100,6 +100,84 @@ String jsonEscape(const String &s)
   return out;
 }
 
+// ================== DINH DANH ==================
+struct DinhDanh {
+  String ma_id              = "BN-0001";
+  String ho_ten             = "Nguyen Van A";
+  int    nam_sinh           = 1990;
+  String dia_chi            = "Ha Noi";
+  String ngay_cap_dinh_danh = "2026-05-30";
+  String ten_thiet_bi       = "Pi Zero 2W";
+  String id_thiet_bi        = "DEVICE-0001";
+  String dia_chi_thiet_bi   = "Ha Noi";
+};
+
+DinhDanh dinhDanh;
+
+static String _jStr(const String &j, const String &key) {
+  int p = j.indexOf("\"" + key + "\"");
+  if (p < 0) return "";
+  p = j.indexOf(':', p + key.length() + 2);
+  if (p < 0) return "";
+  p++;
+  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t')) p++;
+  if (j[p] != '"') return "";
+  p++;
+  String v = "";
+  while (p < (int)j.length() && j[p] != '"') {
+    if (j[p] == '\\' && p + 1 < (int)j.length()) { p++; v += j[p]; }
+    else v += j[p];
+    p++;
+  }
+  return v;
+}
+
+static int _jInt(const String &j, const String &key) {
+  int p = j.indexOf("\"" + key + "\"");
+  if (p < 0) return -1;
+  p = j.indexOf(':', p + key.length() + 2);
+  if (p < 0) return -1;
+  p++;
+  while (p < (int)j.length() && (j[p] == ' ' || j[p] == '\t')) p++;
+  String v = "";
+  while (p < (int)j.length() && j[p] >= '0' && j[p] <= '9') v += j[p++];
+  return v.length() ? v.toInt() : -1;
+}
+
+void loadDinhDanhFromSD() {
+  File f = SD.open("/dinh_danh.json", FILE_READ);
+  if (!f) { Serial.println("[DD] dinh_danh.json not found, using defaults"); return; }
+  String c = "";
+  while (f.available()) c += (char)f.read();
+  f.close();
+  String v;
+  int    n;
+  if ((v = _jStr(c, "ma_id")).length())              dinhDanh.ma_id              = v;
+  if ((v = _jStr(c, "ho_ten")).length())             dinhDanh.ho_ten             = v;
+  if ((n = _jInt(c, "nam_sinh")) >= 0)               dinhDanh.nam_sinh           = n;
+  if ((v = _jStr(c, "dia_chi")).length())            dinhDanh.dia_chi            = v;
+  if ((v = _jStr(c, "ngay_cap_dinh_danh")).length()) dinhDanh.ngay_cap_dinh_danh = v;
+  if ((v = _jStr(c, "ten_thiet_bi")).length())       dinhDanh.ten_thiet_bi       = v;
+  if ((v = _jStr(c, "id_thiet_bi")).length())        dinhDanh.id_thiet_bi        = v;
+  if ((v = _jStr(c, "dia_chi_thiet_bi")).length())   dinhDanh.dia_chi_thiet_bi   = v;
+  Serial.println("[DD] Loaded dinh_danh.json");
+}
+
+bool saveDinhDanhToSD() {
+  File f = SD.open("/dinh_danh.json", FILE_WRITE);
+  if (!f) return false;
+  f.printf("{\n  \"ma_id\":\"%s\",\n  \"ho_ten\":\"%s\",\n  \"nam_sinh\":%d,\n"
+           "  \"dia_chi\":\"%s\",\n  \"ngay_cap_dinh_danh\":\"%s\",\n"
+           "  \"ten_thiet_bi\":\"%s\",\n  \"id_thiet_bi\":\"%s\",\n"
+           "  \"dia_chi_thiet_bi\":\"%s\"\n}",
+    dinhDanh.ma_id.c_str(), dinhDanh.ho_ten.c_str(), dinhDanh.nam_sinh,
+    dinhDanh.dia_chi.c_str(), dinhDanh.ngay_cap_dinh_danh.c_str(),
+    dinhDanh.ten_thiet_bi.c_str(), dinhDanh.id_thiet_bi.c_str(),
+    dinhDanh.dia_chi_thiet_bi.c_str());
+  f.close();
+  return true;
+}
+
 String safeFileName(String name)
 {
   name.replace("\\", "/");
@@ -268,10 +346,61 @@ void handleStatus()
   json += "\"sd_total\":" + String((unsigned long long)getTotalBytes()) + ",";
   json += "\"sd_used\":" + String((unsigned long long)getUsedBytes()) + ",";
   json += "\"sd_total_human\":\"" + humanSize(getTotalBytes()) + "\",";
-  json += "\"sd_used_human\":\"" + humanSize(getUsedBytes()) + "\"";
-  json += "}";
+  json += "\"sd_used_human\":\"" + humanSize(getUsedBytes()) + "\",";
+  json += "\"dinh_danh\":{";
+  json += "\"ma_id\":\"" + jsonEscape(String(dinhDanh.ma_id)) + "\",";
+  json += "\"ho_ten\":\"" + jsonEscape(String(dinhDanh.ho_ten)) + "\",";
+  json += "\"nam_sinh\":" + String(dinhDanh.nam_sinh) + ",";
+  json += "\"dia_chi\":\"" + jsonEscape(String(dinhDanh.dia_chi)) + "\",";
+  json += "\"ngay_cap_dinh_danh\":\"" + jsonEscape(String(dinhDanh.ngay_cap_dinh_danh)) + "\",";
+  json += "\"ten_thiet_bi\":\"" + jsonEscape(String(dinhDanh.ten_thiet_bi)) + "\",";
+  json += "\"id_thiet_bi\":\"" + jsonEscape(String(dinhDanh.id_thiet_bi)) + "\",";
+  json += "\"dia_chi_thiet_bi\":\"" + jsonEscape(String(dinhDanh.dia_chi_thiet_bi)) + "\"";
+  json += "}}";
+
 
   server.send(200, "application/json", json);
+}
+
+void handleGetDinhDanh()
+{
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"ma_id\":\"" + jsonEscape(dinhDanh.ma_id) + "\",";
+  json += "\"ho_ten\":\"" + jsonEscape(dinhDanh.ho_ten) + "\",";
+  json += "\"nam_sinh\":" + String(dinhDanh.nam_sinh) + ",";
+  json += "\"dia_chi\":\"" + jsonEscape(dinhDanh.dia_chi) + "\",";
+  json += "\"ngay_cap_dinh_danh\":\"" + jsonEscape(dinhDanh.ngay_cap_dinh_danh) + "\",";
+  json += "\"ten_thiet_bi\":\"" + jsonEscape(dinhDanh.ten_thiet_bi) + "\",";
+  json += "\"id_thiet_bi\":\"" + jsonEscape(dinhDanh.id_thiet_bi) + "\",";
+  json += "\"dia_chi_thiet_bi\":\"" + jsonEscape(dinhDanh.dia_chi_thiet_bi) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handlePostDinhDanh()
+{
+  String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty body\"}");
+    return;
+  }
+  String v;
+  int    n;
+  if ((v = _jStr(body, "ma_id")).length())              dinhDanh.ma_id              = v;
+  if ((v = _jStr(body, "ho_ten")).length())             dinhDanh.ho_ten             = v;
+  if ((n = _jInt(body, "nam_sinh")) >= 0)               dinhDanh.nam_sinh           = n;
+  if ((v = _jStr(body, "dia_chi")).length())            dinhDanh.dia_chi            = v;
+  if ((v = _jStr(body, "ngay_cap_dinh_danh")).length()) dinhDanh.ngay_cap_dinh_danh = v;
+  if ((v = _jStr(body, "ten_thiet_bi")).length())       dinhDanh.ten_thiet_bi       = v;
+  if ((v = _jStr(body, "id_thiet_bi")).length())        dinhDanh.id_thiet_bi        = v;
+  if ((v = _jStr(body, "dia_chi_thiet_bi")).length())   dinhDanh.dia_chi_thiet_bi   = v;
+
+  if (!saveDinhDanhToSD()) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"sd_write_failed\"}");
+    return;
+  }
+  handleGetDinhDanh();
 }
 
 void handleFileList()
@@ -605,6 +734,14 @@ void handleFileUploadAll()
 }
 
 // ================== WIFI SWITCHING ==================
+void handleDeviceInfo()
+{
+  String json = "{\"ok\":true,";
+  json += "\"id_thiet_bi\":\"" + jsonEscape(dinhDanh.id_thiet_bi) + "\",";
+  json += "\"mac\":\"" + WiFi.macAddress() + "\"}";
+  server.send(200, "application/json", json);
+}
+
 void notifyTrustedHost()
 {
   String ip = WiFi.localIP().toString();
@@ -744,6 +881,8 @@ void setup()
     while (true) { ledRed(true); delay(100); ledRed(false); delay(100); }
   }
 
+  loadDinhDanhFromSD();
+
   uint8_t cardType = SD.cardType();
   Serial.print("[SD] Loai the: ");
   if (cardType == CARD_MMC)        Serial.println("MMC");
@@ -827,6 +966,11 @@ void setup()
 
   server.on("/api/upload",     HTTP_POST, handleUploadResponse, handleFileUpload);
   server.on("/api/upload-all", HTTP_POST, handleUploadAllResponse, handleFileUploadAll);
+
+  server.on("/api/dinh-danh", HTTP_GET,  handleGetDinhDanh);
+  server.on("/api/dinh-danh", HTTP_POST, handlePostDinhDanh);
+
+  server.on("/api/device-info", HTTP_GET, handleDeviceInfo);
 
   server.onNotFound(handleNotFound);
 
